@@ -1030,16 +1030,23 @@ struct FactionPacket {
 // The host's absolute in-game clock (GameWorld::getTimeStamp_inGameHours, in
 // total campaign hours - time_probe run 141509 proved it save-derived and
 // advancing at exactly frameSpeedMult x the base rate). ~1 Hz on CH_RELIABLE.
-// The join computes offset = hostHours - localHours and corrects by SLEWING:
-// it quietly scales its local sim speed on top of the arbitrated consensus
-// speed until the offset is inside tolerance (there is no engine setter for
-// the clock base; a slew converges without one and never makes the clock
-// jump or run backwards). At the default hour length (~109 real-seconds per
-// game hour) 50 ms of wire latency is ~0.0005 game hours - ignorable, so no
-// RTT compensation. seq is host-monotonic (stale-sample guard).
+// The receiver computes the offset against its own clock and corrects by
+// SLEWING: it quietly scales its local sim speed on top of the arbitrated
+// consensus speed until the offset is inside tolerance (there is no engine
+// setter for the clock base; a slew converges without one and never makes the
+// clock jump or run backwards).
+//
+// BOTH sides send, because each can only slew one way. The join catches up by
+// running faster, which the 5x clamp on the slewed speed makes a no-op at a
+// travelling session's 5x; the host is then the only one with room, and slows
+// itself to be caught (the clock brake). The correction is always LOCAL to the
+// sender of it - what crosses the wire is this clock and the unslewed consensus
+// speed. At the default hour length (~109 real-seconds per game hour) 50 ms of
+// wire latency is ~0.0005 game hours - ignorable, so no RTT compensation. seq
+// is per-sender monotonic (stale-sample guard).
 struct TimePacket {
     u8  type;      // = PKT_TIME
-    u32 ownerId;   // network player id of the sender (the host)
+    u32 ownerId;   // network player id of the sender (either side)
     u32 seq;       // per-sender monotonic (stale-sample guard)
     f64 gameHours; // absolute in-game clock, total hours
 };

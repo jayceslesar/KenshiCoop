@@ -1724,11 +1724,427 @@ const float RunApartScenario::ARRIVE_R = 150.0f;
 const float RunApartScenario::IDLE_LEG = 15.0f;
 const float RunApartScenario::PROBE_R  = 1800.0f;
 
+// town_arrive (zone-load population parity, 2026-08-06): walk BOTH squads into a
+// town whose zone has NEVER been loaded in this save, and judge what the join
+// sees once it gets there.
+//
+// Why this needs its own scenario, and why loading a save inside the town does
+// not test it: a town's population is GENERATED when its zone streams in. Load a
+// save that was written in the town and both clients read the same baked bodies,
+// so the hands match and the census resolves - measured in Bad Teeth, 78% of the
+// host's census rows resolve to a local body and 9% of the join's population is
+// suppressed. Walk into that same town instead and each engine generates its own
+// population: same spawn points, different hands. The join then cannot resolve
+// the host's census, mints proxies for all of it, and suppresses its own
+// natively-spawned bodies as unclaimed - the same town walked into measured 4%
+// resolved and 68% suppressed, with 225 proxy binds and 264 census-missing rows
+// (session 20260806_1224). On screen that is a town of NPCs popping in and out,
+// which is how it was found.
+//
+// So the fixture has to be a save that has never SEEN the target town, and the
+// bodies have to arrive on foot. Both squads park at a measured point outside it
+// - census=0 there, so none of the town is loaded yet, which is the property the
+// park point is chosen for - wait for their own zone to stream, then walk in
+// under their own locomotion at 5x, which is how a player actually crosses the
+// map and which leaves the streaming machinery the least time to keep up.
+//
+// Navigation is SELF-GUIDING rather than a recorded route: aim HOP_D along the
+// straight line to the target, re-aimed every sample, so each routing decision
+// is short. run_apart's recorded routes exist because a single order across
+// 160 k u fails outright; over the ~6.7 k u of a town approach the router copes,
+// and a self-guiding walker retargets to any town by changing two coordinates
+// instead of recording a new route. When it stops closing, SIDESTEP: swing the
+// aim off the bearing by growing angles, alternating sides, so it walks around
+// the obstacle instead of standing in front of it. Progress resets the bearing.
+//
+// Both the start and the target are env-overridable (KENSHICOOP_TOWN_FROM /
+// KENSHICOOP_TOWN_AT, "x,z"), because the gate is about population identity and
+// not about this particular town.
+class TownArriveScenario : public TimedScenario {
+public:
+    TownArriveScenario()
+        : TimedScenario("town_arrive", 1000), recvCount_(0),
+          haveTabs_(false), parked_(0), settled_(false), settleMs_(0),
+          arrived_(false), arriveMs_(0), speedMs_(0), camMs_(0),
+          fx_(0), fz_(0), tx_(0), tz_(0), groundOk_(false),
+          travelled_(0.0f), lastX_(0), lastZ_(0), haveLast_(false),
+          hops_(0), bestD_(1.0e9f), stallMs_(0), nSide_(0), bias_(0.0f) {}
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        // Measured defaults (session 20260806_1224): the park point is the cell
+        // claim one cell short of town, where the join's audit reported census=0
+        // and wide=0 - nothing of the town in memory. The target is the camera
+        // centre while standing in it.
+        fx_ = -35747.0f; fz_ = -14509.0f;
+        tx_ = -32899.0f; tz_ = -20539.0f;
+        readPt("KENSHICOOP_TOWN_FROM", &fx_, &fz_);
+        readPt("KENSHICOOP_TOWN_AT",   &tx_, &tz_);
+
+        voteSpeed(ctx, 0);
+
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int h = tabLeaderIdx(sq, n, 0);
+        int j = tabLeaderIdx(sq, n, 1);
+        haveTabs_ = (h >= 0 && j >= 0);
+
+        // Park the OWN tab only. Each side authors its own tab, so a symmetric
+        // park keeps the teleport on the side that owns it and lets the peer's
+        // copy converge through the normal channel - one snap, inside the settle
+        // window, which the oracle's judged window starts after.
+        float gy = 0.0f;
+        groundOk_ = engine::terrainHeightAt(fx_, fz_, &gy);
+        if (haveTabs_) {
+            const int ownRank = ctx.isHost ? 0 : 1;
+            for (unsigned int i = 0; i < n; ++i) {
+                if (tabRankOf(sq, n, i) != ownRank) continue;
+                Character* c = engine::resolve(sq[i]);
+                if (!c) continue;
+                // Spread along x so they do not land stacked, and offset the
+                // join's tab clear of the host's so the two squads arrive
+                // together without standing inside each other.
+                float px = fx_ + (float)parked_ * 4.0f + (ctx.isHost ? 0.0f : 30.0f);
+                float py = groundOk_ ? gy : sq[i].y;
+                if (engine::park(c, px, py, fz_, 0.0f)) ++parked_;
+            }
+            lastX_ = fx_; lastZ_ = fz_; haveLast_ = true;
+        }
+        bestD_ = straightLength();
+        stallMs_ = 0;
+
+        char b[352];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO TOWNARRIVE start side=%s have=%d parked=%u "
+                  "from=%.0f,%.0f,%.0f target=%.0f,%.0f straight=%.0f ground=%d "
+                  "hop=%.0f speed=%.1f settleMs=%lu holdMs=%lu",
+                  ctx.isHost ? "host" : "join", haveTabs_ ? 1 : 0, parked_,
+                  fx_, groundOk_ ? gy : 0.0f, fz_, tx_, tz_, straightLength(),
+                  groundOk_ ? 1 : 0, HOP_D, SPEED_MULT,
+                  (unsigned long)SETTLE_MS, (unsigned long)HOLD_MS);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!haveTabs_)
+            coop::logLine("SCENARIO TOWNARRIVE needs a 2-tab save (rank-0/rank-1 member missing)");
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveTabs_) {
+            if (ctx.elapsedMs >= HARD_MS) { passed_ = false; return true; }
+            return false;
+        }
+        // Re-vote: anything that clicks after us (the replicator's arbitration, a
+        // fight, the engine's own handling) would otherwise leave the pair
+        // walking a several-thousand-unit approach at 1x, and the log would not
+        // say why the run timed out short of town.
+        voteSpeed(ctx, ctx.elapsedMs);
+
+        if (evidenceDue(ctx.elapsedMs)) {
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            int h = tabLeaderIdx(sq, n, 0);
+            int j = tabLeaderIdx(sq, n, 1);
+            int own = ctx.isHost ? h : j;
+
+            // Watch our own tab throughout. Unlike the split scenarios there is
+            // nothing to be learned from looking at the peer here: the bug is in
+            // what OUR client renders around OUR characters, and the camera is
+            // itself an interest anchor, so pointing it elsewhere would change
+            // the thing being measured.
+            if (own >= 0 && (camMs_ == 0 || (ctx.elapsedMs - camMs_) >= CAM_REFOCUS_MS)) {
+                camMs_ = ctx.elapsedMs;
+                Character* oc = engine::resolve(sq[own]);
+                if (oc) engine::cameraFocusOn(ctx.gw, oc);
+            }
+
+            float d = -1.0f;
+            if (own >= 0) {
+                if (haveLast_) {
+                    float px = sq[own].x - lastX_, pz = sq[own].z - lastZ_;
+                    float step = (float)sqrt((double)(px * px + pz * pz));
+                    // The park itself is a teleport, not travel.
+                    if (step <= MAX_STEP) travelled_ += step;
+                }
+                lastX_ = sq[own].x; lastZ_ = sq[own].z; haveLast_ = true;
+                d = destDist(sq[own]);
+
+                if (!settled_) {
+                    // Do not start walking until the ground we were parked on is
+                    // actually streamed in: ordering a move through an unloaded
+                    // zone is how a squad ends up standing still for a window.
+                    bool zone = engine::isZoneLoadedAt(ctx.gw, sq[own].x, sq[own].y,
+                                                       sq[own].z);
+                    if (zone && ctx.elapsedMs >= SETTLE_MS) {
+                        settled_ = true; settleMs_ = ctx.elapsedMs;
+                        bestD_ = d; stallMs_ = ctx.elapsedMs;
+                        char sb[224];
+                        _snprintf(sb, sizeof(sb) - 1,
+                                  "SCENARIO TOWNARRIVE settled side=%s atMs=%lu zone=%d "
+                                  "pop=%u d=%.0f drift=%.0f",
+                                  ctx.isHost ? "host" : "join", ctx.elapsedMs,
+                                  zone ? 1 : 0,
+                                  engine::countNpcsNear(ctx.gw, sq[own].x, sq[own].y,
+                                                        sq[own].z, PROBE_R),
+                                  d, parkDrift(sq[own]));
+                        sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+                    }
+                } else if (!arrived_ && d >= 0.0f && d <= ARRIVE_R) {
+                    arrived_ = true; arriveMs_ = ctx.elapsedMs;
+                    char ab[224];
+                    _snprintf(ab, sizeof(ab) - 1,
+                              "SCENARIO TOWNARRIVE arrived side=%s atMs=%lu d=%.0f "
+                              "travelled=%.0f straight=%.0f hops=%u sidesteps=%u "
+                              "walkMs=%lu",
+                              ctx.isHost ? "host" : "join", ctx.elapsedMs, d,
+                              travelled_, straightLength(), hops_, nSide_,
+                              ctx.elapsedMs - settleMs_);
+                    ab[sizeof(ab) - 1] = '\0'; coop::logLine(ab);
+                }
+
+                if (settled_ && !arrived_) {
+                    trackStall(ctx, d);
+                    walkStep(ctx, sq, n, sq[own]);
+                } else if (arrived_) {
+                    // Shuffle on the spot so the bodies keep a live locomotion
+                    // state in town (a frozen squad would not exercise the
+                    // streaming this scenario is here to judge) without leaving
+                    // the population we are measuring.
+                    Character* oc = engine::resolve(sq[own]);
+                    bool legB = ((ctx.elapsedMs / 4000) % 2) != 0;
+                    if (oc) engine::orderMoveTo(oc, tx_ + (legB ? IDLE_LEG : 0.0f),
+                                                sq[own].y, tz_);
+                }
+            }
+
+            if (ctx.isHost) {
+                if (h >= 0) logScenarioEntity("MEMBER", sq[h]);
+                if (j >= 0) { logScenarioEntity("RECV", sq[j]); ++recvCount_; }
+            } else {
+                if (j >= 0) logScenarioEntity("MEMBER", sq[j]);
+                if (h >= 0) { logScenarioEntity("RECV", sq[h]); ++recvCount_; }
+            }
+
+            // popHost/popJoin are the same two POINTS sampled on both clients, so
+            // the pair is comparable across logs - but they come from the sphere
+            // query, which is the one that under-reports inside a town, so they
+            // are reported and never gated. The gate reads the join's
+            // "[audit] exist" enumeration instead.
+            if (h >= 0 && j >= 0) {
+                float dx = sq[j].x - sq[h].x, dz = sq[j].z - sq[h].z;
+                float sep = (float)sqrt((double)(dx * dx + dz * dz));
+                int cx = 0, cz = 0;
+                int hc = engine::cellAt(ctx.gw, sq[own >= 0 ? own : h].x,
+                                        sq[own >= 0 ? own : h].z, &cx, &cz) ? 1 : 0;
+                unsigned int popH = engine::countNpcsNear(ctx.gw, sq[h].x, sq[h].y,
+                                                          sq[h].z, PROBE_R);
+                unsigned int popJ = engine::countNpcsNear(ctx.gw, sq[j].x, sq[j].y,
+                                                          sq[j].z, PROBE_R);
+                int zH = engine::isZoneLoadedAt(ctx.gw, sq[h].x, sq[h].y, sq[h].z) ? 1 : 0;
+                int zJ = engine::isZoneLoadedAt(ctx.gw, sq[j].x, sq[j].y, sq[j].z) ? 1 : 0;
+                float mult = 0.0f; bool paused = false;
+                engine::readGameSpeed(ctx.gw, &mult, &paused);
+                char b[416];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO TOWNARRIVE side=%s phase=%s d=%.0f "
+                          "travelled=%.0f popHost=%u popJoin=%u zHost=%d zJoin=%d "
+                          "sep=%.0f cell=%d(%d,%d) arrived=%d hops=%u "
+                          "sidesteps=%u bias=%.0f speed=%.1f",
+                          ctx.isHost ? "host" : "join", phaseName(), d,
+                          travelled_, popH, popJ, zH, zJ, sep, hc, cx, cz,
+                          arrived_ ? 1 : 0, hops_, nSide_, bias_, mult);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // The judged window is the HOLD after arrival, so the run ends a fixed
+        // hold past whenever we got there rather than at a fixed wall time - a
+        // slow approach must not eat the measurement. The host outlives the join
+        // so the join's disconnect is never the thing that ends the host's run.
+        unsigned long extra = ctx.isHost ? HOST_EXTRA_MS : 0;
+        if (arrived_) {
+            // The hold gets its full window wherever the approach ended. Letting
+            // the walk deadline also end an arrived run would silently shorten
+            // the only part that is judged, and label a slow approach a timeout.
+            if (ctx.elapsedMs >= arriveMs_ + HOLD_MS + extra) {
+                passed_ = (recvCount_ >= 1);
+                return true;
+            }
+        } else if (ctx.elapsedMs >= HARD_MS + extra) {
+            // Out of time short of town: report it rather than judging a window
+            // that never happened.
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO TOWNARRIVE timeout side=%s d=%.0f travelled=%.0f "
+                      "hops=%u sidesteps=%u settled=%d",
+                      ctx.isHost ? "host" : "join", destDistLast(), travelled_,
+                      hops_, nSide_, settled_ ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            passed_ = false;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static void readPt(const char* var, float* x, float* z) {
+        const char* v = getenv(var);
+        if (v && *v) sscanf(v, "%f,%f", x, z);
+    }
+    void voteSpeed(const ScenarioContext& ctx, unsigned long ms) {
+        if (ms != 0 && (ms - speedMs_) < SPEED_VOTE_MS) return;
+        speedMs_ = ms;
+        engine::writeGameSpeed(ctx.gw, SPEED_MULT, false);
+    }
+    float straightLength() const {
+        float dx = tx_ - fx_, dz = tz_ - fz_;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+    float destDist(const EntityState& e) const {
+        float dx = e.x - tx_, dz = e.z - tz_;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+    float destDistLast() const {
+        if (!haveLast_) return -1.0f;
+        float dx = lastX_ - tx_, dz = lastZ_ - tz_;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+    // How far the tab leader ended up from the nominal park point. Tens of units
+    // are the deliberate spread (4 u per member, 30 u between tabs); hundreds
+    // mean the park landed in the air or inside something, and the approach is
+    // starting from somewhere other than the measured point.
+    float parkDrift(const EntityState& e) const {
+        float dx = e.x - fx_, dz = e.z - fz_;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+    const char* phaseName() const {
+        return arrived_ ? "hold" : (settled_ ? "walk" : "settle");
+    }
+
+    // Not closing on the town for STALL_MS is an obstacle or a fight, not slow
+    // going: at the measured ~570 u/s under a 5x vote a clear approach closes
+    // HOP_D in about a second. Answer it by swinging the aim off the bearing,
+    // alternating sides and growing the angle, so the squad tries around one
+    // side then the other rather than pressing into whatever stopped it.
+    void trackStall(const ScenarioContext& ctx, float d) {
+        if (d < 0.0f) return;
+        if (d < bestD_ - STALL_EPS) {
+            bestD_ = d; stallMs_ = ctx.elapsedMs; bias_ = 0.0f;
+            return;
+        }
+        if (ctx.elapsedMs - stallMs_ < STALL_MS) return;
+        if (nSide_ >= MAX_SIDESTEPS) {
+            // Keep walking straight at it and let the timeout report the truth;
+            // silently sidestepping forever would read as a healthy approach.
+            stallMs_ = ctx.elapsedMs;
+            return;
+        }
+        ++nSide_;
+        float mag = (float)((nSide_ + 1) / 2) * SIDESTEP_DEG;
+        if (mag > MAX_BIAS_DEG) mag = MAX_BIAS_DEG;
+        bias_ = ((nSide_ % 2) != 0) ? mag : -mag;
+        stallMs_ = ctx.elapsedMs;
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO TOWNARRIVE stall side=%s d=%.0f best=%.0f forMs=%lu "
+                  "n=%u bias=%.0f - sidestepping",
+                  ctx.isHost ? "host" : "join", d, bestD_, (unsigned long)STALL_MS,
+                  nSide_, bias_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Aim HOP_D along the (bias-rotated) bearing to town and order the WHOLE
+    // owned tab there. Not the far target: one order per sample over a short leg
+    // keeps every routing decision small, which is what makes a self-guiding
+    // walker viable over an approach. Not the leader alone: an unordered member
+    // stays put, keeps its own region attended, and strings the squad out for
+    // reasons that have nothing to do with what is being measured.
+    void walkStep(const ScenarioContext& ctx, const EntityState* sq,
+                  unsigned int n, const EntityState& own) {
+        float dx = tx_ - own.x, dz = tz_ - own.z;
+        float d = (float)sqrt((double)(dx * dx + dz * dz));
+        if (d < 1.0f) return;
+        float ux = dx / d, uz = dz / d;
+        float r = bias_ * 3.14159265f / 180.0f;
+        float cs = (float)cos((double)r), sn = (float)sin((double)r);
+        float rx = ux * cs - uz * sn, rz = ux * sn + uz * cs;
+        float hop = (d < HOP_D) ? d : HOP_D;
+        float ax = own.x + rx * hop, az = own.z + rz * hop;
+        const int ownRank = ctx.isHost ? 0 : 1;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (tabRankOf(sq, n, i) != ownRank) continue;
+            Character* mc = engine::resolve(sq[i]);
+            if (mc) engine::orderMoveTo(mc, ax, sq[i].y, az);
+        }
+        ++hops_;
+    }
+
+    // A park is a teleport and the settle has to absorb it: the destination zone
+    // streams in, the bodies ground, and the peer's copy of the parked tab snaps
+    // once. 25 s covers all three at 5x.
+    static const unsigned long SETTLE_MS      = 25000;
+    // The judged window. At the audit's 5 s cadence this is 24 samples, enough
+    // that a median is a median rather than a coin toss.
+    static const unsigned long HOLD_MS        = 120000;
+    // ~6.7 k u at the measured ~570 u/s is ~12 s of clear walking. 240 s allows
+    // an approach that fights, detours and sidesteps most of the way in.
+    static const unsigned long HARD_MS        = 240000;
+    static const unsigned long HOST_EXTRA_MS  = 10000;
+    static const unsigned long SPEED_VOTE_MS  = 10000;
+    static const unsigned long CAM_REFOCUS_MS = 5000;
+    static const unsigned long STALL_MS       = 15000;
+    static const unsigned int  MAX_SIDESTEPS  = 24;
+    static const unsigned int  MAX_SQUAD      = 32;
+    static const float SPEED_MULT;
+    static const float HOP_D;
+    static const float ARRIVE_R;
+    static const float STALL_EPS;
+    static const float SIDESTEP_DEG;
+    static const float MAX_BIAS_DEG;
+    static const float MAX_STEP;
+    static const float IDLE_LEG;
+    static const float PROBE_R;
+
+    unsigned int  recvCount_;
+    bool          haveTabs_;
+    unsigned int  parked_;
+    bool          settled_;
+    unsigned long settleMs_;
+    bool          arrived_;
+    unsigned long arriveMs_;
+    unsigned long speedMs_;
+    unsigned long camMs_;
+    float         fx_, fz_;        // measured park point outside the town
+    float         tx_, tz_;        // town centre
+    bool          groundOk_;
+    float         travelled_;
+    float         lastX_, lastZ_;
+    bool          haveLast_;
+    unsigned int  hops_;
+    float         bestD_;          // closest we have been to town
+    unsigned long stallMs_;
+    unsigned int  nSide_;
+    float         bias_;           // current aim offset, degrees
+};
+const float TownArriveScenario::SPEED_MULT = 5.0f;
+// Short enough that each routing decision is local, long enough that a 1 Hz
+// sample cannot overshoot the aim and leave the squad circling it.
+const float TownArriveScenario::HOP_D    = 500.0f;
+// The town centre is a destination for a squad arriving strung out behind its
+// leader, and being 200 u into a town is being in it.
+const float TownArriveScenario::ARRIVE_R = 200.0f;
+const float TownArriveScenario::STALL_EPS = 50.0f;
+const float TownArriveScenario::SIDESTEP_DEG = 40.0f;
+const float TownArriveScenario::MAX_BIAS_DEG = 120.0f;
+// Bigger than a sample's worth of running at 5x, so the opening park does not
+// land in the travelled total.
+const float TownArriveScenario::MAX_STEP  = 1500.0f;
+const float TownArriveScenario::IDLE_LEG  = 15.0f;
+const float TownArriveScenario::PROBE_R   = 1800.0f;
+
 } // namespace
 
 Scenario* makeMovementScenario(const std::string& name) {
     if (name == "split_far2")   return new SplitFar2Scenario();
     if (name == "run_apart")    return new RunApartScenario();
+    if (name == "town_arrive")  return new TownArriveScenario();
     if (name == "leader_move")  return new LeaderMoveScenario();
     if (name == "fast_march")   return new FastMarchScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();

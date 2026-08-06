@@ -53,7 +53,9 @@ Replicator::Replicator()
       censusStaleMs_(0), censusStaleEdges_(0), proxyDriftLogMs_(0),
       camHintSendMs_(0), peerCamMs_(0),
       midCursor_(0), midSliceMs_(0),
-      censusParkDist_(0.0f), censusParks_(0), censusFreezeAi_(true),
+      censusParkDist_(0.0f), censusParks_(0),
+      censusPrevMs_(0), censusWalkDist_(0.0f), censusWalks_(0),
+      censusFreezeAi_(true),
       attentionRadius_(0.0f),
       attnFlips_(0), attnWinMs_(0), attnBaseSupp_(0), attnBaseCull_(0),
       attnBaseProxy_(0), attnVetoMs_(0), attnVetoRawN_(0), attnVetoMask_(0),
@@ -64,7 +66,8 @@ Replicator::Replicator()
       speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
       spawnSync_(false), spawnPosLogMs_(0),
-      spawnMintRadius_(0.0f), censusScanMs_(0),
+      spawnMintRadius_(0.0f), adoptRadius_(0.0f), censusAdopts_(0),
+      censusScanMs_(0),
       poolSeen_(-1), poolSent_(-1), poolSentMs_(0), poolTotal_(-1),
       poolSeq_(0), poolAcked_(0),
       moneySync_(true), recruitSync_(true),
@@ -79,7 +82,8 @@ Replicator::Replicator()
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       storeSync_(false), contCensusMs_(0),
-      timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
+      timeSync_(true), timeBrake_(true),
+      timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
       platoonT0_(0),
       lifeSweepMs_(0) {
@@ -196,6 +200,9 @@ void Replicator::resetSession() {
     // host re-publishes within a second of the new world going live.
     censusHands_.clear();
     censusPos_.clear();
+    censusPrev_.clear();
+    censusPrevMs_ = 0;
+    censusFix_.clear();
     parkMs_.clear();
     censusRecvMs_ = 0;
     censusSendMs_ = 0;
@@ -316,20 +323,27 @@ void Replicator::resetSession() {
 }
 
 void Replicator::clearPeerReplicationState(GameWorld* gw) {
-    // Destroy every minted proxy body before resetSession() drops the map that
+    // Destroy every MINTED proxy body before resetSession() drops the map that
     // owns the pointers. The engine owns the bodies; a proxy left standing after
     // the peer that authored it is gone is a permanent ghost, and any map still
     // pointing at it (targets_, drivenChars_) would drive a body with no fresh
     // authority - or a freed pointer once the engine reaps it. SEH-guarded via
     // despawnProxyNpc so a single bad pointer can't take down the leave path.
-    unsigned int cleared = 0;
+    //
+    // ADOPTED entries are released, not destroyed (destroyIfMinted): a body we
+    // adopted is one this client generated itself, so the peer leaving makes it
+    // ours again rather than making it garbage. Destroying them here would empty a
+    // whole town on disconnect, and bake that emptiness into the next save.
+    unsigned int cleared = 0, released = 0;
     for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
          it != proxyByKey_.end(); ++it) {
-        if (gw && it->second && engine::despawnProxyNpc(gw, it->second))
-            ++cleared;
+        if (!gw || !it->second) continue;
+        if (destroyIfMinted(gw, it->second)) ++cleared; else ++released;
     }
-    char b[96];
-    _snprintf(b, sizeof(b) - 1, "[leave] cleared proxies=%u", cleared);
+    mintedBodies_.clear();
+    char b[128];
+    _snprintf(b, sizeof(b) - 1, "[leave] cleared proxies=%u released=%u",
+              cleared, released);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
     // World-item proxies (Phase 3): the world stays LIVE across a peer leave /

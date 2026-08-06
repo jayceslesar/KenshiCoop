@@ -1767,3 +1767,422 @@ function Test-RunApart {
     Write-Host "  RUN-APART $v - $why"
     return (Add-GateResult -Name "run_apart" -Status $v -Metrics $metrics -Detail $why)
 }
+
+
+# ---- town_arrive oracles --------------------------------------------------------
+#
+# The pair walks into a town whose zone has never been loaded in this save. Two
+# gates, because "did the walk happen" and "was the town right when we got there"
+# fail for completely different reasons and a run that never arrived must not be
+# read as a clean town.
+#
+#   town_arrive     (PRIMARY) - both squads walked in, and the town is populated.
+#   town_pop_parity (GATING)  - what the join sees there is the host's town.
+#
+# Everything the second gate judges is measured AFTER arrival, keyed off the
+# scenario's own arrived marker by LINE NUMBER rather than by clock: the approach
+# legitimately produces the churn the town must not (the park snap, the peer's
+# copy catching up, zones streaming), so judging the whole run would mix the two.
+
+# Parse the scenario's TOWNARRIVE markers and rows out of one log. arrivedLine is
+# how the parity gate finds the start of its window.
+function Get-TownArriveData {
+    param([string]$File)
+    $o = @{ start = $null; settled = $null; arrived = $null; timeout = $null
+            rows = (New-Object System.Collections.ArrayList); arrivedLine = -1 }
+    if (-not (Test-Path $File)) { return $o }
+
+    $sp = "SCENARIO TOWNARRIVE start side=(\w+) have=(\d) parked=(\d+) " +
+          "from=(-?[\d\.]+),(-?[\d\.]+),(-?[\d\.]+) " +
+          "target=(-?[\d\.]+),(-?[\d\.]+) straight=([\d\.]+) ground=(\d)"
+    $m = Select-String -Path $File -Pattern $sp -ErrorAction SilentlyContinue |
+         Select-Object -First 1
+    if ($m) {
+        $g = $m.Matches[0].Groups
+        $o.start = @{ side = $g[1].Value; have = [int]$g[2].Value
+                      parked = [int]$g[3].Value
+                      straight = [double]$g[9].Value; ground = [int]$g[10].Value }
+    }
+    $stp = "SCENARIO TOWNARRIVE settled side=(\w+) atMs=(\d+) zone=(\d) pop=(\d+) " +
+           "d=([\d\.]+) drift=([\d\.]+)"
+    $m = Select-String -Path $File -Pattern $stp -ErrorAction SilentlyContinue |
+         Select-Object -First 1
+    if ($m) {
+        $g = $m.Matches[0].Groups
+        $o.settled = @{ atMs = [long]$g[2].Value; zone = [int]$g[3].Value
+                        pop = [int]$g[4].Value; drift = [double]$g[6].Value }
+    }
+    $ap = "SCENARIO TOWNARRIVE arrived side=(\w+) atMs=(\d+) d=([\d\.]+) " +
+          "travelled=([\d\.]+) straight=([\d\.]+) hops=(\d+) sidesteps=(\d+) " +
+          "walkMs=(\d+)"
+    $m = Select-String -Path $File -Pattern $ap -ErrorAction SilentlyContinue |
+         Select-Object -First 1
+    if ($m) {
+        $g = $m.Matches[0].Groups
+        $o.arrived = @{ atMs = [long]$g[2].Value; d = [double]$g[3].Value
+                        travelled = [double]$g[4].Value
+                        straight = [double]$g[5].Value
+                        hops = [int]$g[6].Value; sidesteps = [int]$g[7].Value
+                        walkMs = [long]$g[8].Value }
+        $o.arrivedLine = $m.LineNumber
+    }
+    $tp = "SCENARIO TOWNARRIVE timeout side=(\w+) d=(-?[\d\.]+) travelled=([\d\.]+) " +
+          "hops=(\d+) sidesteps=(\d+) settled=(\d)"
+    $m = Select-String -Path $File -Pattern $tp -ErrorAction SilentlyContinue |
+         Select-Object -First 1
+    if ($m) {
+        $g = $m.Matches[0].Groups
+        $o.timeout = @{ d = [double]$g[2].Value; travelled = [double]$g[3].Value
+                        settled = [int]$g[6].Value }
+    }
+    # d can be -1 for a sample where the tab leader was momentarily unresolvable.
+    $rp = "SCENARIO TOWNARRIVE side=(\w+) phase=(\w+) d=(-?[\d\.]+) " +
+          "travelled=([\d\.]+) popHost=(\d+) popJoin=(\d+) zHost=(\d) zJoin=(\d) " +
+          "sep=([\d\.]+) cell=\d\((-?\d+),(-?\d+)\) arrived=(\d) hops=(\d+) " +
+          "sidesteps=(\d+) bias=(-?[\d\.]+) speed=([\d\.]+)"
+    foreach ($m in (Select-String -Path $File -Pattern $rp -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        [void]$o.rows.Add(@{ side = $g[1].Value; phase = $g[2].Value
+                             d = [double]$g[3].Value
+                             travelled = [double]$g[4].Value
+                             popHost = [int]$g[5].Value; popJoin = [int]$g[6].Value
+                             sep = [double]$g[9].Value
+                             arrived = [int]$g[12].Value
+                             hops = [int]$g[13].Value
+                             sidesteps = [int]$g[14].Value
+                             speed = [double]$g[16].Value })
+    }
+    return $o
+}
+
+# The join's "[audit] exist" samples from a given line onward. fresh=0 samples are
+# excluded for the same reason Test-ExistenceParity excludes them: wide culling is
+# deliberately off on a stale census, so the classification is not meaningful.
+# RequireFresh: a row whose census is stale cannot be read for cen/hid, because
+# those classify against the census - so the JOIN side demands fresh=1. The HOST in
+# this scenario receives no census at all (it authors the town), and its rows read
+# fresh=0 forever, while the only field wanted from them - wide, its own count of
+# the town - does not depend on the census. Hence the switch.
+function Get-TownAuditRows {
+    param([string]$File, [int]$AfterLine = 0, [bool]$RequireFresh = $true)
+    $rows = New-Object System.Collections.ArrayList
+    if (-not (Test-Path $File)) { return $rows }
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[audit\] exist near=(\d+) " +
+           "wide=(\d+) drv=(\d+) cen=(\d+) hid=(\d+) ghost=(\d+) supp=(\d+) " +
+           "census=(\d+) fresh=(\d) parks=(\d+)(?: walks=(\d+))?"
+    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+        if ($m.LineNumber -le $AfterLine) { continue }
+        $g = $m.Matches[0].Groups
+        if ($RequireFresh -and $g[13].Value -ne "1") { continue }
+        $ms = ((([int]$g[1].Value * 60 + [int]$g[2].Value) * 60 +
+                 [int]$g[3].Value) * 1000) + [int]$g[4].Value
+        [void]$rows.Add(@{ ms = $ms
+                           wide = [int]$g[6].Value; drv = [int]$g[7].Value
+                           cen = [int]$g[8].Value; hid = [int]$g[9].Value
+                           supp = [int]$g[11].Value; census = [int]$g[12].Value
+                           parks = [long]$g[14].Value
+                           # walks= post-dates the walk-converge band, so a log
+                           # written before it has no field to read.
+                           walks = if ($g[15].Success) { [long]$g[15].Value }
+                                   else { [long]0 } })
+    }
+    return $rows
+}
+
+# Count matches of a pattern occurring after a line number (window = post-arrival).
+function Measure-TownAfter {
+    param([string]$File, [string]$Pattern, [int]$AfterLine)
+    if (-not (Test-Path $File)) { return 0 }
+    $n = 0
+    foreach ($m in (Select-String -Path $File -Pattern $Pattern -ErrorAction SilentlyContinue)) {
+        if ($m.LineNumber -gt $AfterLine) { $n++ }
+    }
+    return $n
+}
+
+function Get-TownMedian {
+    param([double[]]$Values)
+    if ($Values.Count -eq 0) { return -1.0 }
+    $s = @($Values | Sort-Object)
+    return [double]$s[[int]($s.Count / 2)]
+}
+
+# town_arrive (PRIMARY): did both squads actually WALK into a POPULATED town?
+#
+# Both halves matter as a no-signal guard. A run that parked outside and never
+# moved, or that lost its 5x vote and timed out short, has not produced the
+# streaming this scenario is about. And an empty field would sail through the
+# parity gate for the worst possible reason - there was nothing there to get
+# wrong - so the town being populated at all is part of the mechanism proof.
+function Test-TownArrive {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinSamples = 5,
+          # Covered ground against the straight line. Sidesteps and detours only
+          # ever make the path LONGER than the straight line, so anything below
+          # the straight line means it did not walk the approach.
+          [double]$MinTravelFrac = 0.7,
+          # 5x is the scenario's own vote, and the point of it: town travel at
+          # speed is what a player does and what stresses the streaming. 4x
+          # allows for a sample taken mid-arbitration.
+          [double]$MinSpeed = 4.0,
+          # Bad Teeth held census=172 walked in and 160 loaded from save. 40 is
+          # comfortably a town and comfortably above open country (census=0 at
+          # the park point, tens on the road).
+          [int]$MinCensus = 40)
+
+    $h = Get-TownArriveData -File $HostFile
+    $j = Get-TownArriveData -File $JoinFile
+    if (-not $h.start -or -not $j.start) {
+        return (Add-GateResult -Name "town_arrive" -Status SKIP `
+            -Detail "no TOWNARRIVE start row on one or both sides (scenario did not arm)")
+    }
+    if ($h.start.have -ne 1 -or $j.start.have -ne 1) {
+        return (Add-GateResult -Name "town_arrive" -Status SKIP `
+            -Detail "the save has no rank-0/rank-1 tab pair, so there is no join-owned squad to walk in")
+    }
+    if ($h.rows.Count -lt $MinSamples -or $j.rows.Count -lt $MinSamples) {
+        return (Add-GateResult -Name "town_arrive" -Status SKIP `
+            -Detail "too few samples (host=$($h.rows.Count) join=$($j.rows.Count) < $MinSamples)")
+    }
+
+    $maxSpeed = 0.0
+    foreach ($r in @($h.rows) + @($j.rows)) { if ($r.speed -gt $maxSpeed) { $maxSpeed = $r.speed } }
+    $censusPeak = 0
+    foreach ($a in (Get-TownAuditRows -File $JoinFile)) {
+        if ($a.census -gt $censusPeak) { $censusPeak = $a.census }
+    }
+    $straight = $h.start.straight
+    $need = [math]::Round($straight * $MinTravelFrac, 0)
+    $hTrav = if ($h.arrived) { $h.arrived.travelled }
+             elseif ($h.timeout) { $h.timeout.travelled } else { 0.0 }
+    $jTrav = if ($j.arrived) { $j.arrived.travelled }
+             elseif ($j.timeout) { $j.timeout.travelled } else { 0.0 }
+
+    $metrics = @{
+        straight = [math]::Round($straight, 0)
+        hostTravelled = [math]::Round($hTrav, 0)
+        joinTravelled = [math]::Round($jTrav, 0)
+        needTravelled = $need
+        hostArriveMs = if ($h.arrived) { $h.arrived.atMs } else { -1 }
+        joinArriveMs = if ($j.arrived) { $j.arrived.atMs } else { -1 }
+        hostSidesteps = if ($h.arrived) { $h.arrived.sidesteps } else { -1 }
+        joinSidesteps = if ($j.arrived) { $j.arrived.sidesteps } else { -1 }
+        hostParked = $h.start.parked; joinParked = $j.start.parked
+        hostSettleMs = if ($h.settled) { $h.settled.atMs } else { -1 }
+        joinSettleMs = if ($j.settled) { $j.settled.atMs } else { -1 }
+        parkDrift = if ($j.settled) { [math]::Round($j.settled.drift, 0) } else { -1 }
+        censusPeak = $censusPeak
+        maxSpeed = $maxSpeed
+        hostSamples = $h.rows.Count; joinSamples = $j.rows.Count
+    }
+
+    $why = ""
+    if ($h.start.parked -eq 0 -or $j.start.parked -eq 0) {
+        $why = "a side parked nobody at the approach point (host $($h.start.parked), " +
+               "join $($j.start.parked)), so it never started outside the town"
+    } elseif ($maxSpeed -lt $MinSpeed) {
+        $why = "the 5x vote never took - peak speed ${maxSpeed}x (< ${MinSpeed}x), " +
+               "so this is not the travel speed the scenario is meant to stress"
+    } elseif (-not $h.arrived -or -not $j.arrived) {
+        $hd = if ($h.timeout) { "$([math]::Round($h.timeout.d,0)) u short" } else { "no timeout row" }
+        $jd = if ($j.timeout) { "$([math]::Round($j.timeout.d,0)) u short" } else { "no timeout row" }
+        $why = "a squad never reached the town (host: $hd, join: $jd); covered " +
+               "host $($metrics.hostTravelled) u, join $($metrics.joinTravelled) u " +
+               "of a $($metrics.straight) u approach - check the stall rows for " +
+               "whether it was a fight or the router"
+    } elseif ($hTrav -lt $need -or $jTrav -lt $need) {
+        $why = "a squad arrived without walking the approach - host " +
+               "$($metrics.hostTravelled) u, join $($metrics.joinTravelled) u, " +
+               "need $need u of a $($metrics.straight) u straight line"
+    } elseif ($censusPeak -lt $MinCensus) {
+        $why = "the town is not populated - peak census $censusPeak row(s) " +
+               "(need $MinCensus), so there is nothing here to judge parity on"
+    }
+    $v = if ($why) { "FAIL" } else { "PASS" }
+    if (-not $why) {
+        $why = "both squads walked in at ${maxSpeed}x - host $($metrics.hostTravelled) u " +
+               "by $($metrics.hostArriveMs) ms, join $($metrics.joinTravelled) u by " +
+               "$($metrics.joinArriveMs) ms (straight $($metrics.straight) u, " +
+               "sidesteps host=$($metrics.hostSidesteps) join=$($metrics.joinSidesteps)), " +
+               "into a town of $censusPeak census row(s)"
+    }
+    Write-Host "  TOWN-ARRIVE $v - $why"
+    return (Add-GateResult -Name "town_arrive" -Status $v -Metrics $metrics -Detail $why)
+}
+
+# town_pop_parity (GATING): once in town, is the join looking at ONE town?
+#
+# The bug the scenario was written for. A town's population is generated when its
+# zone streams in, so two clients that WALK into one generate it separately: same
+# spawn points, different engine hands. The join cannot resolve the host's census
+# rows against its own bodies, so it mints a proxy for every row AND suppresses
+# its own natively-spawned copy as unclaimed - two towns stacked on one spot, one
+# of them hidden.
+#
+# WHAT THIS GATES ON took three tries to get right, and the two wrong answers are
+# worth keeping written down, because each looked obviously correct.
+#
+# Try 1, cen/census: of the rows the host claims exist, how many resolve to a local
+# body by hand. It separates the measured cases beautifully - 0.04 walked in against
+# 0.78 loaded from a save - and it measures the MECHANISM, not the outcome. A body
+# the join adopts and drives as a bound proxy is classified drv, not cen, so the fix
+# for this bug leaves cen at zero. A gate on it would have failed the fix. Reported
+# below, not judged.
+#
+# Try 2, an NPC count around the host's leader taken by both clients: apples to
+# apples, and it read 2.46 broken. But it comes from countNpcsNear, a spatial query,
+# and a SUPPRESSED body is hidden, not removed - it still answers the query. So the
+# metric counts bodies nobody can see, and it read 1.43 on a run where the join was
+# showing 104 bodies to the host's 105. Perfect parity, gate says two towns.
+#
+# What is judged is VISIBLE population, which is what a player can actually see,
+# built from each side's own audit line so both are measured the same way:
+#
+#   visible  = wide - hid   (enumerated, minus the ones deliberately hidden)
+#   visRatio = the join's visible population over the host's
+#
+# Measured, standing 9 u apart in Bad Teeth:
+#   pre-fix   join wide=273 hid=135 -> 138 visible, host 111 -> ratio 1.24
+#   post-fix  join wide=159 hid=55  -> 104 visible, host 105 -> ratio 0.99
+#
+# visPerCensus (visible over the host's census row count) is the same statement
+# made against the host's own claim rather than its enumeration, and it is the
+# tighter of the two because it does not depend on the host's audit firing.
+#
+# WHAT IS DELIBERATELY NOT JUDGED, and this is the substantive finding: hid. The
+# instinct is that a join hiding 55 of its own townspeople is broken, and it was the
+# gate here for two revisions. It is not. Both engines generate the town when the
+# zone streams in, and they generate DIFFERENT PEOPLE - not the same people under
+# different hands. Probing every unpaired census row against a 1200 u radius for a
+# body of the same template and faction: 75 rows paired, 49 had a twin too far out,
+# and 90 had no twin anywhere. Those 90 are population the host has and the join
+# never generated, and the join's own equivalent surplus is what hid counts. The
+# host is authoritative, so hiding it is the CORRECT outcome, and a gate on hid
+# would fail a run for behaving properly. Reported, with its parts.
+#
+# parkRate is reported for the same kind of reason: a HEALTHY Bad Teeth logged 216
+# parks/min against the broken run's 528, so a threshold there fails good runs.
+function Test-TownPopParity {
+    param([string]$HostFile, [string]$JoinFile,
+          # Pre-fix 1.24, post-fix 0.99. Banded on BOTH sides: a join that
+          # under-populates a town is also a bug, just a quieter one. The band is
+          # wide because a town is genuinely in flux - patrols leave, bodies sit at
+          # the streaming edge - and because the two sides' audits are not sampled
+          # on the same tick.
+          [double]$MinVisRatio = 0.75, [double]$MaxVisRatio = 1.18,
+          [int]$MinSamples = 6, [int]$MinCensus = 40)
+
+    $j = Get-TownArriveData -File $JoinFile
+    $h = Get-TownArriveData -File $HostFile
+    if (-not $j.start) {
+        return (Add-GateResult -Name "town_pop_parity" -Status SKIP `
+            -Detail "no TOWNARRIVE rows in the join log (scenario did not arm)")
+    }
+    if ($j.arrivedLine -lt 0) {
+        return (Add-GateResult -Name "town_pop_parity" -Status SKIP `
+            -Detail "the join never arrived, so there is no in-town window to judge (see town_arrive)")
+    }
+
+    $all = @(Get-TownAuditRows -File $JoinFile -AfterLine $j.arrivedLine)
+    $win = @($all | Where-Object { $_.census -ge $MinCensus })
+    if ($win.Count -lt $MinSamples) {
+        return (Add-GateResult -Name "town_pop_parity" -Status SKIP `
+            -Metrics @{ samples = $win.Count; auditRows = $all.Count } `
+            -Detail ("only $($win.Count) post-arrival audit sample(s) with census >= " +
+                     "$MinCensus (< $MinSamples) - too little town to judge"))
+    }
+
+    # VISIBLE population on each side, from each side's own audit: enumerated minus
+    # deliberately hidden. The host's audit only exists when it runs the authority
+    # pass too (cell authority on), so fall back to its census row count - which is
+    # the host's claim about the same town - when it does not.
+    $jVis = @($win | ForEach-Object { [double]($_.wide - $_.hid) })
+    $medJoinVis = [int](Get-TownMedian -Values $jVis)
+    $hAll = @(Get-TownAuditRows -File $HostFile -AfterLine $h.arrivedLine `
+                  -RequireFresh $false)
+    $hWin = @($hAll | Where-Object { $_.wide -ge $MinCensus })
+    $hostSource = "audit"
+    if ($hWin.Count -ge $MinSamples) {
+        $hVis = @($hWin | ForEach-Object { [double]($_.wide - $_.hid) })
+        $medHostVis = [int](Get-TownMedian -Values $hVis)
+    } else {
+        $hostSource = "census"
+        $medHostVis = [int](Get-TownMedian -Values @($win | ForEach-Object { [double]$_.census }))
+    }
+    if ($medHostVis -le 0) {
+        return (Add-GateResult -Name "town_pop_parity" -Status SKIP `
+            -Metrics @{ hostVisible = $medHostVis; joinVisible = $medJoinVis } `
+            -Detail "the host shows no town, so there is no ratio to take")
+    }
+    $visRatio = [math]::Round($medJoinVis / [double]$medHostVis, 3)
+
+    $hidF = @($win | ForEach-Object { [double]$_.hid / [double]$_.census })
+    $corr = @($win | ForEach-Object { [double]$_.cen / [double]$_.census })
+    $visC = @($win | ForEach-Object { [double]($_.wide - $_.hid) / [double]$_.census })
+    $medHid  = [math]::Round((Get-TownMedian -Values $hidF), 3)
+    $medCorr = [math]::Round((Get-TownMedian -Values $corr), 3)
+    $medVisC = [math]::Round((Get-TownMedian -Values $visC), 3)
+
+    $spanMs = $win[-1].ms - $win[0].ms
+    $spanMin = if ($spanMs -gt 0) { $spanMs / 60000.0 } else { 0.0 }
+    $parkRate = if ($spanMin -gt 0) {
+        [math]::Round(($win[-1].parks - $win[0].parks) / $spanMin, 0)
+    } else { -1 }
+    # The two corrections, side by side. A park is a teleport and the player sees
+    # every one of them; a walk is the same correction carried on the body's own
+    # feet. Neither is a fault on its own - a town in flux needs correcting - so
+    # what is worth watching is the SPLIT, and a park rate that stays high while
+    # walks stay near zero means the band is not catching the class it was aimed
+    # at (the patrols whose host copy walks away from a frozen local twin).
+    $walkRate = if ($spanMin -gt 0) {
+        [math]::Round(($win[-1].walks - $win[0].walks) / $spanMin, 0)
+    } else { -1 }
+    $proxies = Measure-TownAfter -File $JoinFile -AfterLine $j.arrivedLine `
+                   -Pattern "\[spawn\] proxy BOUND"
+    $adopts  = Measure-TownAfter -File $JoinFile -AfterLine $j.arrivedLine `
+                   -Pattern "\[spawn\] proxy ADOPT"
+    $adoptMiss = Measure-TownAfter -File $JoinFile -AfterLine $j.arrivedLine `
+                   -Pattern "\[spawn\] adopt MISS"
+    $missing = Measure-TownAfter -File $JoinFile -AfterLine $j.arrivedLine `
+                   -Pattern "\[spawn\] census-missing"
+
+    $medCensus = [int](Get-TownMedian -Values @($win | ForEach-Object { [double]$_.census }))
+    $medHidN   = [int](Get-TownMedian -Values @($win | ForEach-Object { [double]$_.hid }))
+    $medWide   = [int](Get-TownMedian -Values @($win | ForEach-Object { [double]$_.wide }))
+    $medDrv    = [int](Get-TownMedian -Values @($win | ForEach-Object { [double]$_.drv }))
+    $metrics = @{
+        samples = $win.Count; windowSec = [math]::Round($spanMs / 1000.0, 0)
+        visRatio = $visRatio; visPerCensus = $medVisC
+        joinVisible = $medJoinVis; hostVisible = $medHostVis
+        hostVisibleFrom = $hostSource
+        hidFrac = $medHid; corrFrac = $medCorr
+        medCensus = $medCensus; medHid = $medHidN
+        medWide = $medWide; medDrv = $medDrv
+        proxiesBound = $proxies; proxiesAdopted = $adopts
+        adoptMisses = $adoptMiss; censusMissing = $missing
+        parksPerMin = $parkRate; walksPerMin = $walkRate
+    }
+
+    $why = ""
+    if ($visRatio -gt $MaxVisRatio) {
+        $why = "the join is showing more town than the host has - $medJoinVis " +
+               "visible bodies to the host's $medHostVis (ratio=$visRatio > " +
+               "$MaxVisRatio), from wide=$medWide less hid=$medHidN, against " +
+               "$medCensus census row(s), with $proxies mint(s) and $adopts " +
+               "adoption(s): the two clients are each contributing a population"
+    } elseif ($visRatio -lt $MinVisRatio) {
+        $why = "the join is missing town - $medJoinVis visible bodies to the host's " +
+               "$medHostVis (ratio=$visRatio < $MinVisRatio), with $missing " +
+               "census-missing row(s) and $adoptMiss unpaired"
+    }
+    $v = if ($why) { "FAIL" } else { "PASS" }
+    if (-not $why) {
+        $why = "one town on both clients - $medJoinVis visible bodies to the host's " +
+               "$medHostVis (ratio=$visRatio, $medVisC per census row), from " +
+               "wide=$medWide less hid=$medHidN, $proxies mint(s) + $adopts " +
+               "adoption(s), $adoptMiss unpaired, $parkRate park(s)/min over " +
+               "$($metrics.windowSec)s (hid frac=$medHid, cen frac=$medCorr, reported)"
+    }
+    Write-Host "  TOWN-POP-PARITY $v - $why"
+    return (Add-GateResult -Name "town_pop_parity" -Status $v -Metrics $metrics -Detail $why)
+}

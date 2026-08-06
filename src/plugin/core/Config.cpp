@@ -225,6 +225,7 @@ void loadConfig(Config& c) {
     c.recruitSync = envOr("KENSHICOOP_RECRUIT_SYNC", "1") != "0";
     c.factionSync = envOr("KENSHICOOP_FACTION_SYNC", "1") != "0";
     c.timeSync    = envOr("KENSHICOOP_TIME_SYNC", "1") != "0";
+    c.timeBrake   = envOr("KENSHICOOP_TIME_BRAKE", "1") != "0";
     c.doorSync    = envOr("KENSHICOOP_DOOR_SYNC", "1") != "0";
     c.buildSync   = envOr("KENSHICOOP_BUILD_SYNC", "1") != "0";
     c.bdoorSync   = envOr("KENSHICOOP_BDOOR_SYNC", "1") != "0";
@@ -314,6 +315,53 @@ void loadConfig(Config& c) {
         std::string cp = envOr("KENSHICOOP_CENSUS_PARK", "");
         c.censusParkDist = cp.empty() ? 120.0f : (float)std::atof(cp.c_str());
         if (c.censusParkDist < 0.0f) c.censusParkDist = 0.0f;
+        // Census walk band: how far past the park distance a diverged copy is
+        // WALKED back to the host's position rather than teleported there. "0"
+        // (explicit) restores teleport-at-every-distance; absent = 400 u.
+        //
+        // The floor of the band is censusParkDist_ and the ceiling separates two
+        // different kinds of divergence. Below it a copy is BEHIND its
+        // counterpart and can catch up on foot: Bad Teeth measured that class at
+        // a median 154 u, patrol templates whose host copy walks a route the
+        // join's copy is frozen out of following. Above it a copy is not behind
+        // but ELSEWHERE - the pack-hidden class, measured 500-900 u, standing
+        // where its counterpart has never been - and there is nothing to
+        // converge to on foot; walking would cross whatever lies between and
+        // take a minute of world time to arrive. 400 u sits clear of both.
+        std::string cw = envOr("KENSHICOOP_CENSUS_WALK", "");
+        c.censusWalkDist = cw.empty() ? 400.0f : (float)std::atof(cw.c_str());
+        if (c.censusWalkDist < 0.0f) c.censusWalkDist = 0.0f;
+        // Census adoption radius: how far from a census row's reported position
+        // the join will look for one of its OWN bodies to bind to that row
+        // instead of minting a proxy over it. "0" (explicit) disables adoption
+        // and restores the defer-only duplicate guard; absent = 600 u default.
+        //
+        // MEASURED. Both clients generate the town at the same spawn points, but
+        // they have been simulating it independently since the zone streamed in, so
+        // the question is how far the two copies of one townsperson drift before
+        // the census round trip pairs them. Distances actually used to adopt, from
+        // a run with the radius opened to 600 u so the distribution was visible
+        // (run 20260806_141604, 83 adoptions):
+        //
+        //   median 16 u   p90 290 u   max 588 u
+        //   <= 20 u: 52%   <= 60 u: 71%   <= 150 u: 86%   <= 250 u: 89%
+        //
+        // The twins are CLOSE, and the tail is thin: the whole 250-600 u band is 9
+        // of 83 pairings. So the radius is set just past the knee at 250 u rather
+        // than at the widest reach that still finds matches. Beyond the knee each
+        // extra unit buys a handful of the least trustworthy pairings - two bodies
+        // that share a template but are half a town apart - and charges a long
+        // teleport at bind time plus a sphere query that grows with the cube of the
+        // radius, right at the zone load where the frame budget is already worst.
+        //
+        // (An earlier reading of the same data said median 348 u and argued for
+        // 600. It measured the distance from each MINTED row to the nearest body
+        // the join had HIDDEN, which pairs rows against bodies of any template at
+        // any time in the run - a lower bound on "was a twin available", not a
+        // measurement of how far the actual twin was.)
+        std::string adr = envOr("KENSHICOOP_ADOPT_RADIUS", "");
+        c.adoptRadius = adr.empty() ? 250.0f : (float)std::atof(adr.c_str());
+        if (c.adoptRadius < 0.0f) c.adoptRadius = 0.0f;
         // Attention gate: "0" (explicit) disables - every body counts as
         // observed and reconciliation behaves exactly as it did before the
         // gate existed. Absent = 1000 u default.
@@ -394,6 +442,7 @@ std::string describeConfig(const Config& c) {
         { "money",   c.moneySync },
         { "spawn",   c.spawnSync },    { "recruit", c.recruitSync },
         { "faction", c.factionSync },  { "time",    c.timeSync },
+        { "timeBrake", c.timeBrake },
         { "door",    c.doorSync },     { "build",   c.buildSync },
         { "bdoor",   c.bdoorSync },    { "hunger",  c.hungerSync },
         { "save",    c.saveSync },     { "load",    c.loadSync },
@@ -423,11 +472,11 @@ std::string describeConfig(const Config& c) {
     s += "]";
     char b[192];
     _snprintf(b, sizeof(b) - 1,
-              " censusR=%.0f mintR=%.0f park=%.0f snap=%.1f/%.2fs armMs=%lu"
-              " attnR=%.0f cellAuth=%d",
+              " censusR=%.0f mintR=%.0f park=%.0f walk=%.0f snap=%.1f/%.2fs"
+              " armMs=%lu attnR=%.0f cellAuth=%d",
               c.censusRadius, c.spawnMintRadius, c.censusParkDist,
-              c.snapDist, c.snapSeconds, c.scenarioArmTimeoutMs,
-              c.attentionRadius, c.cellAuth ? 1 : 0);
+              c.censusWalkDist, c.snapDist, c.snapSeconds,
+              c.scenarioArmTimeoutMs, c.attentionRadius, c.cellAuth ? 1 : 0);
     b[sizeof(b) - 1] = '\0';
     s += b;
     return s;

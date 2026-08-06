@@ -316,6 +316,65 @@
             Tier = 'probe'; WanVariant = $false
         }
 
+        # town_arrive: walk into a town this save has never loaded, at travel speed.
+        #
+        # The gap this closes. Every other town scenario LOADS a save taken in the
+        # town, so both clients read the same baked bodies and the hands match:
+        # measured in Bad Teeth from a save, 78% of the host's census rows resolve
+        # to a local body and 9% of the join's population is suppressed. That is
+        # not how a player meets a town. Walk into one and each engine GENERATES
+        # its population as the zone streams in: same spawn points, different
+        # hands. The join then cannot resolve the host's census, mints proxies for
+        # all of it, and suppresses its own natively-spawned bodies as unclaimed -
+        # the same town walked into measured 4% resolved and 68% suppressed, with
+        # 225 proxy binds and 264 census-missing rows (session 20260806_1224). On
+        # screen: a town of NPCs popping in and out. Loading that same town from a
+        # save made it go away, which is what isolated it to zone load time and is
+        # why this scenario has to arrive on foot.
+        #
+        # Geometry, both measured from that session rather than guessed. The park
+        # point (-35747,-14509) is the cell claim one cell short of town, where the
+        # join's audit reported census=0 wide=0 - none of the town in memory, which
+        # is the property it is chosen for. The target (-32899,-20539) is the
+        # camera centre standing in it. 6,668 u apart.
+        #
+        # Navigation is self-guiding (aim 500 u along the bearing, re-aimed every
+        # sample, sidestep by growing angles when it stops closing) rather than a
+        # recorded route like run_apart. Over 6.7 k u the router copes with short
+        # legs, and the scenario then retargets to any town via
+        # KENSHICOOP_TOWN_FROM / KENSHICOOP_TOWN_AT ("x,z") instead of needing a
+        # new recording. The gates judge population identity, not this town.
+        #
+        # 5x on both sides, re-voted, with the combat cap cleared for run_apart's
+        # reason: town travel at speed is what a player does and what leaves the
+        # streaming machinery least time to keep up, and a fight en route must cost
+        # a detour rather than pinning the sim to 1x for the rest of the approach.
+        #
+        # runfar1: two tabs together, buffed enough to cross bandit country, and a
+        # tracked fixture so run_test.ps1 restores it every run. NOTE the standing
+        # requirement on this fixture - it must never have VISITED the target town,
+        # or the population is baked into it and the scenario measures nothing. The
+        # check is that this test FAILS on a build without the fix; a pass on an
+        # unfixed build means the fixture, not the code, has changed.
+        #
+        # Seconds/KillGraceSec outlive the worst case: 240 s of approach deadline
+        # plus a 120 s in-town hold plus the host's 10 s overhang = 370 s.
+        town_arrive = @{
+            Save = 'runfar1'; Setup = ''; Tolerance = 18.0
+            Seconds = 430; KillGraceSec = 400
+            PrimaryGate = 'town_arrive'
+            Gating   = @('town_arrive', 'town_pop_parity', 'clock_sync')
+            Advisory = @('existence_parity', 'lifecycle', 'suppress_churn',
+                         'anti_zombie', 'mint_dist', 'smoothness', 'snap_rate')
+            # ADOPT_RADIUS is pinned rather than inherited from the DLL default so
+            # the run records the reach it measured against, and so the A/B against
+            # pre-adoption behaviour ('0') is a one-line edit here, not a rebuild.
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1'
+                         KENSHICOOP_SPEED_COMBAT_CAP = '0'
+                         KENSHICOOP_ADOPT_RADIUS = '250' }
+            Tier = 'probe'; WanVariant = $false
+        }
+
         # cell_probe: measure ZoneManager's sector grid before any authority is
         # keyed on it. Read-only - no park, no mutation - so the SAVE is the
         # experiment: on 'sync' (a live town, both tabs together) it answers
@@ -1580,14 +1639,14 @@
         # world_parity: full-roster cross-client parity on the dense 'camp'
         # prison save. Nothing scripted - both sides run their sims while the
         # replicator's 5 s auditRows dumps (SCENARIO WORLD/WNPC with the
-        # task=/pelvis=/mv= parity fields and cls=pc player rows) feed
+        # task=/pelvis=/mv=/carry= parity fields and cls=pc player rows) feed
         # Test-WorldParity's tiered judgment:
         #   PC tier     - every player character present on both sides, hard
         #                 position gate (a diverged host-PC is invisible to
         #                 every other oracle: the NPC dumps exclude the squad)
-        #   near tier   - host rows within 260 u of a PC anchor: existence,
-        #                 position and task parity on the join
-        #   census tier - 260-2000 u: existence + position within the park
+        #   near tier   - host rows within the ~200 u position-stream bubble:
+        #                 existence, position and task parity on the join
+        #   census tier - 200-1800 u: existence + position within the park
         #                 threshold; task not judged (local-sim copies)
         # Seconds/KillGraceSec: the 180 s host window outlives the default
         # 150 s self-exit + kill grace (same pattern as travel_parity).

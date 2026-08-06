@@ -127,6 +127,66 @@ Character* sameTemplateNear(GameWorld* gw, const char* charSid,
     }
 }
 
+// SEH-guarded (join, census ADOPTION 2026-08-06): nearest same-template (and
+// same-faction, when known) world NPC within 'radius', with its distance. See the
+// Engine.h note for why this is not sameTemplateNear with a flag - the caller
+// BINDS what it gets back, so the best match matters rather than any match.
+//
+// Faction is compared only when both sides could read one: it is best-effort on
+// the host (a blank facSid means "unknown", not "no faction") and can fail locally
+// through the same vtable, so an unreadable faction is not evidence against a
+// match. Getting that backwards would reject every candidate on a modded install
+// and quietly restore the duplicate-town behaviour.
+Character* adoptCandidateNear(GameWorld* gw, const char* charSid,
+                              const char* facSid,
+                              float x, float y, float z, float radius,
+                              Character* const* excl, unsigned int exclCount,
+                              float* outDist) {
+    if (outDist) *outDist = -1.0f;
+    if (!gw || !g_getCharsFn || !charSid || !charSid[0] || radius <= 0.0f) return 0;
+    __try {
+        Ogre::Vector3 center(x, y, z);
+        g_npcQuery.clear();
+        // 512 rather than sameTemplateNear's 96: an adoption radius covers a whole
+        // town square, and a truncated candidate list silently becomes a mint.
+        g_getCharsFn(gw, &g_npcQuery, &center, radius, radius, radius, 512, 512, 0);
+        unsigned int total = g_npcQuery.size();
+        Character* best = 0;
+        float bestD = 0.0f;
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* obj = g_npcQuery[i];
+            if (!obj || isPlayerSquad(gw, obj)) continue;
+            Character* ch = static_cast<Character*>(obj);
+            bool skip = false;
+            for (unsigned int e = 0; e < exclCount && !skip; ++e)
+                if (excl[e] == ch) skip = true;
+            if (skip) continue;
+            GameData* gd = ch->getGameData();
+            if (!gd) continue;
+            const char* sid = gd->stringID.c_str();
+            if (!sid || strcmp(sid, charSid) != 0) continue;
+            if (facSid && facSid[0]) {
+                Faction* f = ch->getFaction();
+                if (f && g_facGetDataFn) {
+                    GameData* fd = g_facGetDataFn(f);
+                    if (fd) {
+                        const char* lf = fd->stringID.c_str();
+                        if (lf && lf[0] && strcmp(lf, facSid) != 0) continue;
+                    }
+                }
+            }
+            Ogre::Vector3 p = ch->getPosition();
+            float dx = p.x - x, dy = p.y - y, dz = p.z - z;
+            float d = (float)sqrt((double)(dx * dx + dy * dy + dz * dz));
+            if (!best || d < bestD) { best = ch; bestD = d; }
+        }
+        if (best && outDist) *outDist = bestD;
+        return best;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
                          float x, float y, float z, float heading, float age) {
     if (!gw || !gw->theFactory || !g_createCharFn || !charSid || !charSid[0]) return 0;

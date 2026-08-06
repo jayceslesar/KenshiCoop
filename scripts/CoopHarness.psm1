@@ -102,6 +102,14 @@ $script:CoopDiagEnvKeys = @(
     # host's rebuilt armour reads alv=-1, not even Gear). Managed here rather than left
     # ambient so a stale shell value cannot silently decide what a run measured.
     'KENSHICOOP_GEAR_LEVEL'
+    # --- census adoption reach (Config.cpp) --------------------------------------
+    # Ships at 250 u: the join binds a census row to one of its OWN bodies of that
+    # template instead of minting a proxy beside it, which is what stops a
+    # separately-generated town from being built twice on the join. NOT a 0/1 gate -
+    # it carries the radius, and "0" turns adoption off. Managed here so town_arrive
+    # can pin the value it measured against instead of inheriting whatever the DLL
+    # currently ships, and so the A/B is a manifest edit rather than a rebuild.
+    'KENSHICOOP_ADOPT_RADIUS'
 )
 
 function Get-CoopDiagEnvKeys {

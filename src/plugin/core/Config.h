@@ -97,6 +97,21 @@ struct Config {
     // per-key cooldown). The census carries positions per row; existence
     // culling is untouched. 0 disables parking.
     float        censusParkDist;    // KENSHICOOP_CENSUS_PARK          (120 u)
+    float        censusWalkDist;    // KENSHICOOP_CENSUS_WALK          (400 u)
+
+    // Census ADOPTION reach (zone-load population parity, 2026-08-06): how far
+    // from a census row's position the join looks for one of its OWN bodies of
+    // the same template+faction to BIND to that row, instead of minting a proxy
+    // beside it. The zone-generated town case: both engines create the population
+    // when the zone streams in, from the same spawn points but with different
+    // engine hands, so nothing resolves, the join mints a full duplicate town and
+    // suppresses its own - measured 231 bodies against the host's 111, 133 mints
+    // and 125 hidden. Adoption binds the body that is already standing there.
+    // Sized off the MEASURED drift between the two copies of one townsperson
+    // (median 16 u, 86% inside 150 u) rather than off spawn accuracy - see the
+    // Config.cpp note for the distribution and for what the tail costs.
+    // 0 disables adoption (defer-only duplicate guard, i.e. the old behaviour).
+    float        adoptRadius;       // KENSHICOOP_ADOPT_RADIUS         (250 u)
 
     // Attention gate (attention-gated reconciliation): how close an interest
     // anchor - either client's tab leaders, either client's camera - must be
@@ -386,6 +401,16 @@ struct Config {
     // measures raw unsynced drift and its speed burst isn't re-arbitrated).
     // "0" is the A/B escape hatch.
     bool          timeSync;
+
+    // KENSHICOOP_TIME_BRAKE (default ON): the HOST half of that correction.
+    // Catching up only works while there is room above the consensus speed,
+    // and the slew clamps at 5x - so at a travelling session's 5x the join
+    // saturates and the offset simply stands (run 20260806_153111: slew pinned
+    // at 2.00 for 168 s, both clocks advancing at the same rate, offset flat at
+    // 0.16 gh). Down has room at every speed, so the host slows its own sim -
+    // locally, never on the wire - while the join is behind and out of
+    // headroom. "0" restores join-catches-up-or-nothing.
+    bool          timeBrake;
 
     // KENSHICOOP_DOOR_SYNC (default ON): door/gate state sync (protocol 26) -
     // a symmetric change-gated channel: both clients sample nearby baked

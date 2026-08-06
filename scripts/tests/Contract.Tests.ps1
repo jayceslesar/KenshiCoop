@@ -263,7 +263,8 @@ Check "CoopHarness exposes a non-empty DiagEnv keyset" ($diagKeys.Count -gt 0)
 $badDiag = @()
 # Every knob is a 0/1 gate EXCEPT the few that carry a magnitude (a batch cap, say). Those are
 # named here rather than loosening the rule, so a typo in a real gate still fails loudly.
-$numericDiagKeys = @('KENSHICOOP_WI_BATCH_MAX', 'KENSHICOOP_WD_TRANSIENT_DEAD')
+$numericDiagKeys = @('KENSHICOOP_WI_BATCH_MAX', 'KENSHICOOP_WD_TRANSIENT_DEAD',
+                     'KENSHICOOP_ADOPT_RADIUS')
 foreach ($name in $scenarios.Keys) {
     $e = $scenarios[$name]
     if (-not $e.ContainsKey('DiagEnv')) { continue }

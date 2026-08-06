@@ -2173,7 +2173,11 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         if (changed || userActed || speedLastSendMs_ == 0 ||
             (now - speedLastSendMs_) >= RESEND_MS) {
             bool effPaused = (eff <= EPS);
-            // slewedEffective is identity on the host (timeSlew_ stays 1.0).
+            // slewedEffective carries the clock brake on the host exactly as it
+            // carries the slew on the join (protocol 25). What goes out on the
+            // wire below is the UNSLEWED eff: the brake is the host's own sim
+            // running slow to let the join close a gap, and broadcasting it
+            // would slow the join by the same factor and close nothing.
             if (engine::writeGameSpeedQuiet(gw, slewedEffective(eff), effPaused))
                 speedLastApplied_ = eff;
             SpeedPacket pkt;
@@ -2251,8 +2255,84 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
     unsigned long now = nowMs();
 
     if (isHost) {
-        // The authority just broadcasts its absolute clock at ~1 Hz; the join
-        // does all the correcting. timeSlew_ stays 1.0 here by construction.
+        // THE BRAKE (2026-08-06). The host used to be a pure clock reference -
+        // it broadcast its hours and never corrected, leaving the join to close
+        // every offset by running FASTER. That works only while there is room
+        // above the consensus speed, and slewedEffective clamps at 5x, which is
+        // also where a session that wants to travel sits. Measured at that
+        // ceiling (run 20260806_153111): the join held slew=2.00 for all 168 s
+        // and the two clocks advanced at 137.3 and 137.1 game-seconds per real
+        // second - the same rate - with the offset flat at 0.16 gh throughout.
+        // The join was asking for 10x, receiving 5x, and the controller was
+        // saturated and open-loop for the entire run.
+        //
+        // So give the correction its other direction. Down has room at every
+        // speed: the host slows ITSELF while the join is behind and cannot
+        // catch up on its own. What is broadcast stays the unslewed consensus,
+        // exactly as the join's own slew is local to the join - if the brake
+        // went out on the wire both sims would slow together and the gap would
+        // never close.
+        //
+        // This matters well beyond the clock reading right. 0.16 gh is about
+        // ten game-minutes, and a townsperson walks a few hundred units in
+        // that: the host's copy is that much further along its route than the
+        // join's, which is the same magnitude as the divergence the census park
+        // and walk-converge bands spend the whole town correcting. A clock gap
+        // is a position gap everywhere at once.
+        const TimePacket* jn = 0;
+        for (std::deque<InboundTime>::iterator it = got.begin();
+             it != got.end(); ++it) {
+            if (timeSeqSeen_ != 0 && (long)(it->pkt.seq - timeSeqSeen_) <= 0)
+                continue;
+            timeSeqSeen_ = it->pkt.seq;
+            jn = &it->pkt;
+        }
+        if (jn && timeBrake_) {
+            double localH = -1.0;
+            if (engine::readGameClock(gw, &localH, 0) && localH >= 0.0) {
+                double lag = localH - jn->gameHours; // >0 = the join is BEHIND
+                // How much catch-up the join can still muster on its own,
+                // computed rather than reported: its slew caps at 2x and
+                // slewedEffective clamps the product at 5x, so the consensus
+                // speed alone says whether it has anywhere left to go. At 2.5x
+                // and below it can still double; at 5x it has nothing. Braking
+                // when the join can fix the gap itself would slow the host
+                // player's game for no reason.
+                float eff  = (speedLastSet_ > 0.01f) ? speedLastSet_ : 1.0f;
+                float head = 5.0f / eff;          // ceiling / consensus
+                if (head > 2.0f) head = 2.0f;     // ...but its own cap first
+                const double B_ENGAGE_GH    = 0.01;   // as the join's
+                const double B_DISENGAGE_GH = 0.002;
+                const double B_GAIN         = 15.0;   // gentler: the slow loop
+                const double B_FLOOR        = -0.40;  // never below 0.6x
+                bool braking = (timeSlew_ < 0.999f);
+                bool engage  = head < 1.10f &&
+                               (braking ? (lag > B_DISENGAGE_GH)
+                                        : (lag > B_ENGAGE_GH));
+                float newSlew = 1.0f;
+                if (engage) {
+                    double d = -lag * B_GAIN;
+                    if (d < B_FLOOR) d = B_FLOOR;
+                    newSlew = (float)(1.0 + d);
+                }
+                bool slewChanged = fabs(newSlew - timeSlew_) > 0.01f;
+                timeSlew_ = newSlew;
+                if (slewChanged && speedLastSet_ > 0.01f) {
+                    float want = slewedEffective(speedLastSet_);
+                    if (engine::writeGameSpeedQuiet(gw, want, false))
+                        timeSlewApplied_ = want;
+                }
+                if (slewChanged || timeLastLogMs_ == 0 ||
+                    (now - timeLastLogMs_) >= 5000) {
+                    timeLastLogMs_ = now;
+                    char b[176]; _snprintf(b, sizeof(b) - 1,
+                        "[time] BRAKE lag=%.4fgh slew=%.2f head=%.2f eff=%.2f "
+                        "local=%.5f join=%.5f",
+                        lag, timeSlew_, head, eff, localH, jn->gameHours);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
         const unsigned long SEND_MS = 1000;
         if (timeLastSendMs_ != 0 && (now - timeLastSendMs_) < SEND_MS) return;
         double hours = -1.0;
@@ -2331,6 +2411,24 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                   "[time] OFFSET off=%.4fgh slew=%.2f host=%.5f local=%.5f",
                   off, timeSlew_, newest->gameHours, local);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Report our own clock back, on the same channel and cadence. The host
+    // cannot brake for a lag it cannot see, and this is the whole of what it
+    // needs: it derives the join's remaining headroom from the consensus speed
+    // it set itself. Sent from inside the sample handler, so the report is
+    // naturally paced by the host's own 1 Hz broadcast and a join that is
+    // hearing nothing says nothing.
+    const unsigned long REPORT_MS = 1000;
+    if (timeLastSendMs_ == 0 || (now - timeLastSendMs_) >= REPORT_MS) {
+        timeLastSendMs_ = now;
+        TimePacket mine;
+        memset(&mine, 0, sizeof(mine));
+        mine.type      = (u8)PKT_TIME;
+        mine.ownerId   = ownerId;
+        mine.seq       = timeSeqOut_++;
+        mine.gameHours = local;
+        net.queueTime(mine);
     }
 }
 

@@ -13,6 +13,23 @@
 
 namespace coop {
 
+// Destroy a bound proxy body only if we are the ones who created it (see
+// mintedBodies_ in Replicator.h). Returns true if it was destroyed - the pointer
+// is DEAD after that - and false for an adopted body, which the caller must leave
+// standing and merely unbind.
+//
+// The distinction has real teeth on the peer-left path, which walks the whole
+// proxy map: before adoption every entry there was a body this client minted, so
+// destroying all of them was right. An adopted entry is one of our own townspeople,
+// and destroying those would empty the town the moment the host disconnected.
+bool Replicator::destroyIfMinted(GameWorld* gw, Character* c) {
+    if (!c) return false;
+    std::set<Character*>::iterator m = mintedBodies_.find(c);
+    if (m == mintedBodies_.end()) return false; // adopted / not ours to destroy
+    mintedBodies_.erase(m);
+    return engine::despawnProxyNpc(gw, c);
+}
+
 void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                             bool isHost) {
     // Request pacing: per-hand debounce (the reliable channel guarantees
@@ -77,11 +94,17 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             const Key& bk = it->first;
             Character* orig = engine::resolveCharByHand(bk.i, bk.s, bk.t, bk.c, bk.cs);
             if (orig && orig != it->second) {
-                engine::despawnProxyNpc(gw, it->second);
-                char b[176]; _snprintf(b, sizeof(b) - 1,
+                // An ADOPTED body is only unbound here, never destroyed: it is one
+                // of ours, and the hand resolving to something else means our guess
+                // about which body answered that row was wrong, not that this body
+                // should stop existing.
+                bool destroyed = destroyIfMinted(gw, it->second);
+                char b[200]; _snprintf(b, sizeof(b) - 1,
                     "[spawn] proxy DUPE-HEAL hand=%u,%u,%u,%u,%u (original resolved; "
-                    "proxy destroyed, proxies=%u)",
-                    bk.t, bk.c, bk.cs, bk.i, bk.s, (unsigned)proxyByKey_.size() - 1);
+                    "%s, proxies=%u)",
+                    bk.t, bk.c, bk.cs, bk.i, bk.s,
+                    destroyed ? "proxy destroyed" : "adopted body unbound",
+                    (unsigned)proxyByKey_.size() - 1);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 spawnReq_.erase(bk); // hand resolves now - no REQ needed again
                 lifeSet(bk, LIFE_RESOLVED, "dupe-heal");
@@ -227,7 +250,14 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         nSquad = engine::captureSquad(gw, false, squad, MAX_SQUAD);
 
     const unsigned int MINT_BUDGET_PER_TICK = 4;
+    // Adoption is bounded by its spatial query, not by body creation, so it gets a
+    // looser budget than the mint: a town answers ~100 census rows and adopting 4
+    // per tick would take most of the approach to converge. Not unlimited though -
+    // the queries land in a burst exactly at zone load, where the frame budget is
+    // already worst - so 8, which clears a town in a couple of seconds.
+    const unsigned int ADOPT_BUDGET_PER_TICK = 8;
     unsigned int mintedThisTick = 0;
+    unsigned int adoptedThisTick = 0;
     for (std::deque<InboundSpawnInfo>::iterator it = got.begin();
          it != got.end(); ++it) {
         const SpawnInfoPacket& p = it->pkt;
@@ -269,6 +299,144 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         for (unsigned int i = 0; i < nSquad; ++i) {
             float d = dist3(p.x, p.y, p.z, squad[i].x, squad[i].y, squad[i].z);
             if (mintDist < 0.0f || d < mintDist) mintDist = d;
+        }
+        // ADOPTION (2026-08-06, zone-load population parity). Deferring a mint was
+        // only ever half an answer, and the two halves of the system spent a town
+        // undoing each other: the dupe guard below defers because a twin stands
+        // there, the authority pass then SUPPRESSES that twin because its local
+        // hand is not in the host's census, and a suppressed body is excluded from
+        // the guard's own candidate list - so the retry 5 s later sees no twin and
+        // mints after all. Walking into Bad Teeth measured the end state of that
+        // loop: 133 mints against 125 suppressions, the join counting 231 bodies
+        // where the host standing 9 u away counted 111. Two towns on one spot, with
+        // the join's own one hidden underneath.
+        //
+        // So BIND the twin instead of deferring to it. The census row and the local
+        // body are the same townsperson: both engines generated this population
+        // from the same spawn points when the zone streamed in, and only the engine
+        // hands differ. Binding into proxyByKey_ hands the body to the host's
+        // stream and inherits the entire existing proxy path - drive, park, freeze,
+        // liveness sweep - and because bound proxies are exempt from suppression it
+        // closes the loop at both ends at once: no duplicate stands up, and no own
+        // body gets hidden. rekeyPeerBody does exactly this bind for a recruit; the
+        // only new thing here is choosing WHICH body from evidence (template,
+        // faction, proximity) instead of being told by a reliable edge.
+        //
+        // Adoption cannot be as certain as a re-key, and its failure mode is a
+        // crowd of one template pairing crosswise - the join's "Bob" driven by the
+        // host's "Alice". They share a template and faction and stand metres apart,
+        // so it is invisible in the world; the cost is per-body state (a name, a
+        // wound, an inventory) landing on the wrong twin. Against a doubled town
+        // that is worth it, and nearest-first pairing keeps it rare.
+        // KENSHICOOP_ADOPT_RADIUS=0 restores defer-only.
+        //
+        // PLACED ABOVE the far / near-unloaded / budget gates deliberately: every
+        // one of those exists to protect the act of CREATING a body (mint into an
+        // unloaded block, a hitch from many creates in one tick), and adoption
+        // creates nothing. It gets its own, looser budget for the one cost it does
+        // have, the spatial query.
+        if (rq.fromCensus && !rq.forceReq && adoptRadius_ > 0.0f &&
+            adoptedThisTick < ADOPT_BUDGET_PER_TICK) {
+            static Character* aExcl[NPC_CENSUS_MAX]; // main-thread only
+            unsigned int ane = 0;
+            for (std::map<Key, Character*>::iterator pi = proxyByKey_.begin();
+                 pi != proxyByKey_.end() && ane < NPC_CENSUS_MAX; ++pi)
+                aExcl[ane++] = pi->second;
+            // Bodies the peer's stream is already driving are spoken for: they
+            // resolved by hand, so they are correlated by something far stronger
+            // than proximity, and binding one to a DIFFERENT row would hijack a
+            // correct correlation to serve a guess.
+            for (std::set<Character*>::iterator di = drivenChars_.begin();
+                 di != drivenChars_.end() && ane < NPC_CENSUS_MAX; ++di)
+                aExcl[ane++] = *di;
+            // Note the asymmetry with the dupe guard below, which also excludes
+            // suppressed bodies: a hidden twin is the BEST candidate adoption has,
+            // because it is hidden precisely for the reason we are here - the
+            // host's census does not name its hand. Excluding them is what let the
+            // old loop escape into a mint, so adoption restores and binds them.
+            // Search WIDER than we are willing to bind, so that a row we decline
+            // still tells us how far its twin was. Without that the logs can only
+            // report successes inside whatever radius is configured, which is the
+            // measurement that made the first two radius choices wrong: one read a
+            // 348 u median off unmatched hidden bodies, the other read a 16 u median
+            // off the successes of a 600 u radius. The declines are the evidence.
+            const float ADOPT_PROBE_RADIUS = 1200.0f;
+            float probeR = adoptRadius_ > ADOPT_PROBE_RADIUS
+                               ? adoptRadius_ : ADOPT_PROBE_RADIUS;
+            float adoptD = -1.0f;
+            Character* twin = engine::adoptCandidateNear(gw, p.charSid, p.facSid,
+                                                         p.x, p.y, p.z, probeR,
+                                                         aExcl, ane, &adoptD);
+            if (twin && adoptD > adoptRadius_) {
+                // A twin exists but is further out than we trust. Say so, with the
+                // distance, and fall through to the mint.
+                char b[208]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] adopt MISS hand=%u,%u,%u,%u,%u sid='%s' d=%.0f "
+                    "radius=%.0f probe=%.0f (nearest twin out of reach)",
+                    k.t, k.c, k.cs, k.i, k.s, p.charSid, adoptD, adoptRadius_,
+                    probeR);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                twin = 0;
+            } else if (!twin) {
+                char b[192]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] adopt MISS hand=%u,%u,%u,%u,%u sid='%s' d=-1 "
+                    "radius=%.0f probe=%.0f (no same-template body in reach)",
+                    k.t, k.c, k.cs, k.i, k.s, p.charSid, adoptRadius_, probeR);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // Last identity check, which only the replicator can make: if the
+            // host's census NAMES this candidate's own local hand, the body is
+            // already correlated to some row of its own and must not be re-bound to
+            // this one. Rare in a freshly generated town (nothing resolves there, so
+            // nothing is named), decisive in a town that is part baked and part
+            // generated. Declining is enough - a body that is census-named is not
+            // the one this row is missing.
+            if (twin) {
+                unsigned int th[5];
+                if (engine::readHand(twin, th)) {
+                    Key tk; tk.t = th[0]; tk.c = th[1]; tk.cs = th[2];
+                    tk.i = th[3]; tk.s = th[4];
+                    if (censusHands_.find(tk) != censusHands_.end()) twin = 0;
+                }
+            }
+            if (twin) {
+                // suppressed_ is keyed by the body's LOCAL hand - the very hand we
+                // could not correlate - so the entry has to be found by pointer.
+                bool wasHidden = false;
+                for (std::map<Key, Character*>::iterator si = suppressed_.begin();
+                     si != suppressed_.end(); ++si) {
+                    if (si->second != twin) continue;
+                    engine::restoreNpc(gw, twin);
+                    suppressed_.erase(si);
+                    wasHidden = true;
+                    break;
+                }
+                // Hand the body over on the same terms spawnProxyNpc creates one:
+                // land it on the host's transform, then quiet its local AI. Both
+                // matter more here than at a mint, because an adopted body arrives
+                // with a life already in progress - it is mid-errand on a town
+                // schedule, up to adoptRadius_ away from where the host has it. Skip
+                // the park and the first driven frame slides it across the square;
+                // skip the AI detach and the townsperson keeps re-deciding to walk
+                // back to its stool, fighting the stream for as long as it is bound.
+                engine::park(twin, p.x, p.y, p.z, p.heading);
+                engine::detachFromTownAI(twin);
+                engine::clearGoals(twin);
+                proxyByKey_[k] = twin;
+                ++adoptedThisTick;
+                ++censusAdopts_;
+                lifeSet(k, LIFE_RESOLVED, "adopt");
+                if (p.dead) targets_[k].deathLatched = true;
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] proxy ADOPT hand=%u,%u,%u,%u,%u sid='%s' fac='%s' "
+                    "d=%.0f radius=%.0f hidden=%d dead=%d mintDist=%.0f "
+                    "(proxies=%u adopts=%lu)",
+                    k.t, k.c, k.cs, k.i, k.s, p.charSid, p.facSid,
+                    adoptD, adoptRadius_, wasHidden ? 1 : 0, p.dead ? 1 : 0,
+                    mintDist, (unsigned)proxyByKey_.size(), censusAdopts_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                continue;
+            }
         }
         if (spawnMintRadius_ > 0.0f &&
             (mintDist < 0.0f || mintDist > spawnMintRadius_)) {
@@ -346,6 +514,11 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         // 20u) deferred forever (near 0/4), while far spawns into empty terrain
         // bound fine (far 4/4). Restores pre-guard stream-REQ minting; the census
         // path keeps the dupe protection it was built for.
+        // ADOPTION ran earlier in this loop and has already had its chance at this
+        // row: if a twin were bindable we would not have reached the mint. What is
+        // left for this guard is the case adoption will not touch - a same-template
+        // body under a hand we cannot correlate and have no confidence to BIND
+        // (faction mismatch, or adoption switched off) - so it stays a defer.
         if (rq.fromCensus && !rq.forceReq) {
             static Character* excl[NPC_CENSUS_MAX]; // main-thread only
             unsigned int ne = 0;
@@ -405,6 +578,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             }
         }
         proxyByKey_[k] = proxy;
+        mintedBodies_.insert(proxy);
         ++mintedThisTick;
         lifeSet(k, LIFE_RESOLVED, "mint");
         // Dead on arrival: latch the down state now (the same reliable-latch
@@ -868,7 +1042,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // (removeWorldItemProxy is for world Item* proxies and mis-handles a
         // Character body; the same rekey path already uses despawnProxyNpc for
         // its control-flip phantom cull below).
-        culled = engine::despawnProxyNpc(gw, mint) ? 1 : 0;
+        culled = destroyIfMinted(gw, mint) ? 1 : 0;
         repaired = 1;
     }
     if (c) {
@@ -956,7 +1130,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
             std::map<Key, Character*>::iterator px = proxyByKey_.find(newK);
             if (px != proxyByKey_.end()) {
                 if (px->second && px->second != c)
-                    engine::despawnProxyNpc(gw, px->second);
+                    destroyIfMinted(gw, px->second);
                 proxyByKey_.erase(px);
             }
             char cf[176]; _snprintf(cf, sizeof(cf) - 1,

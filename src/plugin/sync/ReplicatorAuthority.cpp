@@ -83,6 +83,12 @@ void Replicator::applyNpcCensus(Inbound& in) {
     // cell a body stands in.
     censusOwner_ = nc.ownerId;
     censusHands_.clear();
+    // Keep the outgoing rows as the previous sample before they are overwritten:
+    // two consecutive census positions are the only evidence the join has of how
+    // fast the host's copy of an unstreamed body is travelling, and the walk-
+    // converge band has to out-pace exactly that.
+    censusPrev_.swap(censusPos_);
+    censusPrevMs_ = censusRecvMs_;
     censusPos_.clear();
     unsigned int n = (unsigned int)(nc.hands.size() / 5);
     bool havePos = nc.pos.size() >= (size_t)n * 3;
@@ -898,12 +904,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         //                     against - pcs=0 makes the zero vacuous
         char b[448]; _snprintf(b, sizeof(b) - 1,
             "[audit] exist near=%u wide=%u drv=%u cen=%u hid=%u ghost=%u "
-            "supp=%u census=%u fresh=%d parks=%lu "
+            "supp=%u census=%u fresh=%d parks=%lu walks=%lu "
             "nearCap=%d wideCap=%d staleMs=%lu edges=%lu ghostMax=%.0f ghostEdge=%u "
             "dorm=%u attnR=%.0f dormPc=%u pcs=%u mine=%u skip=%u cells=%u",
             n, wn, cDrv, cCen, cHid, cGhost,
             (unsigned)suppressed_.size(), (unsigned)censusHands_.size(),
-            censusFresh ? 1 : 0, censusParks_,
+            censusFresh ? 1 : 0, censusParks_, censusWalks_,
             nearTrunc ? 1 : 0, wideTrunc ? 1 : 0,
             censusStaleMs_, censusStaleEdges_, ghostMaxD, ghostEdge,
             cDorm, attentionRadius_, cDormPc, nPc,
@@ -1373,23 +1379,185 @@ float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Ke
     if (censusParkDist_ <= 0.0f) return -1.0f;
     std::map<Key, CensusPos>::iterator it = censusPos_.find(k);
     if (it == censusPos_.end()) return -1.0f;
-    float d = dist3(st.x, st.y, st.z, it->second.x, it->second.y, it->second.z);
-    if (d <= censusParkDist_) return d;
+    // HORIZONTAL divergence only (2026-08-06). This was dist3, and height is the
+    // one axis a park cannot correct: park writes the transform, then the engine
+    // settles the body onto whatever is underfoot LOCALLY, so a copy the two
+    // clients disagree about vertically lands straight back where it started.
+    // Walking into Bad Teeth measured one - a Holy Priest at an IDENTICAL x/z,
+    // 129 u higher on the join than on the host (582 against 453: two engines
+    // disagreeing about a floor) - parked once a second for the whole run at an
+    // unchanging d=129, and took 84 of that run's 221 teleports on its own.
+    // Ground position is ours to reconcile; height belongs to the collision that
+    // owns it, and measuring an axis we cannot move only manufactures work.
+    float ddx = st.x - it->second.x, ddz = st.z - it->second.z;
+    float d  = std::sqrt(ddx * ddx + ddz * ddz);
+    float dv = std::fabs(st.y - it->second.y);
+    unsigned long nowP = nowMs();
+    // One threshold to start correcting, a closer one to stop. A single line
+    // would make the walk band below stutter for exactly the reason it exists:
+    // the body walks until it is a hair inside the line, we stop ordering, the
+    // freeze halts it, and a counterpart that is still walking re-opens the gap
+    // within the second - so the body would spend the town walking half a second
+    // and standing still half a second. Converging PAST the line and only
+    // re-arming at it lets one order cover several census rows.
+    std::map<Key, CensusFix>::iterator cf = censusFix_.find(k);
+    bool walkingNow = cf != censusFix_.end() && cf->second.walkMs != 0 &&
+                      (nowP - cf->second.walkMs) < 1500;
+    if (d <= (walkingNow ? censusParkDist_ * 0.5f : censusParkDist_)) {
+        // Converged. Drop the walk destination so the next real divergence
+        // issues a fresh one, and clear the futile streak - a body that closed
+        // the gap is not stuck.
+        if (cf != censusFix_.end()) { cf->second.haveDest = false;
+                                      cf->second.fails = 0;
+                                      cf->second.walkMs = 0; }
+        return d;
+    }
+    // WALK THE GAP instead of jumping it (2026-08-06). Teleporting is the only
+    // correction this path had, and for anything that WALKS it is the wrong one.
+    // A patrol's two copies cannot help diverging: the host's walks its route,
+    // the join's is AI-frozen the moment it crosses this threshold and so cannot
+    // follow, and the census position keeps advancing - so the gap re-opens as
+    // fast as it is closed and the only tool available is another teleport. Bad
+    // Teeth measured the result: 137 of one run's 221 teleports were patrol
+    // templates (Holy Sentinel, Servant, Paladin), median hop 154 u, one body
+    // jumping every two seconds for the length of the run. Nothing was broken;
+    // the correction itself was the artefact the player sees.
+    //
+    // A body that is merely BEHIND its counterpart should catch up the way it
+    // would in the world, on its feet. walkTo routes through the engine's own
+    // locomotion, so the body paths around what is in the way, grounds itself,
+    // and plays a real walk clip - and it costs nothing extra, since the census
+    // position it is already being corrected onto is the destination.
+    //
+    // The teleport stays for the class it was written for. The pack-hidden case
+    // is a copy that is not behind its counterpart but somewhere else entirely
+    // (measured 500-900 u), where there is nothing to converge to on foot: it
+    // would spend a minute walking a route its counterpart never took, through
+    // whatever lies between. Past the band ceiling, jump.
+    if (censusWalkDist_ > 0.0f && d <= censusWalkDist_) {
+        CensusFix& f = censusFix_[k];
+        // What the counterpart is doing, from the step between the last two
+        // census rows - the only thing the join can know about an unstreamed
+        // body's motion, since the census carries position and nothing else.
+        float stepX = 0.0f, stepZ = 0.0f, hostSpd = 0.0f;
+        std::map<Key, CensusPos>::iterator pv = censusPrev_.find(k);
+        if (pv != censusPrev_.end() && censusPrevMs_ &&
+            censusRecvMs_ > censusPrevMs_) {
+            stepX = it->second.x - pv->second.x;
+            stepZ = it->second.z - pv->second.z;
+            float dt = (float)(censusRecvMs_ - censusPrevMs_) / 1000.0f;
+            // Converted OUT of world units per second and INTO the engine's
+            // speed scale: the step is real displacement and so already carries
+            // the game-speed multiplier, while walkTo commands a speed the
+            // multiplier is then applied to. Miss that and a 5x session orders
+            // five times the intended sprint.
+            float mult = (speedLastSet_ > 1.0f) ? speedLastSet_ : 1.0f;
+            hostSpd = std::sqrt(stepX * stepX + stepZ * stepZ) / dt / mult;
+        }
+        // Walk to where the counterpart is GOING, not where it was. A census row
+        // is already up to a second old when it arrives, so a body sent to the
+        // reported spot arrives at a place its counterpart has left and stops
+        // there to wait for the next row. Leading by the last step - the
+        // distance it covered over exactly one row - keeps the destination
+        // roughly one row ahead, which is where it will be when the order runs
+        // out. A counterpart that stopped has a zero step and so is never led,
+        // which is what keeps the lead from overshooting a body at rest.
+        float tx = it->second.x + stepX, tz = it->second.z + stepZ;
+        // Re-issue only when the destination actually moved (the locomotion-
+        // drive lesson: a per-frame walkTo restarts the path and renders as
+        // stutter). Census rows arrive at ~1 Hz, so in practice this is one
+        // order per row for a moving target and one in total for a still one.
+        float moved = f.haveDest
+            ? std::sqrt((tx - f.dx) * (tx - f.dx) + (tz - f.dz) * (tz - f.dz))
+            : (REISSUE_DIST + 1.0f);
+        if (moved > REISSUE_DIST) {
+            // Speed has to EXCEED the pace of what it is chasing or the gap
+            // never closes - the body would trail at a fixed distance forever,
+            // permanently over the threshold.
+            float base = (hostSpd > 1.0f) ? hostSpd : 12.0f;
+            float spd  = base + d;          // wider gap, harder catch-up
+            float cap  = base * 2.5f;       // ...but never a teleport on legs
+            if (spd > cap) spd = cap;
+            engine::walkTo(c, tx, it->second.y, tz, spd);
+            f.haveDest = true; f.dx = tx; f.dz = tz;
+            ++censusWalks_;
+            static unsigned long walkLogTick = 0; // main-thread only, ~1 line/s
+            if ((nowP - walkLogTick) >= 1000) {
+                walkLogTick = nowP;
+                char nm[48]; engine::charName(c, nm, sizeof(nm));
+                char b[224]; _snprintf(b, sizeof(b) - 1,
+                    "[census] walk hand=%u,%u name='%s' d=%.0f hostSpd=%.0f "
+                    "lead=%.0f spd=%.0f band=%.0f (walks=%lu parks=%lu)",
+                    k.i, k.s, nm, d, hostSpd,
+                    std::sqrt(stepX * stepX + stepZ * stepZ), spd,
+                    censusWalkDist_, censusWalks_, censusParks_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        // Refreshed every tick, not just on re-issue: this is what tells the
+        // divergence freeze below that the body is under a walk order of ours
+        // and its per-tick haltMovement would cancel the very correction in
+        // progress.
+        f.walkMs = nowP;
+        f.fails  = 0;
+        return d;
+    }
+    // TELEPORT. A body that reaches this point failed the walk band above, so
+    // it is not behind its counterpart, it is somewhere else.
+    //
     // Per-key cooldown (npc_sync regression, run 185524): the engine's own
     // schedule AI can re-place the body the same frame (a seated copy), so an
     // unthrottled park re-teleported every frame and wrecked tracking. One
     // park per key per cooldown bounds the fight; a free wanderer sticks on
     // the first try.
-    unsigned long nowP = nowMs();
     // A FROZEN body (AI suspended for repeat divergence) reparks on a 1 s
     // cooldown: run 014948 showed a frozen slave still re-pathed to ~600 u
     // between 5 s parks (an in-flight movement goal survives the suspend),
     // so the clamp must out-pace the walk. Unfrozen bodies keep the 5 s
     // cooldown that protects seat-schedule NPCs from park thrash.
     unsigned long cool = censusFrozen_.count(k) ? 1000 : 5000;
+    // Futile-park backoff. A park that lands and a park that silently does
+    // nothing look identical from the call site, so the only evidence is the
+    // next tick's position: a body still standing where we last teleported it
+    // was not moved BY us either. Repeating a correction that demonstrably does
+    // not take is pure cost, and it is not hypothetical - the vertical case
+    // above spun at 1 Hz for an entire run, and the chained Nutto (parks=543 at
+    // a constant d=381) needed its own anchor-break fix to escape the same loop.
+    // This is the general form of both: keep retrying, because a zone reload or
+    // an unchaining can make it work later, but a minute apart instead of a
+    // second. Deliberately NOT a give-up - a body that is genuinely diverged
+    // still deserves the occasional attempt.
+    const float         PARK_MOVED_EPS   = 5.0f;
+    const unsigned int  PARK_FUTILE_MAX  = 3;
+    const unsigned long PARK_FUTILE_COOL = 60000;
+    std::map<Key, CensusFix>::iterator fs = censusFix_.find(k);
+    bool unmoved = fs != censusFix_.end() && fs->second.fails > 0 &&
+                   std::fabs(st.x - fs->second.px) < PARK_MOVED_EPS &&
+                   std::fabs(st.z - fs->second.pz) < PARK_MOVED_EPS;
+    if (unmoved && fs->second.fails >= PARK_FUTILE_MAX) cool = PARK_FUTILE_COOL;
     std::map<Key, unsigned long>::iterator pm = parkMs_.find(k);
     if (pm != parkMs_.end() && (nowP - pm->second) < cool) return d;
     parkMs_[k] = nowP;
+    {
+        CensusFix& f = censusFix_[k];
+        // A first park has nothing to compare against, so the streak starts at
+        // 1 and the entry records where we are about to move the body from.
+        bool same = f.fails > 0 &&
+                    std::fabs(st.x - f.px) < PARK_MOVED_EPS &&
+                    std::fabs(st.z - f.pz) < PARK_MOVED_EPS;
+        f.fails = same ? f.fails + 1 : 1;
+        if (same && f.fails == PARK_FUTILE_MAX) {
+            char nm[48]; engine::charName(c, nm, sizeof(nm));
+            char b[208]; _snprintf(b, sizeof(b) - 1,
+                "[census] park FUTILE hand=%u,%u name='%s' d=%.0f dv=%.0f "
+                "(unmoved across %u parks; retrying every %lus)",
+                k.i, k.s, nm, d, dv, PARK_FUTILE_MAX,
+                PARK_FUTILE_COOL / 1000);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        f.px = st.x; f.pz = st.z;
+        f.haveDest = false; // a teleport invalidates any walk destination
+    }
     // Anchor break (world_parity 2026-07-17): a census copy chained/caged at
     // the WRONG fixture (cross-client furniture identity is unreliable) is
     // position-anchored - every park teleport snapped straight back (Nutto:
@@ -1418,10 +1586,10 @@ float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Ke
         if ((now - logTick) >= 250) {
             logTick = now;
             char nm[48]; engine::charName(c, nm, sizeof(nm));
-            char b[192]; _snprintf(b, sizeof(b) - 1,
-                "[census] park hand=%u,%u name='%s' d=%.0f local=%.0f,%.0f,%.0f "
-                "host=%.0f,%.0f,%.0f (parks=%lu)",
-                k.i, k.s, nm, d, st.x, st.y, st.z,
+            char b[208]; _snprintf(b, sizeof(b) - 1,
+                "[census] park hand=%u,%u name='%s' d=%.0f dv=%.0f "
+                "local=%.0f,%.0f,%.0f host=%.0f,%.0f,%.0f (parks=%lu)",
+                k.i, k.s, nm, d, dv, st.x, st.y, st.z,
                 it->second.x, it->second.y, it->second.z, censusParks_);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
@@ -1468,7 +1636,17 @@ void Replicator::censusFreezeDivergedAi(Character* c, const Key& k, float drift)
     engine::addAiSuspend(c);                     // quiesce AI decisions this tick
     // A destination committed BEFORE the suspend keeps the body running (run
     // 014948: frozen slave re-pathed ~600 u between parks); kill it per tick.
-    engine::haltMovement(c);
+    //
+    // UNLESS the destination is OURS. That same survival is what makes the
+    // walk-converge band work at all - the suspend stops the body deciding
+    // where to go while our order carries it where the host's copy is - and
+    // halting it every tick would cancel the correction in progress and leave
+    // the teleport as the only way home, which is the loop the band exists to
+    // break. The AI stays suspended either way, so what walks is only ever us.
+    std::map<Key, CensusFix>::iterator wf = censusFix_.find(k);
+    bool walking = wf != censusFix_.end() && wf->second.walkMs != 0 &&
+                   (now - wf->second.walkMs) < 1500;
+    if (!walking) engine::haltMovement(c);
     static unsigned long logTick = 0;           // main-thread only, ~4 lines/s
     if ((now - logTick) >= 250) {
         logTick = now;

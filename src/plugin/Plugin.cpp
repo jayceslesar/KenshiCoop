@@ -1977,7 +1977,9 @@ void configureReplicator() {
         g_repl.setSendStamp(g_cfg.sendStamp);
         g_repl.setCensusRadius(g_cfg.censusRadius);
         g_repl.setSpawnMintRadius(g_cfg.spawnMintRadius);
+        g_repl.setAdoptRadius(g_cfg.adoptRadius);
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
+        g_repl.setCensusWalkDist(g_cfg.censusWalkDist);
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setAttentionRadius(g_cfg.attentionRadius);
         g_repl.setCellAuth(g_cfg.cellAuth);
@@ -2009,13 +2011,13 @@ void configureReplicator() {
         _snprintf(b, sizeof(b) - 1,
                   "KenshiCoop: interp delay=%u-%ums extrap=%ums stale=%ums snap=%.0fu "
                   "drive catchupK=%.2f snapDist=%.1fu snapSec=%.2f sendStamp=%d "
-                  "census=%.0fu mint=%.0fu park=%.0fu starveHold=%ums",
+                  "census=%.0fu mint=%.0fu park=%.0fu walk=%.0fu starveHold=%ums",
                   g_cfg.interpMinDelayMs, g_cfg.interpMaxDelayMs,
                   g_cfg.interpMaxExtrapMs, g_cfg.interpStaleMs, g_cfg.interpSnapDist,
                   g_cfg.catchupK, g_cfg.snapDist, g_cfg.snapSeconds,
                   g_cfg.sendStamp ? 1 : 0,
                   g_cfg.censusRadius, g_cfg.spawnMintRadius, g_cfg.censusParkDist,
-                  g_cfg.starveHoldMs);
+                  g_cfg.censusWalkDist, g_cfg.starveHoldMs);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
     }
@@ -2190,6 +2192,7 @@ void installEngineDetours() {
     g_repl.setSquadSync(g_cfg.squadSync);
     g_repl.setFactionSync(g_cfg.factionSync);
     g_repl.setTimeSync(g_cfg.timeSync);
+    g_repl.setTimeBrake(g_cfg.timeBrake);
     g_repl.setDoorSync(g_cfg.doorSync);
     g_repl.setBuildSync(g_cfg.buildSync);
     g_repl.setBdoorSync(g_cfg.bdoorSync);

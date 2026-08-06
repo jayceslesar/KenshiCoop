@@ -602,18 +602,29 @@ public:
     //    apply locally and broadcast PKT_SPEED_SET on change (+ safety resend).
     void syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
 
-    // BEFORE engine, AFTER syncSpeed (protocol 25 game-clock sync):
-    //  * host: broadcast the absolute in-game clock (PKT_TIME, ~1 Hz);
-    //  * join: drain samples, measure offset = hostHours - localHours, and
-    //    steer timeSlew_ - a multiplier the speed layer's quiet writes apply
-    //    ON TOP of the arbitrated consensus speed (proportional, capped, with
-    //    a disengage deadband). The slew composes with speed consensus rather
-    //    than fighting its continuous enforcement; when speedSync is off the
-    //    channel degrades to offset logging (no lever to compose with).
+    // BEFORE engine, AFTER syncSpeed (protocol 25 game-clock sync). Both sides
+    // broadcast their absolute in-game clock at ~1 Hz, and both can correct -
+    // in the one direction each has room for:
+    //  * join: offset = hostHours - localHours, steer timeSlew_ UP to catch up
+    //    (proportional, capped at 2x, with a disengage deadband);
+    //  * host: lag = localHours - joinHours, steer timeSlew_ DOWN to be caught,
+    //    but only while the join has no headroom of its own left (the clock
+    //    brake - see syncTime; at the 5x ceiling the join's lever does nothing
+    //    and this is the only one that works).
+    // Either way the slew is LOCAL: the speed layer's quiet writes apply it on
+    // top of the arbitrated consensus, which is what goes on the wire. The slew
+    // composes with speed consensus rather than fighting its continuous
+    // enforcement; when speedSync is off the channel degrades to offset logging
+    // (no lever to compose with).
     void syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
 
     // Game-clock sync master enable (KENSHICOOP_TIME_SYNC).
     void setTimeSync(bool v) { timeSync_ = v; }
+
+    // KENSHICOOP_TIME_BRAKE (default ON): the host half of the correction -
+    // slowing its own sim while the join is behind and out of headroom. "0"
+    // restores the join-only slew, which is join-catches-up or nothing.
+    void setTimeBrake(bool v) { timeBrake_ = v; }
 
     // Session reset (protocol 32): called on the world-reload edge (gameplay
     // non-live -> live after a mid-session load). The old world is GONE - every
@@ -692,11 +703,26 @@ public:
     // stream-bubble-only minting.
     void setSpawnMintRadius(float r) { spawnMintRadius_ = r; }
 
+    // KENSHICOOP_ADOPT_RADIUS (zone-load population parity, 2026-08-06): how far
+    // from a census row's position the join looks for one of its OWN bodies of the
+    // same template+faction to BIND to that row, rather than minting a proxy next
+    // to it. Zone-generated town population is the case: both engines create it
+    // from the same spawn points when the zone streams in, with different engine
+    // hands, so nothing resolves by hand and the pre-adoption code built a second
+    // town on top of the first and hid the first. <= 0 restores that behaviour.
+    void setAdoptRadius(float r) { adoptRadius_ = r; }
+
     // KENSHICOOP_CENSUS_PARK (v38 pack-hidden fix): how far a census-PRESENT
     // local copy may drift from the host's census position before the join
     // parks it back onto the host's spot. <= 0 disables parking (existence-
     // only census, the v37 behavior).
     void setCensusParkDist(float d) { censusParkDist_ = d; }
+
+    // KENSHICOOP_CENSUS_WALK: the ceiling of the band in which a diverged
+    // census-band body is WALKED back onto the host's position instead of
+    // teleported there. <= 0 disables the walk and restores teleport-only
+    // correction at every distance.
+    void setCensusWalkDist(float d) { censusWalkDist_ = d; }
 
     // KENSHICOOP_CENSUS_FREEZE_AI (default ON): the join freezes the local AI
     // of a census-band body (census-present, unstreamed) that DIVERGES past
@@ -1064,6 +1090,38 @@ private:
     float                     censusParkDist_;
     unsigned long             censusParks_;   // join: divergence-park count
     std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
+    // The census rows from the PREVIOUS packet, and when they arrived. Two
+    // consecutive rows are the only measure of the host copy's pace the join
+    // has for a body outside the stream bubble - the census carries position
+    // and nothing else - and the walk-converge band needs it to pick a speed
+    // that out-paces what it is chasing.
+    std::map<Key, CensusPos>  censusPrev_;
+    unsigned long             censusPrevMs_;
+    // Per-key state for the two ways a census row can correct its local body:
+    // the walk that converges it, and the teleport of last resort.
+    //
+    // px/pz/fails are the futile-park detector. engine::park reports that it
+    // WROTE the transform, not that the body stayed there, so a correction the
+    // engine undoes (a height the local collision re-grounds, a fixture that
+    // re-anchors) is indistinguishable from one that worked until the next
+    // tick's position is read back - and a body standing exactly where we last
+    // teleported it did not get there by walking.
+    //
+    // dx/dz/haveDest throttle the walk order (re-issuing a destination every
+    // frame restarts the path and renders as stutter), and walkMs tells the
+    // divergence freeze that this body is under a walk order it must not halt.
+    struct CensusFix {
+        CensusFix() : px(0), pz(0), fails(0), haveDest(false),
+                      dx(0), dz(0), walkMs(0) {}
+        float         px, pz;
+        unsigned int  fails;
+        bool          haveDest;
+        float         dx, dz;
+        unsigned long walkMs;
+    };
+    std::map<Key, CensusFix>  censusFix_;
+    float                     censusWalkDist_; // walk-converge band ceiling
+    unsigned long             censusWalks_;    // join: walk-converge orders issued
     // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI): join-side flag +
     // per-key last-diverge tick. A census-band body that drifts past
     // censusParkDist_ is added here and AI-suspended; the hold (~5 s) keeps it
@@ -2049,12 +2107,14 @@ private:
     // itself, since the label is the GUI's object to destroy, not ours).
     void pruneDebugMarkers(const std::set<Character*>& live);
     // world_parity roster rows: one "SCENARIO WNPC" line for a body, with the
-    // task/pelvis/mv parity fields appended (world_parity oracle) after the
-    // legacy hand/pos/cls/name schema (travel_parity's parser ignores the
+    // task/pelvis/mv/carry parity fields appended (world_parity oracle) after
+    // the legacy hand/pos/cls/name schema (travel_parity's parser ignores the
     // extras). cls=pc rows carry the player characters - the class the legacy
     // dumps EXCLUDED, which is how a diverged host-PC position stayed
-    // invisible to every automated gate. Shared by the host (Publish) and
-    // join (Authority) dump sites.
+    // invisible to every automated gate. carry= marks a PASSENGER, whose
+    // position is owned by its carrier on both clients and therefore says
+    // nothing about its own tracking (see the emitWnpcRow comment). Shared by
+    // the host (Publish) and join (Authority) dump sites.
     void emitWnpcRow(Character* c, const EntityState& st, const char* cls);
     // PLATOON FIRST-SIGHT probe (2026-08-02 split_far root cause). The two
     // clients diverge at platoon granularity, not per body: the join's set of
@@ -2209,11 +2269,13 @@ private:
     // multiplier (1.0 = no correction); the speed layer applies effective *
     // timeSlew_ in its quiet writes so the slew and the consensus compose.
     bool          timeSync_;
-    float         timeSlew_;          // join: current slew factor (host: always 1)
-    u32           timeSeqOut_;        // host: monotonic seq for PKT_TIME
-    u32           timeSeqSeen_;       // join: newest sample seq applied
-    unsigned long timeLastSendMs_;    // host: last broadcast
-    unsigned long timeLastLogMs_;     // join: offset-log throttle
+    bool          timeBrake_;         // host may slow itself for a lagging join
+    float         timeSlew_;          // local slew: join >= 1 (catch up),
+                                      //   host <= 1 (be caught)
+    u32           timeSeqOut_;        // monotonic seq for the PKT_TIME we send
+    u32           timeSeqSeen_;       // newest peer sample seq applied
+    unsigned long timeLastSendMs_;    // last clock broadcast/report
+    unsigned long timeLastLogMs_;     // offset/brake log throttle
     // The engine speed the slewed value was derived from; lets the enforcement
     // distinguish "our slewed write" from a real user click.
     float         timeSlewApplied_;   // join: last effective*slew written (-1 = none)
@@ -2237,6 +2299,20 @@ private:
     // by pointer via drivenChars_ (hide on stale stream / restore on return
     // come free from the existing hysteresis).
     std::map<Key, Character*> proxyByKey_;
+
+    // Bodies THIS client created (successful mints only). Bound proxies come from
+    // two places now - minted, or ADOPTED from the population we generated
+    // ourselves - and every teardown that destroys a proxy must tell them apart:
+    // destroying an adopted body deletes one of our own townspeople, and the
+    // peer-left path would have deleted a whole town's worth at once. Keyed by
+    // pointer rather than by stream key deliberately: re-key migrations move keys
+    // between bodies, but "did we create this" is a property of the body.
+    std::set<Character*> mintedBodies_;
+
+    // Destroy 'c' only if we minted it, and say whether we did. An adopted body is
+    // left standing and merely unbound - the local engine owns it again, and its
+    // AI resumes on the next tick that does not drive it.
+    bool destroyIfMinted(GameWorld* gw, Character* c);
     // Lifetime guard (2026-07-11 join crash): the ENGINE owns the proxy body
     // and can despawn it (zone streaming, cleanup) while proxyByKey_ still
     // holds the pointer - every later touch would be a use-after-free.
@@ -2304,6 +2380,11 @@ private:
     // scan throttle (the resolve sweep over censusHands_ runs at ~0.5 Hz, not
     // per tick).
     float         spawnMintRadius_;
+    float         adoptRadius_;
+    // Adoptions performed (census row bound to a body we already had). Reported
+    // on the proxy telemetry line so a run says how much of a town was adopted
+    // rather than minted.
+    unsigned long censusAdopts_;
     unsigned long censusScanMs_;
     // Phase 0 telemetry: hands already reported unresolved (log once per hand).
     std::set<Key> spawnLogged_;

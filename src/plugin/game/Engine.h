@@ -421,6 +421,28 @@ Character* sameTemplateNear(GameWorld* gw, const char* charSid,
                             float x, float y, float z, float radius,
                             Character* const* excl, unsigned int exclCount);
 
+// SEH-guarded (join, census ADOPTION): the NEAREST world NPC matching the host's
+// template - and its faction, when the host could read one - within 'radius' of
+// (x,y,z), reporting the distance in *outDist. 0 if none.
+//
+// Same question sameTemplateNear asks, for a different purpose, which is why it is
+// a separate entry point rather than a flag. sameTemplateNear answers "is
+// something already standing here" in order to DEFER a mint, so the first hit will
+// do. This answer gets BOUND to the host's census row, so it has to be the best
+// hit: a town crowd is many bodies off one template, and pairing them in whatever
+// order the spatial query yields would cross-pair bodies standing metres apart.
+//
+// 'radius' is the SEARCH reach, which the caller sets wider than the reach it is
+// willing to bind at: the returned distance on a candidate it then rejects is the
+// only honest measurement of how far a row's twin actually was, and that number is
+// what the bind radius has to be chosen from. Deciding the search by the bind
+// radius would only ever confirm whatever radius was already set.
+Character* adoptCandidateNear(GameWorld* gw, const char* charSid,
+                              const char* facSid,
+                              float x, float y, float z, float radius,
+                              Character* const* excl, unsigned int exclCount,
+                              float* outDist);
+
 // spawn_probe / spawn_sync scenario scaffold (SEH-guarded): reproduce a runtime
 // squad spawn locally - 'count' world characters in a nearby NON-PLAYER faction
 // (findNearbyNonPlayerFaction; leader-faction fallback on a blank save), spread
