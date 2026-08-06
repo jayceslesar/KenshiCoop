@@ -277,6 +277,39 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // snapshot. Hands are resolved fresh each frame: a despawn since the
     // census walk degrades to a skip, and the near tier is deduped by hand
     // (an NPC walking into the bubble is already in buf at 20 Hz).
+    // Carrier promotion: a body CARRYING someone owns that PASSENGER's
+    // transform on both clients, so every unit the carrier's copy trails is
+    // inherited by the passenger - and the passenger can be the peer's own
+    // player character. The ~2 Hz mid rotation below is nowhere near enough for
+    // that: on the camp prison save the host's Holy Sentinels arrest the
+    // join-owned PC and haul it across town, and the carrier's copy trailed
+    // 361-581 u (snap srcVel=0.0 against a local cSpeed of 79 - a stale mid
+    // ring, not a drive failure) while the PC's cross-client gap equalled the
+    // carrier's to within 0.1 u sample for sample (run 20260806_100102). Worse,
+    // the divergence OUTLIVES the haul: each side drops the body at its own
+    // carrier's feet, leaving a 148 u split the drive cannot close while the
+    // body is furniture-anchored. So stream carriers at the full near-band
+    // cadence - no quota, no mover gate. Carriers are a handful of guards at
+    // most, and MAX_PUBLISH still bounds the pass.
+    if (streamNpcs_ && !midBand_.empty() && n < MAX_PUBLISH) {
+        const unsigned int nearEnd0 = n;
+        unsigned int szc = (unsigned int)midBand_.size();
+        for (unsigned int i = 0; i < szc && n < MAX_PUBLISH; ++i) {
+            const Key mk = midBand_[i].k;
+            bool dup = false;
+            for (unsigned int j = 0; j < nearEnd0 && !dup; ++j)
+                dup = buf[j].hIndex == mk.i && buf[j].hSerial == mk.s;
+            if (dup) continue;
+            // captureOne stamps TASK_CARRY_BODY whenever the body carries, so
+            // the captured row identifies a carrier without a second read. A
+            // non-carrier just leaves buf[n] to be overwritten by the next probe.
+            if (!engine::captureNpcByHand(gw, mk.i, mk.s, mk.t, mk.c, mk.cs,
+                                          &buf[n]))
+                continue;
+            if (!coop::taskIsCarry(buf[n].task)) continue;
+            ++n;
+        }
+    }
     if (streamNpcs_ && !midBand_.empty() && n < MAX_PUBLISH) {
         const unsigned int nearEnd = n;
         unsigned int sz = (unsigned int)midBand_.size();
@@ -684,20 +717,52 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
 //   task=   reproducible pose/combat task enum (same vocabulary as MEMBER/RECV)
 //   pelvis= Bip01 height off the rendered skeleton (seated/downed vs standing)
 //   mv=     locomotion bit (cMoving, or speed > walk threshold)
+//   carry=  this body is a PASSENGER on someone's shoulder (isBeingCarried)
 // cls=pc rows carry the player characters, which the NPC dumps exclude
 // (isPlayerSquad skip) - the class where a diverged host-PC hid from every gate.
+//
+// carry= exists because a passenger has NO position of its own: its transform is
+// owned by the carrier's shoulder attach on BOTH clients, so its cross-client gap
+// IS the carrier's gap, not its own tracking error. Measured on the camp save,
+// where the host's Holy Sentinels arrest the join-owned PC and haul it to prison:
+// across 11 carry intervals the PC's host<->join gap equalled the carrier's to
+// within 0.1 u (38.7/38.7, 66.1/66.1, 124.8/124.8, run 20260806_100102). A
+// carried body also reports mv=0 - it is not locomoting itself - so the PC gate's
+// "at rest" filter SELECTED exactly those samples and charged the carrier's NPC
+// tracking error to the PC at a 5 u bound (10 of 15 rest pairs; median 10.0 ->
+// 63.5 u). The oracle judges the carrier on its own NPC row instead.
 void Replicator::emitWnpcRow(Character* c, const EntityState& st, const char* cls) {
     char nm[40]; engine::charName(c, nm, sizeof(nm));
     float pelvis = -1.0f; int idle = -1, crouch = -1, ptask = (int)st.task;
     if (c) engine::readPoseState(c, &pelvis, &idle, &crouch, &ptask);
     int mv = (st.cMoving || st.cSpeed > 0.25f) ? 1 : 0;
+    // A body seated in a bed/cage cannot locomote. The engine still reports
+    // currentlyMoving when a drive walk was issued against that transform
+    // anchor (world_parity Flashbox: 10 of 12 consecutive frozen host samples
+    // reported mv=1), which both starves the oracle's rest filter and keeps
+    // the drive on the walk branch so applyRest never parks the offset. Trust
+    // the seat over the motion bit. Chain (kind=3) is equip, not a seat - a
+    // shackled worker walks, so it keeps the engine bit.
+    if (c && mv) {
+        engine::FurnitureRead fr;
+        if (engine::readFurniture(c, &fr) && fr.valid &&
+            (fr.kind == 1 || fr.kind == 2))
+            mv = 0;
+    }
+    // LOCAL read (like pelvis): the streamed BODY_CARRIED bit describes the
+    // OWNER's body, but each side must report where ITS OWN copy is attached -
+    // the local pickup/drop may lead or trail the stream by a beat.
+    int carried = 0;
+    engine::CarryRead cr;
+    if (c && engine::readCarry(c, &cr) && cr.valid && cr.beingCarried) carried = 1;
     char r[256];
     _snprintf(r, sizeof(r) - 1,
               "SCENARIO WNPC hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f "
-              "cls=%s name='%s' task=%u pelvis=%.2f mv=%d",
+              "cls=%s name='%s' task=%u pelvis=%.2f mv=%d carry=%d",
               st.hIndex, st.hSerial, st.hType,
               st.hContainer, st.hContainerSerial,
-              st.x, st.y, st.z, cls, nm, (unsigned int)st.task, pelvis, mv);
+              st.x, st.y, st.z, cls, nm, (unsigned int)st.task, pelvis, mv,
+              carried);
     r[sizeof(r) - 1] = '\0'; coop::logLine(r);
 }
 

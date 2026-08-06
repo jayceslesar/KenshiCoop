@@ -377,6 +377,15 @@ void Replicator::applyTargets(GameWorld* gw) {
             engine::CarryRead lcr;
             bool locallyCarried = engine::readCarry(c, &lcr) && lcr.beingCarried;
             if (coop::bodyIsCarried(out.bodyState) || locallyCarried) {
+                // Quiet the passenger's own AI like every other carve-out that
+                // skips the drive (the furniture branch below, and the main path
+                // at the walk-drive). This `continue` used to leave a driven
+                // body self-deciding, so the tick the carrier drops it the local
+                // AI is already mid-decision and walks it away from the streamed
+                // drop point before the drive resumes. The suspend set is
+                // rebuilt every tick, so it releases the moment the stream stops
+                // reporting the body as carried.
+                if (aiSuspend_) engine::addAiSuspend(c);
                 d.parked = false; d.haveDest = false;
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
                 continue;
@@ -491,20 +500,39 @@ void Replicator::applyTargets(GameWorld* gw) {
             // unified drive owns transform AND task for chained bodies (it
             // AI-suspends driven bodies itself; applyRest reproduces the
             // host's work pose at rest). Cage/bed (kinds 1-2) remain true
-            // transform anchors below.
+            // transform anchors below - BUT only when the OWNER streams them.
             if (streamKind == 3) {
+                // Unvouched local bed/cage while the owner streams chained-
+                // not-caged (world_parity camp, Flashbox): the host's guards
+                // re-jail the peer-driven copy locally. The cage is a true
+                // transform anchor, so parks/walks no-op against it, and the
+                // throttled HEAL below lost the re-cage race under
+                // FURN_HEAL_MS (run 20260806_100102: ten HEAL ENTER was=2
+                // lines spanning the exact window of 54-148 u rest gaps,
+                // collapsing to 1.2 u the moment the storm ended). Break the
+                // unvouched seat EVERY tick - do not wait for the heal
+                // throttle - and AI-suspend so the local sim cannot re-seat
+                // the copy before the next drive tick. The chained-state
+                // heal stays throttled below.
+                if (haveFr && (localKind == 1 || localKind == 2)) {
+                    int brokeKind = localKind;
+                    bool broke = engine::applyFurniture(gw, c, lfr.furn,
+                                                        localKind, false);
+                    engine::endAction(c);
+                    if (aiSuspend_) engine::addAiSuspend(c);
+                    char bb[176]; _snprintf(bb, sizeof(bb) - 1,
+                        "[furn] CAGE-BREAK occ=%u,%u was=%d stream=3 ok=%d "
+                        "(unvouched)",
+                        out.hIndex, out.hSerial, brokeKind, broke ? 1 : 0);
+                    bb[sizeof(bb) - 1] = '\0'; coop::logLine(bb);
+                    // Refresh so the re-chain heal below sees post-break state.
+                    haveFr = engine::readFurniture(c, &lfr);
+                    localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
+                    if (localKind == 3 && !chainSync_) localKind = 0;
+                }
                 if (haveFr && localKind != 3 &&
                     (now - d.furnHealTick) >= FURN_HEAL_MS) {
                     d.furnHealTick = now;
-                    // A local bed/cage the stream does NOT vouch for is a
-                    // transform anchor at the wrong spot (the host's guard
-                    // jailed its copy locally / a stale attach) - the drive's
-                    // parks and walks all no-op against it (Flashbox held a
-                    // 33 u offset for 60 s). Break it before re-chaining.
-                    if (localKind == 1 || localKind == 2) {
-                        engine::applyFurniture(gw, c, lfr.furn, localKind, false);
-                        engine::endAction(c);
-                    }
                     bool ok = d.haveChainOwner
                         ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
                         : engine::applyFurniture(gw, c, 0, 3, true);

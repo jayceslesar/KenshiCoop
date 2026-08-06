@@ -443,23 +443,26 @@ function Test-ExistenceParity {
 # into dump samples by the caller (a dump emits its rows in one burst).
 # world_parity fields (task=/pelvis=/mv=, appended after name) are optional so
 # logs from older builds still parse; task=-1/pelvis=-1/mv=-1 when absent.
+# carry= is appended after mv= and is optional for the same reason (-1 = the
+# build predates it, which the PC gate treats as "unknown, judge it").
 function Get-WnpcRows {
     param([string]$File)
     $rows = New-Object System.Collections.ArrayList
     if (-not (Test-Path $File)) { return $rows }
     $off = Get-LogClockOffsetMs -File $File
-    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO WNPC hand=(\d+),(\d+),[\d,]+ pos=([\-\d\.,]+) cls=(\w+) name='([^']*)'(?: task=(\d+) pelvis=(-?[\d\.]+) mv=(-?\d+))?"
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO WNPC hand=(\d+),(\d+),[\d,]+ pos=([\-\d\.,]+) cls=(\w+) name='([^']*)'(?: task=(\d+) pelvis=(-?[\d\.]+) mv=(-?\d+)(?: carry=(-?\d+))?)?"
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
         $t = Convert-StampToMs -Groups $g -OffsetMs $off
         $p = $g[7].Value.Split(',') | ForEach-Object { [double]$_ }
-        $task = -1; $pelvis = -1.0; $mv = -1
+        $task = -1; $pelvis = -1.0; $mv = -1; $carry = -1
         if ($g[10].Success) { $task = [int]$g[10].Value }
         if ($g[11].Success) { $pelvis = [double]$g[11].Value }
         if ($g[12].Success) { $mv = [int]$g[12].Value }
+        if ($g[13].Success) { $carry = [int]$g[13].Value }
         [void]$rows.Add(@{ t = $t; hand = "$($g[5].Value),$($g[6].Value)"
                            pos = $p; cls = $g[8].Value; name = $g[9].Value
-                           task = $task; pelvis = $pelvis; mv = $mv })
+                           task = $task; pelvis = $pelvis; mv = $mv; carry = $carry })
     }
     return $rows
 }
@@ -1097,8 +1100,52 @@ function Test-SplitFar2 {
 #                 and position within the park bound ($CensusPosTol at ratio
 #                 >= $PosOkMin); task NOT judged (legit local-sim copies).
 # The first $GraceMs after the join's first dump are skipped (clock catch-up
-# slew + mint/far-mint spin-up are startup transients, not steady state).
-# Missing hands are named per tier in the detail for direct diagnosis.
+# slew + mint/far-mint spin-up are startup transients, not steady state), and
+# so is everything more than $TailGraceMs past the join's LAST dump: the host
+# deliberately OUTLIVES the join (~20 s), and a host sample paired backwards
+# onto the join's final dump compares a live host sim against a join that has
+# stopped simming. That tail alone produced the whole verdict in 2 of 3 camp
+# runs - 20260806_095354's ONLY rest pair sat 3.4 s past the join's last dump
+# (gap 16.2) and 20260806_113219's worst sat 1.6 s past it (gap 214.3, in a run
+# whose PC otherwise held 0.9 u for eight consecutive samples).
+# Missing hands and the worst POSITION offenders are named per tier in the
+# detail, so a failure reports every tier that broke rather than just the PC.
+
+# Tally a body that BLEW its tier's position bound: how often, and how far at
+# its worst. Keyed by hand so one persistently mis-tracked body is reported as
+# one named offender instead of N anonymous bad pairs (run 20260806_100102: a
+# single census-parked Holy Sentinel owned 25 of the 61 near-band failures).
+function Add-PosOffender {
+    param($Tally, $Row, [double]$Gap)
+    $k = $Row.hand
+    if (-not $Tally.ContainsKey($k)) {
+        $Tally[$k] = @{ bad = 0; worst = 0.0; name = $Row.name }
+    }
+    $Tally[$k].bad++
+    if ($Gap -gt $Tally[$k].worst) { $Tally[$k].worst = $Gap }
+}
+
+# Format the worst $Top position offenders as "hand:'name'xN(worst)".
+function Format-PosOffenders {
+    param($Tally, [int]$Top = 5)
+    return (($Tally.GetEnumerator() | Sort-Object { $_.Value.bad } -Descending |
+             Select-Object -First $Top | ForEach-Object {
+                "$($_.Key):'$($_.Value.name)'x$($_.Value.bad)(worst $([math]::Round($_.Value.worst,1)))"
+             }) -join ", ")
+}
+
+# True median. The previous inline sorted[count/2] is the upper element on an
+# even count, which on the 2-sample series world_parity often ends up with
+# reported the WORSE of the two as the "median" (run 20260806_113219: 12.1 and
+# 214.3 judged as 214.3).
+function Get-Median {
+    param($Values)
+    $s = @($Values | Sort-Object)
+    if ($s.Count -eq 0) { return -1.0 }
+    if ($s.Count % 2 -eq 1) { return [double]$s[[int]($s.Count / 2)] }
+    return (([double]$s[$s.Count / 2 - 1] + [double]$s[$s.Count / 2]) / 2.0)
+}
+
 function Test-WorldParity {
     # Position pairs are judged strictly only when the HOST row is AT REST
     # (mv=0): paired dumps are up to $WinMs apart, so a walking body shows
@@ -1107,14 +1154,29 @@ function Test-WorldParity {
     # $CensusRange stays inside the JOIN's 2000 u enumeration edge (the host
     # census reaches 2500 u; a hand at 1900-2000 u from the join's anchors
     # flaps in/out of its dumps as pure enumeration jitter, not desync).
+    # $NearRange is the HOST's position-stream bubble (~200 u - see the
+    # "Position streaming stays at the ~200 u" note in ReplicatorPublish.cpp and
+    # the 200 u interest capture radius in ReplicatorSpawn.cpp), NOT a free
+    # choice. Beyond it the host broadcasts EXISTENCE only (protocol 36) and the
+    # join reconciles with parkDivergedCopy's 120 u threshold, so a body out
+    # there physically cannot hold a 10 u gap: judging the old 260 u band at the
+    # near bound charged the census contract with stream-grade precision. Run
+    # 20260806_100102 bucketed by anchor distance: 0-199 u failed 26 of 164
+    # pairs while 200-249 u failed 33 of 47 (70%), and by the join's own class,
+    # census-parked bodies failed 29 of 35 (83%) against 32 of 182 (18%) for
+    # driven ones. The annulus now falls into the census tier, which judges it
+    # at $CensusPosTol - the bound the protocol actually promises there.
+    # $PcMinRest guards the other direction: a median over 1-2 samples is not a
+    # measurement, and the old sorted[count/2] returned the LARGER of two.
     param([string]$HostFile, [string]$JoinFile,
           [double]$PcTol = 5.0, [double]$PcExistMin = 0.9,
-          [double]$NearRange = 260.0, [double]$NearPosTol = 10.0,
+          [double]$NearRange = 200.0, [double]$NearPosTol = 10.0,
           [double]$NearExistMin = 0.9, [double]$NearTaskMin = 0.8,
           [double]$CensusRange = 1800.0, [double]$CensusPosTol = 120.0,
           [double]$CensusExistMin = 0.7, [double]$PosOkMin = 0.8,
-          [double]$MoverAllow = 100.0,
-          [int]$WinMs = 6000, [int]$MinSamples = 6, [int]$GraceMs = 45000)
+          [double]$MoverAllow = 100.0, [int]$PcMinRest = 3,
+          [int]$WinMs = 6000, [int]$MinSamples = 6, [int]$GraceMs = 45000,
+          [int]$TailGraceMs = 1000)
     $hostAll = Get-WnpcRows -File $HostFile
     $joinAll = Get-WnpcRows -File $JoinFile
     $hostSamples = Group-WnpcSamples -Rows $hostAll
@@ -1126,18 +1188,32 @@ function Test-WorldParity {
                     -Detail "too few worldstate dumps")
     }
     $joinT0 = $joinSamples[0].t
+    $joinTEnd = $joinSamples[$joinSamples.Count - 1].t
     # Per-PC-hand accumulators; per-tier counters; named missing tallies.
     # pcDists = rest-paired (host mv=0) distances; pcDistsAll = every pair
     # (fallback for a PC that never rests - a chained PC streams mv=1
     # continuously - judged against PcTol + MoverAllow).
+    # pcCarried counts the PASSENGER samples dropped, for the metrics.
     $pcSeen = @{}; $pcHave = @{}; $pcDists = @{}; $pcDistsAll = @{}; $pcNames = @{}
     $nearTotal = 0; $nearHave = 0; $nearPosPairs = 0; $nearPosOk = 0
     $taskPairs = 0; $taskMatch = 0; $combatPairs = 0; $combatMatch = 0
     $cenTotal = 0; $cenHave = 0; $cenPosPairs = 0; $cenPosOk = 0
     $missNear = @{}; $missCen = @{}
+    # Worst POSITION offenders per tier: hand -> @{ n; bad; worst; name }. The
+    # old detail named only MISSING hands, so a near/census position failure
+    # printed nothing and read as a PC-only bug (run 20260806_100102: near
+    # pos=0.719 failed silently behind 'pc-bad: Flashbox').
+    $posNear = @{}; $posCen = @{}
+    $pcCarried = 0; $tailSkipped = 0
     $used = 0
     foreach ($hs in $hostSamples) {
         if (($hs.t - $joinT0) -lt $GraceMs) { continue }
+        # Tail guard: the join's dump series must BRACKET the host sample. Past
+        # its final dump the nearest-dump pairing stops being an interpolation
+        # and becomes an extrapolation against a join that is shutting down, so
+        # the host's continued motion is charged to the peer. $TailGraceMs is
+        # only slop for residual clock skew between the two logs.
+        if (($hs.t - $joinTEnd) -gt $TailGraceMs) { $tailSkipped++; continue }
         $js = $null
         foreach ($cand in $joinSamples) {
             if ([math]::Abs($cand.t - $hs.t) -gt $WinMs) { continue }
@@ -1169,6 +1245,18 @@ function Test-WorldParity {
                     # tracking perfectly. All pairs also recorded for the
                     # never-at-rest fallback.
                     $jrow = $jByHand[$hr.hand]
+                    # PASSENGER guard: a body on someone's shoulder has no
+                    # position of its own on either client - it is wherever its
+                    # carrier is - so its gap measures the CARRIER's tracking,
+                    # which the carrier's own NPC row already judges. Worse, a
+                    # passenger is not locomoting, so it reports mv=0 and the
+                    # rest filter below SELECTS it preferentially. On the camp
+                    # save the host's Sentinels arrest the join-owned PC and
+                    # haul it around, which is how 10 of 15 rest pairs became
+                    # carry samples and pulled the median from 10.0 to 63.5 u
+                    # (run 20260806_100102, where PCgap equalled carrierGap to
+                    # within 0.1 u sample for sample).
+                    if ($hr.carry -eq 1 -or $jrow.carry -eq 1) { $pcCarried++; continue }
                     $jp = $jrow.pos
                     $dx = $hr.pos[0] - $jp[0]; $dz = $hr.pos[2] - $jp[2]
                     $dd = [math]::Sqrt($dx * $dx + $dz * $dz)
@@ -1194,25 +1282,35 @@ function Test-WorldParity {
                 $nearTotal++
                 if ($present) {
                     $nearHave++
+                    # Fight-class = synthetic combat stances (65000-65534:
+                    # TASK_COMBAT_*) plus the native TaskType attack family
+                    # (4/5/9/10/11/13/16/21 = MELEE_ATTACK..ATTACK_ENEMIES_
+                    # AND_NEUTRALS), CHASE (46) and combat-aftermath
+                    # FIRST_AID_ORDER (25; run 020025: host sentinels
+                    # bandaging their recapture victims). Event-driven and
+                    # timing-jittered across dumps up to $WinMs apart.
+                    $fight = @(4, 5, 9, 10, 11, 13, 16, 21, 25, 46)
+                    $hCombat = ($hr.task -ge 65000 -and $hr.task -lt 65535) -or ($fight -contains [int]$hr.task)
+                    $jCombat = ($jr.task -ge 65000 -and $jr.task -lt 65535) -or ($fight -contains [int]$jr.task)
+                    $inFight = $hCombat -or $jCombat
+                    # Melee footwork reports mv=0 (stance, not locomotion) while
+                    # the body still slides 10-100 u between paired dumps
+                    # (world_parity residual: 13 of 25 in-bubble position
+                    # failures were combat+hmv=0 inside 50 u of a PC). Give
+                    # fight-class pairs the same mover allowance the walk
+                    # branch already gets; the 10 u rest bound stays for
+                    # non-combat near bodies.
+                    if ($inFight -and $posBound -lt $MoverAllow) { $posBound = $MoverAllow }
                     $dx = $hr.pos[0] - $jr.pos[0]; $dz = $hr.pos[2] - $jr.pos[2]
                     $nearPosPairs++
-                    if ([math]::Sqrt($dx * $dx + $dz * $dz) -le ($NearPosTol + $posBound)) { $nearPosOk++ }
+                    $gap = [math]::Sqrt($dx * $dx + $dz * $dz)
+                    if ($gap -le ($NearPosTol + $posBound)) { $nearPosOk++ }
+                    else { Add-PosOffender -Tally $posNear -Row $hr -Gap $gap }
                     if ($hr.task -ge 0 -and $jr.task -ge 0) {
-                        # Fight-class pairs are event-driven and timing-
-                        # jittered - a brawl paired across dumps up to $WinMs
-                        # apart flips stance enums every sample (run 014948:
-                        # 265 combat pairs, all one camp fight) and drowns the
-                        # job/pose signal the tier gates on. Fight-class =
-                        # synthetic combat stances (65000-65534: TASK_COMBAT_*)
-                        # plus the native TaskType attack family (4/5/9/10/11/
-                        # 13/16/21 = MELEE_ATTACK..ATTACK_ENEMIES_AND_NEUTRALS),
-                        # CHASE (46) and combat-aftermath FIRST_AID_ORDER (25;
-                        # run 020025: host sentinels bandaging their recapture
-                        # victims). Tracked separately, reported not gated.
-                        $fight = @(4, 5, 9, 10, 11, 13, 16, 21, 25, 46)
-                        $hCombat = ($hr.task -ge 65000 -and $hr.task -lt 65535) -or ($fight -contains [int]$hr.task)
-                        $jCombat = ($jr.task -ge 65000 -and $jr.task -lt 65535) -or ($fight -contains [int]$jr.task)
-                        if ($hCombat -or $jCombat) {
+                        # Fight-class task equality is advisory only (run
+                        # 014948: 265 combat pairs in one camp fight drowned
+                        # the job/pose signal). Tracked separately, not gated.
+                        if ($inFight) {
                             $combatPairs++
                             if ($hr.task -eq $jr.task) { $combatMatch++ }
                         } else {
@@ -1231,7 +1329,9 @@ function Test-WorldParity {
                     $cenHave++
                     $dx = $hr.pos[0] - $jr.pos[0]; $dz = $hr.pos[2] - $jr.pos[2]
                     $cenPosPairs++
-                    if ([math]::Sqrt($dx * $dx + $dz * $dz) -le ($CensusPosTol + $posBound)) { $cenPosOk++ }
+                    $gap = [math]::Sqrt($dx * $dx + $dz * $dz)
+                    if ($gap -le ($CensusPosTol + $posBound)) { $cenPosOk++ }
+                    else { Add-PosOffender -Tally $posCen -Row $hr -Gap $gap }
                 } else {
                     $k = "$($hr.hand):'$($hr.name)'"
                     if (-not $missCen.ContainsKey($k)) { $missCen[$k] = 0 }
@@ -1246,7 +1346,13 @@ function Test-WorldParity {
                     -Metrics @{ judged = $used } -Detail "too few aligned dumps")
     }
     # PC verdict: every host PC hand present at >= $PcExistMin of its samples,
-    # per-hand MEDIAN distance <= $PcTol.
+    # per-hand MEDIAN distance <= $PcTol. The strict rest bound needs at least
+    # $PcMinRest rest pairs behind it: below that the "median" is one or two
+    # samples, and on this save those few are exactly the arrest/haul episodes
+    # (see the passenger and tail guards above), so a PC that tracked at 0.9 u
+    # for most of the run was failed at 214.3. With too few rest pairs, fall
+    # back to the all-pairs mover bound - the same treatment a never-resting PC
+    # already gets - and report restN so the thin sample is visible.
     $pcJudged = 0; $pcBad = New-Object System.Collections.ArrayList
     $pcWorst = 0.0
     foreach ($h in $pcSeen.Keys) {
@@ -1254,19 +1360,19 @@ function Test-WorldParity {
         $pcJudged++
         $ratio = $pcHave[$h] / $pcSeen[$h]
         $med = -1.0; $bound = $PcTol
-        if ($pcDists[$h].Count -gt 0) {
-            $sorted = @($pcDists[$h] | Sort-Object)
-            $med = [math]::Round($sorted[[int]($sorted.Count / 2)], 1)
+        $restN = $pcDists[$h].Count
+        if ($restN -ge $PcMinRest) {
+            $med = [math]::Round((Get-Median -Values $pcDists[$h]), 1)
         } elseif ($pcDistsAll[$h].Count -gt 0) {
-            # Never at rest (e.g. a chained PC streams mv=1 continuously):
-            # judge all pairs with the mover misalignment allowance.
-            $sorted = @($pcDistsAll[$h] | Sort-Object)
-            $med = [math]::Round($sorted[[int]($sorted.Count / 2)], 1)
+            # Never at rest (e.g. a chained PC streams mv=1 continuously), or
+            # too few rest pairs to form a median: judge all pairs with the
+            # mover misalignment allowance.
+            $med = [math]::Round((Get-Median -Values $pcDistsAll[$h]), 1)
             $bound = $PcTol + $MoverAllow
         }
         if ($med -gt $pcWorst) { $pcWorst = $med }
         if ($ratio -lt $PcExistMin -or $med -lt 0 -or $med -gt $bound) {
-            [void]$pcBad.Add("$($pcNames[$h])($h) exist=$([math]::Round($ratio,2)) med=$med bound=$bound")
+            [void]$pcBad.Add("$($pcNames[$h])($h) exist=$([math]::Round($ratio,2)) med=$med bound=$bound restN=$restN")
         }
     }
     $pcOk = ($pcJudged -ge 1 -and $pcBad.Count -eq 0)
@@ -1291,12 +1397,24 @@ function Test-WorldParity {
                 Select-Object -First 5 | ForEach-Object { "$($_.Key)x$($_.Value)" }) -join ", "
     $topCen  = ($missCen.GetEnumerator() | Sort-Object Value -Descending |
                 Select-Object -First 5 | ForEach-Object { "$($_.Key)x$($_.Value)" }) -join ", "
+    # Position offenders are named whenever their tier's ratio gate FAILED -
+    # that is the diagnosis the old detail omitted entirely.
+    $topNearPos = ""
+    if ($nearPosPairs -ge 10 -and $nearPosR -lt $PosOkMin) {
+        $topNearPos = Format-PosOffenders -Tally $posNear
+    }
+    $topCenPos = ""
+    if ($cenPosPairs -ge 10 -and $cenPosR -lt $PosOkMin) {
+        $topCenPos = Format-PosOffenders -Tally $posCen
+    }
     $detailParts = New-Object System.Collections.ArrayList
     if ($pcBad.Count -gt 0) { [void]$detailParts.Add("pc-bad: $($pcBad -join '; ')") }
     if ($topNear) { [void]$detailParts.Add("near-missing: $topNear") }
+    if ($topNearPos) { [void]$detailParts.Add("near-pos: $topNearPos") }
     if ($topCen) { [void]$detailParts.Add("census-missing: $topCen") }
+    if ($topCenPos) { [void]$detailParts.Add("census-pos: $topCenPos") }
     $detail = $detailParts -join " | "
-    Write-Host "  world-parity $v - $used samples; PC $pcJudged judged worstMed=$pcWorst (<= $PcTol, bad=$($pcBad.Count)); near exist=$nearExist (>= $NearExistMin) pos=$nearPosR task=$taskR (>= $NearTaskMin) combat=$combatR/$combatPairs (advisory) n=$nearTotal; census exist=$cenExist (>= $CensusExistMin) pos=$cenPosR n=$cenTotal"
+    Write-Host "  world-parity $v - $used samples (tailSkip=$tailSkipped); PC $pcJudged judged worstMed=$pcWorst (<= $PcTol, bad=$($pcBad.Count), carrySkip=$pcCarried); near exist=$nearExist (>= $NearExistMin) pos=$nearPosR task=$taskR (>= $NearTaskMin) combat=$combatR/$combatPairs (advisory) n=$nearTotal (band <= $NearRange u); census exist=$cenExist (>= $CensusExistMin) pos=$cenPosR n=$cenTotal"
     if ($detail) { Write-Host "    $detail" }
     return (Add-GateResult -Name "world_parity" -Status $v `
                 -Metrics @{ judged = $used; pcJudged = $pcJudged; pcWorstMed = $pcWorst
@@ -1304,7 +1422,9 @@ function Test-WorldParity {
                             nearPosOk = $nearPosR; taskParity = $taskR
                             combatParity = $combatR; combatPairs = $combatPairs
                             nearTotal = $nearTotal; cenExist = $cenExist
-                            cenPosOk = $cenPosR; cenTotal = $cenTotal } `
+                            cenPosOk = $cenPosR; cenTotal = $cenTotal
+                            pcCarrySkip = $pcCarried; tailSkip = $tailSkipped
+                            nearRange = $NearRange } `
                 -Detail $detail)
 }
 
