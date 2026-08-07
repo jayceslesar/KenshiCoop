@@ -1762,23 +1762,37 @@ const float RunApartScenario::PROBE_R  = 1800.0f;
 // not about this particular town.
 class TownArriveScenario : public TimedScenario {
 public:
-    TownArriveScenario()
-        : TimedScenario("town_arrive", 1000), recvCount_(0),
+    // The start/target come from the PROFILE the factory picks, so a second
+    // approach to the same town is a registration rather than a second copy of
+    // this class. KENSHICOOP_TOWN_FROM / KENSHICOOP_TOWN_AT still override
+    // either one for an ad-hoc target.
+    //
+    // route/nRoute is OPTIONAL. Given one, the approach follows those recorded
+    // points instead of self-guiding to the target, and the start comes from
+    // the route's own first point. See the factory for why a long approach
+    // needs one.
+    TownArriveScenario(const char* name, float fx, float fz, float tx, float tz,
+                       const RunWp* route = 0, unsigned int nRoute = 0)
+        : TimedScenario(name, 1000), recvCount_(0),
           haveTabs_(false), parked_(0), settled_(false), settleMs_(0),
           arrived_(false), arriveMs_(0), speedMs_(0), camMs_(0),
-          fx_(0), fz_(0), tx_(0), tz_(0), groundOk_(false),
+          fx_(fx), fz_(fz), tx_(tx), tz_(tz), groundOk_(false),
           travelled_(0.0f), lastX_(0), lastZ_(0), haveLast_(false),
-          hops_(0), bestD_(1.0e9f), stallMs_(0), nSide_(0), bias_(0.0f) {}
+          hops_(0), bestD_(1.0e9f), stallMs_(0), nSide_(0), rung_(0),
+          bias_(0.0f), walkMs_(0), maxSide_(0),
+          route_(route), nRoute_(nRoute), wp_(0), nSkip_(0) {}
 
     virtual void onStart(const ScenarioContext& ctx) {
-        // Measured defaults (session 20260806_1224): the park point is the cell
-        // claim one cell short of town, where the join's audit reported census=0
-        // and wide=0 - nothing of the town in memory. The target is the camera
-        // centre while standing in it.
-        fx_ = -35747.0f; fz_ = -14509.0f;
-        tx_ = -32899.0f; tz_ = -20539.0f;
+        // A recorded route carries its own start - the point the human was
+        // standing on when they began walking. Parking anywhere else would put
+        // the squad off the recorded ground on the very first leg.
+        if (route_ && nRoute_) { fx_ = route_[0].x; fz_ = route_[0].z; }
         readPt("KENSHICOOP_TOWN_FROM", &fx_, &fz_);
         readPt("KENSHICOOP_TOWN_AT",   &tx_, &tz_);
+        // Budget the ground actually covered: a route is longer than the line.
+        float len = (route_ && nRoute_) ? routeLength() : straightLength();
+        walkMs_  = walkBudgetMs(len);
+        maxSide_ = sidestepBudget(len);
 
         voteSpeed(ctx, 0);
 
@@ -1816,11 +1830,14 @@ public:
         _snprintf(b, sizeof(b) - 1,
                   "SCENARIO TOWNARRIVE start side=%s have=%d parked=%u "
                   "from=%.0f,%.0f,%.0f target=%.0f,%.0f straight=%.0f ground=%d "
-                  "hop=%.0f speed=%.1f settleMs=%lu holdMs=%lu",
+                  "hop=%.0f speed=%.1f settleMs=%lu holdMs=%lu walkMs=%lu "
+                  "maxSide=%u route=%u routeLen=%.0f",
                   ctx.isHost ? "host" : "join", haveTabs_ ? 1 : 0, parked_,
                   fx_, groundOk_ ? gy : 0.0f, fz_, tx_, tz_, straightLength(),
                   groundOk_ ? 1 : 0, HOP_D, SPEED_MULT,
-                  (unsigned long)SETTLE_MS, (unsigned long)HOLD_MS);
+                  (unsigned long)SETTLE_MS, (unsigned long)HOLD_MS,
+                  walkMs_, maxSide_, nRoute_,
+                  (route_ && nRoute_) ? routeLength() : 0.0f);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         if (!haveTabs_)
             coop::logLine("SCENARIO TOWNARRIVE needs a 2-tab save (rank-0/rank-1 member missing)");
@@ -1828,7 +1845,7 @@ public:
 
     virtual bool onTick(const ScenarioContext& ctx) {
         if (!haveTabs_) {
-            if (ctx.elapsedMs >= HARD_MS) { passed_ = false; return true; }
+            if (ctx.elapsedMs >= walkMs_) { passed_ = false; return true; }
             return false;
         }
         // Re-vote: anything that clicks after us (the replicator's arbitration, a
@@ -1900,7 +1917,8 @@ public:
                 }
 
                 if (settled_ && !arrived_) {
-                    trackStall(ctx, d);
+                    if (route_ && nRoute_) routeStall(ctx, sq[own]);
+                    else                   trackStall(ctx, d);
                     walkStep(ctx, sq, n, sq[own]);
                 } else if (arrived_) {
                     // Shuffle on the spot so the bodies keep a live locomotion
@@ -1967,7 +1985,21 @@ public:
                 passed_ = (recvCount_ >= 1);
                 return true;
             }
-        } else if (ctx.elapsedMs >= HARD_MS + extra) {
+        } else if (settled_ && destDistLast() > straightLength() * RUNAWAY_MULT) {
+            // Half again farther out than we started. That is not a detour, it
+            // is leaving, and no deadline is going to fix it - the old run that
+            // exposed this spent 460 s and 180 k u getting further away. End on
+            // the distance rather than the clock so the log says which it was.
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO TOWNARRIVE runaway side=%s d=%.0f straight=%.0f "
+                      "travelled=%.0f hops=%u sidesteps=%u",
+                      ctx.isHost ? "host" : "join", destDistLast(),
+                      straightLength(), travelled_, hops_, nSide_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            passed_ = false;
+            return true;
+        } else if (ctx.elapsedMs >= walkMs_ + extra) {
             // Out of time short of town: report it rather than judging a window
             // that never happened.
             char b[176];
@@ -2026,20 +2058,36 @@ private:
     void trackStall(const ScenarioContext& ctx, float d) {
         if (d < 0.0f) return;
         if (d < bestD_ - STALL_EPS) {
-            bestD_ = d; stallMs_ = ctx.elapsedMs; bias_ = 0.0f;
+            bestD_ = d; stallMs_ = ctx.elapsedMs; bias_ = 0.0f; rung_ = 0;
             return;
         }
         if (ctx.elapsedMs - stallMs_ < STALL_MS) return;
-        if (nSide_ >= MAX_SIDESTEPS) {
+        if (nSide_ >= maxSide_) {
             // Keep walking straight at it and let the timeout report the truth;
             // silently sidestepping forever would read as a healthy approach.
             stallMs_ = ctx.elapsedMs;
             return;
         }
-        ++nSide_;
-        float mag = (float)((nSide_ + 1) / 2) * SIDESTEP_DEG;
-        if (mag > MAX_BIAS_DEG) mag = MAX_BIAS_DEG;
-        bias_ = ((nSide_ % 2) != 0) ? mag : -mag;
+        ++nSide_; ++rung_;
+        float mag = (float)((rung_ + 1) / 2) * SIDESTEP_DEG;
+        if (mag > MAX_BIAS_DEG) {
+            // The ladder ran out of angles without closing. Re-anchor on where
+            // we ARE instead of holding the widest one: bestD_ is unbeatable
+            // from here, so the next rung fires off the same stale reference,
+            // and the aim would stay pinned at the edge for the rest of the
+            // run. Measured (20260806_215106, the 30 k u approach): the ladder
+            // saturated at 25,198 u out and the pair zigzagged 180,599 u to
+            // 97,068 u short - the wrong side of the map, still running.
+            rung_ = 0; bias_ = 0.0f; bestD_ = d; stallMs_ = ctx.elapsedMs;
+            char rb[192];
+            _snprintf(rb, sizeof(rb) - 1,
+                      "SCENARIO TOWNARRIVE reanchor side=%s d=%.0f n=%u "
+                      "- ladder exhausted, aiming straight from here",
+                      ctx.isHost ? "host" : "join", d, nSide_);
+            rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+            return;
+        }
+        bias_ = ((rung_ % 2) != 0) ? mag : -mag;
         stallMs_ = ctx.elapsedMs;
         char b[208];
         _snprintf(b, sizeof(b) - 1,
@@ -2058,6 +2106,7 @@ private:
     // reasons that have nothing to do with what is being measured.
     void walkStep(const ScenarioContext& ctx, const EntityState* sq,
                   unsigned int n, const EntityState& own) {
+        if (route_ && nRoute_) { routeStep(ctx, sq, n, own); return; }
         float dx = tx_ - own.x, dz = tz_ - own.z;
         float d = (float)sqrt((double)(dx * dx + dz * dz));
         if (d < 1.0f) return;
@@ -2076,6 +2125,67 @@ private:
         ++hops_;
     }
 
+    float wpDist(const EntityState& e) const {
+        float dx = e.x - route_[wp_].x, dz = e.z - route_[wp_].z;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+    float routeLength() const {
+        float t = 0.0f;
+        for (unsigned int i = 1; i < nRoute_; ++i) {
+            float dx = route_[i].x - route_[i - 1].x;
+            float dz = route_[i].z - route_[i - 1].z;
+            t += (float)sqrt((double)(dx * dx + dz * dz));
+        }
+        return t;
+    }
+    // Walk the recording point to point, ordering the WHOLE owned tab at the
+    // next one. Both sides walk the SAME route here, so each is pushed clear of
+    // the line by its own offset - two squads ordered onto one point spend the
+    // approach shouldering each other off it.
+    void routeStep(const ScenarioContext& ctx, const EntityState* sq,
+                   unsigned int n, const EntityState& own) {
+        const float off = ctx.isHost ? 0.0f : TAB_OFFSET;
+        const int ownRank = ctx.isHost ? 0 : 1;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (tabRankOf(sq, n, i) != ownRank) continue;
+            Character* mc = engine::resolve(sq[i]);
+            if (mc) engine::orderMoveTo(mc, route_[wp_].x + off, sq[i].y,
+                                        route_[wp_].z + off);
+        }
+        ++hops_;
+    }
+    // Stalled on a recorded point: skip it. Safe in a way the self-guided
+    // sidestep is not - the next point is ~2,300 u further along ground a human
+    // actually walked, so skipping costs one leg instead of aiming the squad
+    // into terrain nobody has crossed. A fight is the usual cause and running
+    // on is the right answer. Capped, so a genuinely stuck squad ends the run
+    // reporting skips rather than teleporting up the route.
+    void routeStall(const ScenarioContext& ctx, const EntityState& own) {
+        // Reached points come off the list first. A new point is a new
+        // distance, ~2,300 u of it, and carrying the old best across the change
+        // would read as "not closing" and trip the stall clock on a squad that
+        // is running perfectly.
+        const unsigned int was = wp_;
+        while (wp_ + 1 < nRoute_ && wpDist(own) <= WAYPOINT_R) ++wp_;
+        float dWp = wpDist(own);
+        if (wp_ != was) { bestD_ = dWp; stallMs_ = ctx.elapsedMs; return; }
+        if (dWp < bestD_ - STALL_EPS) { bestD_ = dWp; stallMs_ = ctx.elapsedMs; return; }
+        if (ctx.elapsedMs - stallMs_ < STALL_MS) return;
+        bool canSkip = (nSkip_ < MAX_ROUTE_SKIPS && wp_ + 1 < nRoute_);
+        char sb[224];
+        _snprintf(sb, sizeof(sb) - 1,
+                  "SCENARIO TOWNARRIVE stall side=%s wp=%u/%u d=%.0f forMs=%lu "
+                  "n=%u%s",
+                  ctx.isHost ? "host" : "join", wp_ + 1, nRoute_, dWp,
+                  (unsigned long)STALL_MS, nSkip_ + 1,
+                  canSkip ? " - skipping it" : " - holding");
+        sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+        if (canSkip) ++wp_;
+        ++nSkip_;
+        stallMs_ = ctx.elapsedMs;
+        bestD_ = 1.0e9f;
+    }
+
     // A park is a teleport and the settle has to absorb it: the destination zone
     // streams in, the bodies ground, and the peer's copy of the parked tab snaps
     // once. 25 s covers all three at 5x.
@@ -2083,15 +2193,39 @@ private:
     // The judged window. At the audit's 5 s cadence this is 24 samples, enough
     // that a median is a median rather than a coin toss.
     static const unsigned long HOLD_MS        = 120000;
-    // ~6.7 k u at the measured ~570 u/s is ~12 s of clear walking. 240 s allows
-    // an approach that fights, detours and sidesteps most of the way in.
-    static const unsigned long HARD_MS        = 240000;
+    // Walk deadline, DERIVED from the approach rather than fixed. The scenario
+    // retargets by coordinates, so a fixed limit sized for one town silently
+    // times out at a farther one - which is a route the profile below actually
+    // takes. Measured clear approach: 6,669 u in 16-17 s at the 5x vote with
+    // zero sidesteps across three runs (~400 u/s of closure), so the per-unit
+    // term allows four times the measured cost of the ground. The flat term is
+    // everything that does NOT scale with distance: the settle, a fight, and a
+    // strung-out squad finding the centre over the last 200 u. The short
+    // approach comes out at 237 s, which is the 240 s it shipped with.
+    static unsigned long walkBudgetMs(float straight) {
+        return WALK_FLAT_MS + (unsigned long)(straight * WALK_MS_PER_U);
+    }
+    // One sidestep per 500 u of approach, never fewer than the 24 the short
+    // approach shipped with (which it has never needed - three runs, zero
+    // sidesteps). Fixed at 24 a long route would exhaust the budget early and
+    // then press straight into whatever stopped it for the rest of the run.
+    static unsigned int sidestepBudget(float straight) {
+        unsigned int n = (unsigned int)(straight / SIDESTEP_PER_U);
+        return n < MIN_SIDESTEPS ? MIN_SIDESTEPS : n;
+    }
+    static const unsigned long WALK_FLAT_MS   = 170000;
     static const unsigned long HOST_EXTRA_MS  = 10000;
     static const unsigned long SPEED_VOTE_MS  = 10000;
     static const unsigned long CAM_REFOCUS_MS = 5000;
     static const unsigned long STALL_MS       = 15000;
-    static const unsigned int  MAX_SIDESTEPS  = 24;
+    static const unsigned int  MIN_SIDESTEPS  = 24;
+    static const unsigned int  MAX_ROUTE_SKIPS = 6;
     static const unsigned int  MAX_SQUAD      = 32;
+    static const float WALK_MS_PER_U;
+    static const float SIDESTEP_PER_U;
+    static const float RUNAWAY_MULT;
+    static const float WAYPOINT_R;
+    static const float TAB_OFFSET;
     static const float SPEED_MULT;
     static const float HOP_D;
     static const float ARRIVE_R;
@@ -2120,9 +2254,25 @@ private:
     unsigned int  hops_;
     float         bestD_;          // closest we have been to town
     unsigned long stallMs_;
-    unsigned int  nSide_;
+    unsigned int  nSide_;          // sidesteps taken, all ladders
+    unsigned int  rung_;           // position on the CURRENT ladder
     float         bias_;           // current aim offset, degrees
+    unsigned long walkMs_;         // approach deadline, derived from the route
+    unsigned int  maxSide_;        // sidestep budget, derived from the route
+    const RunWp*  route_;          // recorded approach, or NULL to self-guide
+    unsigned int  nRoute_;
+    unsigned int  wp_;             // recorded point we are heading for
+    unsigned int  nSkip_;          // recorded points abandoned on a stall
 };
+const float TownArriveScenario::WALK_MS_PER_U   = 10.0f;
+const float TownArriveScenario::SIDESTEP_PER_U  = 500.0f;
+const float TownArriveScenario::RUNAWAY_MULT    = 1.5f;
+// Recorded points are 1 Hz samples of somebody walking, not places to stand, so
+// reaching one is generous - run_apart's own figure, for the same recording.
+const float TownArriveScenario::WAYPOINT_R      = 400.0f;
+// Both tabs walk the same line here; this pushes the join's orders clear of the
+// host's so the two squads are not ordered onto the same point.
+const float TownArriveScenario::TAB_OFFSET      = 30.0f;
 const float TownArriveScenario::SPEED_MULT = 5.0f;
 // Short enough that each routing decision is local, long enough that a 1 Hz
 // sample cannot overshoot the aim and leave the squad circling it.
@@ -2131,8 +2281,16 @@ const float TownArriveScenario::HOP_D    = 500.0f;
 // leader, and being 200 u into a town is being in it.
 const float TownArriveScenario::ARRIVE_R = 200.0f;
 const float TownArriveScenario::STALL_EPS = 50.0f;
-const float TownArriveScenario::SIDESTEP_DEG = 40.0f;
-const float TownArriveScenario::MAX_BIAS_DEG = 120.0f;
+// The ladder: 25, 25, 50, 50, 75, 75, then re-anchor. Every rung must still
+// CLOSE on the town - past 90 degrees the aim points away from it, and the
+// squad that walks away can never beat its own best distance again, so the
+// stall detector re-fires forever off a reference it has left behind. That is
+// not theoretical: at the old 120-degree ceiling both signs of the widest rung
+// receded, and a 30 k u approach turned into a 180 k u run in the wrong
+// direction. 75 degrees still closes at a quarter rate, which beats standing
+// still and cannot invert.
+const float TownArriveScenario::SIDESTEP_DEG = 25.0f;
+const float TownArriveScenario::MAX_BIAS_DEG = 75.0f;
 // Bigger than a sample's worth of running at 5x, so the opening park does not
 // land in the travelled total.
 const float TownArriveScenario::MAX_STEP  = 1500.0f;
@@ -2144,7 +2302,42 @@ const float TownArriveScenario::PROBE_R   = 1800.0f;
 Scenario* makeMovementScenario(const std::string& name) {
     if (name == "split_far2")   return new SplitFar2Scenario();
     if (name == "run_apart")    return new RunApartScenario();
-    if (name == "town_arrive")  return new TownArriveScenario();
+    // Two approaches to the same town, both measured rather than guessed.
+    //
+    // town_arrive parks one cell short of Bad Teeth, at the point where the
+    // join's audit read census=0 wide=0 - none of the town in memory - and
+    // walks the last 6,668 u. That isolates the arrival: the zone the town
+    // lives in is the only one that streams during the run.
+    //
+    // town_arrive_far walks to that same town from where runfar1 LOADS, so the
+    // town's zone is the LAST of a series streamed under a moving anchor rather
+    // than the only one that streams all run. Same target, same gates, same
+    // fixture; the difference is how much country the pair has crossed when it
+    // walks in, and therefore whether the census machinery meets the town in a
+    // clean state or a used one.
+    //
+    // It follows a RECORDING, and the recording is one already in this file.
+    // JOIN_ROUTE - a human driving a squad south for run_apart - passes through
+    // Bad Teeth on its way: its point 12 (-35749,-14511) is town_arrive's park
+    // point to within 2 u, and its point 15 (-32893,-20457) is the town itself
+    // to within 82 u. So the first 16 points ARE a walked path from the load
+    // position to the town, 34,088 u of it for 30,160 u of displacement, and
+    // both tabs follow it rather than one heading north.
+    //
+    // Self-guiding this distance was tried first and does not work
+    // (20260806_215106). The pair closed 4,962 u cleanly, met something at
+    // 25,198 u out, and the sidestep ladder walked them 180,599 u to the wrong
+    // side of the map - the same lesson, in the same country, that gave
+    // run_apart its recordings. Short approaches can be aimed; long ones have
+    // to be walked where somebody has already walked.
+    static const unsigned int TOWN_ROUTE_WPS = 16;   // JOIN_ROUTE[0..15]
+    if (name == "town_arrive")
+        return new TownArriveScenario("town_arrive",
+                                      -35747.0f, -14509.0f, -32899.0f, -20539.0f);
+    if (name == "town_arrive_far")
+        return new TownArriveScenario("town_arrive_far",
+                                      -50879.0f, 3676.0f, -32899.0f, -20539.0f,
+                                      JOIN_ROUTE, TOWN_ROUTE_WPS);
     if (name == "leader_move")  return new LeaderMoveScenario();
     if (name == "fast_march")   return new FastMarchScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();

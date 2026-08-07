@@ -372,6 +372,68 @@
             DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1'
                          KENSHICOOP_SPEED_COMBAT_CAP = '0'
                          KENSHICOOP_ADOPT_RADIUS = '250' }
+            # full, not smoke: 430 s is longer than any smoke scenario and smoke is
+            # already ~40 minutes, but this is the only scenario that generates a
+            # town's population instead of loading it, so nothing else in the matrix
+            # would catch adoption or the census walk band regressing. No WAN
+            # variant - the gates are calibrated on LAN timings, and a 7-minute
+            # scenario run twice is most of a tier.
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # town_arrive_far: the same town, reached after crossing the country.
+        #
+        # town_arrive parks one cell short of Bad Teeth and walks the last
+        # 6,668 u, so the town's zone is the ONLY one that streams during the
+        # run and the census machinery meets it in a clean state. A player
+        # arrives having already crossed thirty thousand units of map, with
+        # zones streamed and dropped under a moving anchor and cells claimed and
+        # vacated the whole way - and the defects this pair of scenarios exists
+        # to catch (adoption binding the wrong twin, the census walk band, park
+        # futility) are all stateful. This runs the same arrival with that
+        # history behind it.
+        #
+        # It walks a RECORDING, and the recording is one the suite already has.
+        # run_apart's JOIN_ROUTE - a human driving a squad south - passes
+        # THROUGH Bad Teeth: its point 12 (-35749,-14511) is town_arrive's park
+        # point to within 2 u and its point 15 (-32893,-20457) is the town to
+        # within 82 u. So its first 16 points are a walked path from where
+        # runfar1 loads to the town, 34,088 u of ground for 30,160 u of
+        # displacement. Both tabs follow that one path (the join's orders offset
+        # 30 u so the squads are not sent onto the same point) rather than one
+        # going north and one south. Starting on the route's own first point
+        # also means there is no opening park, so unlike town_arrive this never
+        # teleports the squads before it begins.
+        #
+        # Self-guiding this distance was tried first and failed hard
+        # (20260806_215106): the pair closed 4,962 u, met something at 25,198 u
+        # out, and the sidestep ladder took them 180,599 u to 97,068 u short -
+        # the wrong side of the map, still running. That run paid for two fixes
+        # in the walker (the ladder could aim BACKWARDS past 90 degrees and then
+        # never recover, and nothing noticed a squad leaving) and it is why this
+        # scenario follows a recording instead. Short approaches can be aimed;
+        # long ones have to go where somebody has already walked. If a leg does
+        # stall, the walker skips that point rather than sidestepping - the next
+        # one is ~2,300 u further along ground a human covered.
+        #
+        # Walk deadline is derived in the scenario, not set here: 170 s flat plus
+        # 10 ms/u over the ROUTE (not the line) is 511 s here, against the 237 s
+        # the short approach comes out at. Worst case 511 s of approach + 120 s
+        # of hold + the host's 10 s overhang = 641 s, which these outlive. A
+        # clear run should take about 85 s of walking.
+        #
+        # probe until it has walked the route: town_arrive earned 'full' by
+        # passing, and this one has not got there yet.
+        town_arrive_far = @{
+            Save = 'runfar1'; Setup = ''; Tolerance = 18.0
+            Seconds = 720; KillGraceSec = 690
+            PrimaryGate = 'town_arrive'
+            Gating   = @('town_arrive', 'town_pop_parity', 'clock_sync')
+            Advisory = @('existence_parity', 'lifecycle', 'suppress_churn',
+                         'anti_zombie', 'mint_dist', 'smoothness', 'snap_rate')
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1'
+                         KENSHICOOP_SPEED_COMBAT_CAP = '0'
+                         KENSHICOOP_ADOPT_RADIUS = '250' }
             Tier = 'probe'; WanVariant = $false
         }
 
