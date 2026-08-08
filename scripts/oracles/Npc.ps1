@@ -1388,7 +1388,8 @@ function Test-SneakDetect {
 #                    revive follows) the dropped body still reads DOWN
 function Test-CarryOrder {
     param([string]$HostFile, [string]$JoinFile,
-          [int]$MaxLatencyMs = 12000, [double]$MaxCarryGap = 5.0)
+          [int]$MaxLatencyMs = 12000, [double]$MaxCarryGap = 5.0,
+          [int]$DropSettleMs = 750)
     # Subject hands from the latch lines (host log carries all three).
     $roles = @{}
     foreach ($who in @("L0", "M2", "L1")) {
@@ -1457,8 +1458,32 @@ function Test-CarryOrder {
         $dropLat = [int]($pOut[0].t - $Td)
         $m["${t}DropLatMs"] = $dropLat
         if ($dropLat -gt $MaxLatencyMs) { $bad += "${t}: drop latency ${dropLat}ms > $MaxLatencyMs" }
-        if ($d.checkDown -and (($pOut[0].bs -band 7) -eq 0)) {
-            $bad += "${t}: dropped body not DOWN on the peer (bs=$($pOut[0].bs))"
+        # Leaving a shoulder is a PHYSICAL transient, not an instant: the body
+        # detaches and falls before the engine re-flags it down. The owner does it
+        # atomically (dropSubject detaches AND ragdolls in one call, so its own
+        # first uncarried sample already reads bs=3), but the peer cannot - its
+        # copy detaches inside the engine tick and the drive that re-asserts the
+        # down state runs AFTER that tick, so there is always one frame where the
+        # peer's copy has let go and not yet been corrected. At a 500 ms sampling
+        # cadence whether a sample lands in that frame is luck, and it did: three
+        # runs caught the body at the exact carry position with bs=0, the next
+        # sample reading bs=2051 and staying down. Judge after a settle window
+        # instead of on the literal release sample - but tolerate only ONE upright
+        # sample, so a body that genuinely stands back up (upright across several
+        # samples, which is the defect this gate exists for) still fails.
+        if ($d.checkDown) {
+            $settled = @($pOut | Where-Object { $_.t -ge ($Td + $DropSettleMs) })
+            $judge = if ($settled.Count -ge 1) { $settled[0] } else { $pOut[$pOut.Count - 1] }
+            $earlyUp = @($pOut | Where-Object {
+                $_.t -lt ($Td + $DropSettleMs) -and (($_.bs -band 7) -eq 0) })
+            $m["${t}DropUprightSamples"] = $earlyUp.Count
+            if (($judge.bs -band 7) -eq 0) {
+                $bad += "${t}: dropped body not DOWN on the peer (bs=$($judge.bs)" +
+                        " at +$([int]($judge.t - $Td))ms)"
+            } elseif ($earlyUp.Count -gt 1) {
+                $bad += "${t}: dropped body stood upright for $($earlyUp.Count) samples" +
+                        " before going down"
+            }
         }
     }
     if ($bad.Count -gt 0) {

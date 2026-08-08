@@ -39,10 +39,29 @@ function Test-Smoothness {
                     -Metrics @{ active = $active; slewSkip = $slewSkip } `
                     -Detail "only $active scored frames (slewSkip=$slewSkip)")
     }
+    # Population audit (SCENARIO ZEROPOP). Reported, never gated - it exists to say
+    # what the zero frames WERE. The premise it was built to test (that zeroFrac is
+    # inflated by bodies which structurally cannot walk - down, carried, in a bed)
+    # is false: those bodies leave the drive before the scoring block, and the audit
+    # measures 0 in every such bucket. What it does split is the free upright body:
+    #   alias - it advanced within the last 100ms, so the render frame merely outran
+    #           the engine's character-update step. Nothing a player can see.
+    #   stall - it has not advanced for 100ms+ while its source walks. The defect.
+    # Measured ~20% alias / ~80% stall on npc_sync and leader_move, so the metric is
+    # honest and stallFrac is the number worth driving down.
+    $m = @{ zeroFrac = $zeroFrac; maxStep = $maxStep; active = $active; slewSkip = $slewSkip }
+    $zp = Select-String -Path $File -Pattern "SCENARIO ZEROPOP .*alias=(\d+) stall=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $zp) {
+        $alias = [int]$zp.Matches[0].Groups[1].Value
+        $stall = [int]$zp.Matches[0].Groups[2].Value
+        $m.zeroAlias = $alias
+        $m.zeroStall = $stall
+        $m.stallFrac = if ($active -gt 0) { [Math]::Round($stall / $active, 3) } else { 0 }
+    }
     $ok = ($zeroFrac -le $MaxZeroFrac)
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  [$Label] smoothness $v - zeroFrac=$zeroFrac (<= $MaxZeroFrac), maxStep=$maxStep, active=$active, slewSkip=$slewSkip"
-    return (Add-GateResult -Name "smoothness" -Status $v -Metrics @{ zeroFrac = $zeroFrac; maxStep = $maxStep; active = $active; slewSkip = $slewSkip })
+    Write-Host "  [$Label] smoothness $v - zeroFrac=$zeroFrac (<= $MaxZeroFrac), stallFrac=$($m.stallFrac), maxStep=$maxStep, active=$active, slewSkip=$slewSkip"
+    return (Add-GateResult -Name "smoothness" -Status $v -Metrics $m)
 }
 
 # Anim-truth (the float-bug detector). Too few translating frames -> SKIP.
@@ -105,12 +124,26 @@ function Test-MarchInPlace {
         $holdStop = [int]$Matches[1]
         $dip = 0
         if ($line.Line -match "holdDip=(\d+)") { $dip = [int]$Matches[1] }
-        $idleFrac = [math]::Round($holdStop / [double]$rest, 4)
+        # march decomposes exactly: hold (= holdDip + holdStop) + settle + rlps.
+        # Measured over 19 runs on 2026-08-07, holdDip is 94-98% of march, which
+        # is why the gate drops it. settle is the bounded endAction transition.
+        # rlps - a PARKED body re-acquiring a walk - is a visible defect in
+        # principle and is recorded here, but it is not gated: in that same
+        # sample every meaningful relapse count came from combat_probe (188 and
+        # 247 frames, against <= 26 everywhere else), whose baseline hold
+        # re-parks and re-clears its duelists' goals on every tick and so
+        # manufactures the relapses it then reports. A bound belongs per
+        # scenario, not here.
+        $rlps = 0
+        if ($line.Line -match "rlps=(\d+)") { $rlps = [int]$Matches[1] }
+        $idleFrac    = [math]::Round($holdStop / [double]$rest, 4)
+        $relapseFrac = [math]::Round($rlps / [double]$rest, 4)
         $ok = ($idleFrac -le $MaxIdleFrac)
         $v = if ($ok) { "PASS" } else { "FAIL" }
-        Write-Host "  [$Label] march-in-place $v - idleFrac=$idleFrac (<= $MaxIdleFrac), holdStop=$holdStop, holdDip=$dip (scored at rest, not a defect), marchFrac=$marchFrac, restSamples=$rest"
+        Write-Host "  [$Label] march-in-place $v - idleFrac=$idleFrac (<= $MaxIdleFrac), holdStop=$holdStop, holdDip=$dip (scored at rest, not a defect), relapseFrac=$relapseFrac (rlps=$rlps, recorded not gated), marchFrac=$marchFrac, restSamples=$rest"
         return (Add-GateResult -Name "march" -Status $v -Metrics @{
                     idleFrac = $idleFrac; holdStop = $holdStop; holdDip = $dip
+                    relapseFrac = $relapseFrac; relapses = $rlps
                     marchFrac = $marchFrac; restSamples = $rest })
     }
     # Pre-attribution DLL: only the conflated metric exists.

@@ -54,15 +54,19 @@ function Get-VitalsSeries {
 function Test-NpcVitals {
     param([string]$HostFile, [string]$JoinFile,
           [double]$Tol = 15.0, [int]$TailMs = 10000, [int]$PairWinMs = 1500)
-    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($null -eq $pin) {
         Write-Host "  NPC-VITALS SKIP - no pinned duelists on host"
         return (Add-GateResult -Name "npc_vitals" -Status SKIP -Detail "no pinned duelists")
     }
     $bi = $pin.Matches[0].Groups[3].Value; $bs = $pin.Matches[0].Groups[4].Value
     $handIS = "$bi,$bs"
-    $Hv = Get-VitalsSeries -File $HostFile -HandIS $handIS
-    $Jv = Get-VitalsSeries -File $JoinFile -HandIS $handIS
+    # No @() around the call: Get-VitalsSeries returns ,$list, so wrapping it
+    # yields a one-element array holding the whole series.
+    $Hv = @(); $Jv = @()
+    foreach ($id in (Get-HandAliases -File $HostFile -WireIndexSerial $handIS)) { $Hv += Get-VitalsSeries -File $HostFile -HandIS $id }
+    foreach ($id in (Get-HandAliases -File $JoinFile -WireIndexSerial $handIS)) { $Jv += Get-VitalsSeries -File $JoinFile -HandIS $id }
+    $Hv = @($Hv | Sort-Object -Property t); $Jv = @($Jv | Sort-Object -Property t)
     if ($Hv.Count -lt 3 -or $Jv.Count -lt 3) {
         Write-Host "  NPC-VITALS SKIP - insufficient vitals series (host=$($Hv.Count) join=$($Jv.Count))"
         return (Add-GateResult -Name "npc_vitals" -Status SKIP -Metrics @{ host = $Hv.Count; join = $Jv.Count } -Detail "insufficient series")

@@ -189,7 +189,8 @@ class CombatKillScenario : public TimedScenario {
 public:
     CombatKillScenario()
         : TimedScenario("combat_kill", 0), recvCount_(0), lastLogMs_(0), combatLogged_(false),
-          havePins_(false), lastRearmMs_(0), lastWoundMs_(0), koLogged_(false) {}
+          havePins_(false), lastRearmMs_(0), lastWoundMs_(0), koLogged_(false),
+          repins_(0) {}
 
     // Same pre-arm pin+hold as combat_order.
     virtual void onGameplay(const ScenarioContext& ctx) {
@@ -208,10 +209,36 @@ public:
 
     virtual bool onTick(const ScenarioContext& ctx) {
         if (ctx.isHost && havePins_ && ctx.elapsedMs < ORDER_AT_MS) {
+            // Re-pin while there is still baseline left to hold the new pair
+            // peaceful. pickDuelSubjects now skips downed candidates, so this
+            // lands on a fresh upright pair rather than the same corpse.
+            if (duelistDown(handA_) || duelistDown(handB_)) {
+                havePins_ = false;
+                ++repins_;
+                pinDuelists(ctx);
+                char b[96];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO duel REPIN n=%u ok=%d (pinned duelist went down)",
+                          repins_, havePins_ ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (ctx.isHost && havePins_ && ctx.elapsedMs < ORDER_AT_MS) {
             engine::holdDuelistsPeaceful(ctx.gw);
         }
         if (ctx.isHost && havePins_ && ctx.elapsedMs >= ORDER_AT_MS) {
             if (!combatLogged_) {
+                // The premise, stated before the fight: a duel needs two
+                // conscious duelists. Said out loud so a run that never had a
+                // fight to replicate is not scored as a replication failure.
+                bool upA = !duelistDown(handA_), upB = !duelistDown(handB_);
+                if (!upA || !upB) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO duel PREMISE FAILED upA=%d upB=%d repins=%u",
+                              upA ? 1 : 0, upB ? 1 : 0, repins_);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
                 int n = engine::startDuel(ctx.gw);
                 // Weaken B on the HOST so the real fight draws decisive blood in the
                 // window (the damage_guard oracle needs a host-side blood drop as its
@@ -237,16 +264,29 @@ public:
                 // so the takedown is enforced; the REPLICATION path (down edge -> reliable
                 // event stamped with the attacker -> join forces B down) is what we test.
                 // Re-assert on a throttle so B stays down (the KO timer needs topping).
-                if (ctx.elapsedMs - lastWoundMs_ >= 1500) {
+                //
+                // Unless the duel already picked its own loser. Nothing says B
+                // wins; run 172544 had B beat A six seconds before this point,
+                // and the enforced KO then landed on a body no one was hitting,
+                // so it went out as actor=0,0 - a synthetic takedown reported as
+                // an attribution failure. A fight that resolves itself is the
+                // better test anyway: its event carries a real attacker.
+                bool aDown = duelistDown(handA_);
+                if (!aDown && ctx.elapsedMs - lastWoundMs_ >= 1500) {
                     lastWoundMs_ = ctx.elapsedMs;
                     engine::orderDownSubject(ctx.gw, handB_); // knockDown B by hand
                     engine::logDuelCombat(ctx.gw);
                 }
                 if (!koLogged_) {
                     char b[128];
-                    _snprintf(b, sizeof(b) - 1,
-                              "SCENARIO KO enforced loser=B(%u,%u)",
-                              handB_[3], handB_[4]);
+                    if (aDown)
+                        _snprintf(b, sizeof(b) - 1,
+                                  "SCENARIO duel RESOLVED loser=A(%u,%u)",
+                                  handA_[3], handA_[4]);
+                    else
+                        _snprintf(b, sizeof(b) - 1,
+                                  "SCENARIO KO enforced loser=B(%u,%u)",
+                                  handB_[3], handB_[4]);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                     koLogged_ = true;
                 }
@@ -328,6 +368,17 @@ private:
         }
     }
 
+    // A pinned duelist the town's own brawl has already knocked out. The pin is
+    // latched ~30 s before the order, and duel1 is a populated town: measured
+    // 2026-08-07, the victim went down at baseline+4 s with no attacker, the
+    // enforced takedown then found no bodyState edge to send, and the oracle
+    // read a missing event as missing ATTRIBUTION.
+    bool duelistDown(const unsigned int h[5]) const {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return false; // unresolvable != down; leave the pin alone
+        return coop::bodyIsDown(engine::readBodyState(c));
+    }
+
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          combatLogged_;
@@ -337,6 +388,7 @@ private:
     unsigned long lastRearmMs_;
     unsigned long lastWoundMs_;
     bool          koLogged_;
+    unsigned int  repins_;
 };
 
 // player_combat (player-combat validation, phase 1): real combat damage TO

@@ -19,6 +19,14 @@
     #   Tier        - 'smoke' (per-pipeline sample) | 'full' | 'none' (diagnostic)
     #   WanVariant  - $true: the full tier reruns this scenario under the WAN
     #                 proxy (profile 'bad') as a second, separately-reported run
+    #   Bounds      - per-scenario threshold overrides, @{ <oracleId> = @{ <Param> = <value> } }.
+    #                 Only the ids/params in CoopOracles' Get-OracleBoundSpec are
+    #                 accepted, and Contract.Tests.ps1 rejects anything else, so a
+    #                 mistyped bound fails the check instead of silently doing
+    #                 nothing. Prefer a bound over WanDemote: a demoted gate stops
+    #                 judging the scenario at all, where a bound keeps judging it
+    #                 at its own number.
+    #   WanBounds   - same shape, overlaid on Bounds when the run is under the proxy
     #
     # Smoke-tier selection principle: ONE scenario per wire pipeline, preferring
     # the bidirectional superset (it strictly covers the unidirectional case):
@@ -93,11 +101,15 @@
             Gating   = @('crosscheck', 'smoothness', 'anim_truth', 'march', 'clock_sync')
             Advisory = @()
             Tier = 'full'; WanVariant = $true
-            # DELIBERATE WAN-regime adjustment (final matrix, 2026-07-05): the same
-            # latency catch-up stepping already demoted for npc_sync - under the
-            # 'bad' proxy the walk-drive advances in bursts (zeroFrac measured
-            # 0.42-0.44 vs the 0.4 gate; crosscheck still green at base tolerance).
-            WanDemote = @('smoothness')
+            # DELIBERATE WAN-regime adjustment (final matrix, 2026-07-05): under the
+            # 'bad' proxy the latency catch-up makes the walk-drive advance in
+            # bursts, so zeroFrac runs above the clean ceiling (crosscheck stays
+            # green at base tolerance). This was a WanDemote - the gate switched
+            # off entirely - until 2026-08-07, when the bound mechanism let it keep
+            # judging at the WAN number instead. Ten runs since 2026-07-29 measured
+            # 0.227-0.478, so 0.55 still catches a real regression while the
+            # demotion caught nothing at all.
+            WanBounds = @{ smoothness = @{ MaxZeroFrac = 0.55 } }
         }
         # suppress_churn gates here (town save): the 2026-07-11 pop-in/out fix -
         # census-present town NPCs must never cycle hidden->restored->hidden at
@@ -475,6 +487,14 @@
             # the WAN proxy.
             WanTolerance = 6.0
             WanDemote    = @('smoothness')
+            # This save streams a small moving population, so some runs score
+            # zeroFrac off very few frames and the fraction turns to noise: over
+            # 12 clean runs on 2026-08-07 the ones under 800 scored frames
+            # measured 0.021, 0.413 and 0.567, while every run above 1500 sat in
+            # 0.28-0.42. Raise the sample floor rather than the ceiling - a small
+            # sample should not be judged, and inflating the ceiling to cover it
+            # would stop the gate judging the well-sampled runs too.
+            Bounds = @{ smoothness = @{ MinActiveFrames = 800 } }
         }
         # craft1 is loaded WITHOUT the host re-arm setup: CraftOrderScenario pins the
         # baked worker itself and issues the live order mid-run (that IS the test).

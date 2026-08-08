@@ -67,40 +67,79 @@ function Test-CombatOrder {
 # reliable delivery + synced down outcome. Also measures event latency.
 function Test-CombatKill {
     param([string]$HostFile, [string]$JoinFile, [int]$GraceMs = 3000, [double]$MinDown = 0.70)
-    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    # LAST pin, not first: the scenario re-pins when the town knocks a duelist
+    # out during the baseline, and only the final pair fought.
+    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($null -eq $pin) { Write-Host "  COMBAT-KILL FAIL - no pinned duelists on host"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no pinned duelists") }
     $ai = $pin.Matches[0].Groups[1].Value; $as = $pin.Matches[0].Groups[2].Value
     $bi = $pin.Matches[0].Groups[3].Value; $bs = $pin.Matches[0].Groups[4].Value
-    $sendPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] SEND id=\d+ ev=(1|2) hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=' + $ai + ',' + $as
-    $send = Select-String -Path $HostFile -Pattern $sendPat -ErrorAction SilentlyContinue | Select-Object -First 1
+    # A duel needs two conscious duelists. When the town's own brawl downs the
+    # pinned victim before the order, the enforced takedown finds no bodyState
+    # edge and sends nothing - which is indistinguishable, at the wire, from a
+    # takedown the attribution path failed to stamp. The scenario says which one
+    # happened, so read it rather than guess: no fight is NO SIGNAL (this is the
+    # primary gate, so the run still fails - just not for the wrong reason).
+    $premise = Select-String -Path $HostFile -Pattern 'SCENARIO duel PREMISE FAILED (.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $premise) {
+        $why = $premise.Matches[0].Groups[1].Value
+        Write-Host "  COMBAT-KILL SKIP - the scripted duel never had two conscious duelists ($why); no takedown to replicate"
+        return (Add-GateResult -Name "combat_kill" -Status SKIP -Detail "duel premise failed ($why)")
+    }
+    # The victim is whoever actually lost. The scenario enforces a takedown on B
+    # only when the duel has not already produced one; when A loses first it says
+    # so, and that self-resolved KO - with its real attacker - is what to follow.
+    $resolved = Select-String -Path $HostFile -Pattern 'SCENARIO duel RESOLVED loser=A\((\d+),(\d+)\)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $resolved) {
+        $ai = $bi; $as = $bs   # the winner is the other one
+        $bi = $resolved.Matches[0].Groups[1].Value; $bs = $resolved.Matches[0].Groups[2].Value
+    }
+    # ATTRIBUTED to someone, not to A specifically. The property under test is
+    # that the host resolves the takedown, names the body that caused it, and
+    # delivers that reliably - none of which depends on WHICH fighter lands the
+    # last blow. duel1 is a populated place and the pinned pair fight next to
+    # the player squad, so a bystander finishing B is ordinary (run 171617:
+    # actor=1,1348632832, a squad member, three seconds before the scripted
+    # takedown). Demanding A made a green run depend on stagecraft; an actor of
+    # 0,0 is still a FAIL, because that is the attribution bug itself.
+    $sendPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] SEND id=\d+ ev=(1|2) hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=(\d+),(\d+)'
+    $sends = @(Select-String -Path $HostFile -Pattern $sendPat -ErrorAction SilentlyContinue)
+    $send = $sends | Where-Object { $_.Matches[0].Groups[6].Value -ne '0' -or $_.Matches[0].Groups[7].Value -ne '0' } | Select-Object -First 1
     if ($null -eq $send) {
-        Write-Host "  COMBAT-KILL FAIL - host sent no combat KO/death for B=$bi,$bs with actor A=$ai,$as (no real takedown / no attribution)"
+        $why = if ($sends.Count -gt 0) { "$($sends.Count) KO/death event(s) for B carried actor=0,0" }
+               else { "no KO/death event for B at all" }
+        Write-Host "  COMBAT-KILL FAIL - host sent no ATTRIBUTED combat KO/death for B=$bi,$bs ($why)"
         return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no attributed KO/death sent")
     }
     $ev = $send.Matches[0].Groups[5].Value
+    $xi = $send.Matches[0].Groups[6].Value; $xs = $send.Matches[0].Groups[7].Value
+    $actorIsA = ($xi -eq $ai -and $xs -eq $as)
     $sendT = Convert-StampToMs -Groups $send.Matches[0].Groups -OffsetMs (Get-LogClockOffsetMs -File $HostFile)
-    $recvPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] RECV id=\d+ ev=' + $ev + ' .*hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=' + $ai + ',' + $as
+    $recvPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] RECV id=\d+ ev=' + $ev + ' .*hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=' + $xi + ',' + $xs
     $recv = Select-String -Path $JoinFile -Pattern $recvPat -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $recv) {
-        Write-Host "  COMBAT-KILL FAIL - join never received the reliable combat event (ev=$ev hand=B actor=A)"
+        Write-Host "  COMBAT-KILL FAIL - join never received the reliable combat event (ev=$ev hand=B=$bi,$bs actor=$xi,$xs)"
         return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "attributed event not received")
     }
     $rg = $recv.Matches[0].Groups
     $T = Convert-StampToMs -Groups $rg -OffsetMs (Get-LogClockOffsetMs -File $JoinFile)
     $latMs = $T - $sendT
     $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
-    $bKey = $null
-    foreach ($hand in $J.Keys) { if ($hand -match ('^' + $bi + ',' + $bs + ',')) { $bKey = $hand; break } }
-    if ($null -eq $bKey) { Write-Host "  COMBAT-KILL FAIL - join logged no body series for victim B=$bi,$bs"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no victim series on join") }
-    $post = @($J[$bKey] | Where-Object { $_.t -ge ($T + $GraceMs) })
+    $ids = Get-HandAliases -File $JoinFile -WireIndexSerial "$bi,$bs"
+    $samples = @()
+    foreach ($id in $ids) {
+        foreach ($hand in $J.Keys) { if ($hand -match ('^' + [regex]::Escape($id) + ',')) { $samples += $J[$hand] } }
+    }
+    if ($samples.Count -lt 1) { Write-Host "  COMBAT-KILL FAIL - join logged no body series for victim B=$bi,$bs (tried $($ids -join ' '))"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no victim series on join") }
+    $post = @($samples | Where-Object { $_.t -ge ($T + $GraceMs) })
     if ($post.Count -lt 1) { Write-Host "  COMBAT-KILL FAIL - no join samples after the event"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no post-event samples") }
     $down = @($post | Where-Object { ($_.bs -band 7) -ne 0 }).Count
     $ratio = [Math]::Round($down / $post.Count, 3)
     $ok = ($ratio -ge $MinDown)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     $evName = if ($ev -eq "2") { "DEATH" } else { "KO" }
-    Write-Host "  COMBAT-KILL [join] $v - combat $evName for B=$bi,$bs by A=$ai,${as}: reliable event received (latency=${latMs}ms), victim down-after $down/$($post.Count) (ratio=$ratio>=$MinDown)"
-    return (Add-GateResult -Name "combat_kill" -Status $v -Metrics @{ downRatio = $ratio; latencyMs = $latMs; eventType = $evName })
+    $who = if ($actorIsA) { "by the pinned A=$ai,$as" } else { "by $xi,$xs (a bystander, not the pinned A=$ai,$as)" }
+    Write-Host "  COMBAT-KILL [join] $v - combat $evName for B=$bi,$bs ${who}: reliable event received (latency=${latMs}ms), victim down-after $down/$($post.Count) (ratio=$ratio>=$MinDown)"
+    return (Add-GateResult -Name "combat_kill" -Status $v -Metrics @{ downRatio = $ratio; latencyMs = $latMs; eventType = $evName; actorIsPinnedA = $actorIsA })
 }
 
 # damage_guard: the join's cosmetic fights must apply NO local damage. From the
@@ -116,7 +155,7 @@ function Test-CombatKill {
 function Test-DamageGuard {
     param([string]$HostFile, [string]$JoinFile,
           [double]$MinHostDrop = 5.0, [double]$MaxExcessDrop = 8.0)
-    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($null -eq $pin) {
         Write-Host "  DAMAGE-GUARD SKIP - no pinned duelists on host"
         return (Add-GateResult -Name "damage_guard" -Status SKIP -Detail "no pinned duelists")
@@ -125,8 +164,10 @@ function Test-DamageGuard {
     $series = {
         param($file)
         $vals = @()
-        foreach ($m in (Select-String -Path $file -Pattern ("SCENARIO VITALS hand=" + $bi + "," + $bs + " t=\d+ blood=(-?[\d\.]+)") -ErrorAction SilentlyContinue)) {
+        foreach ($id in (Get-HandAliases -File $file -WireIndexSerial "$bi,$bs")) {
+        foreach ($m in (Select-String -Path $file -Pattern ("SCENARIO VITALS hand=" + [regex]::Escape($id) + " t=\d+ blood=(-?[\d\.]+)") -ErrorAction SilentlyContinue)) {
             $vals += [double]$m.Matches[0].Groups[1].Value
+        }
         }
         return ,$vals
     }

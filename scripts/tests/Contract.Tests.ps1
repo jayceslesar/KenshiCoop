@@ -161,6 +161,55 @@ Check "unknown oracle id returns FAIL" ($st -eq 'FAIL')
 $g = Get-GateResults | Where-Object { $_.gate -eq 'definitely_not_an_oracle' } | Select-Object -First 1
 Check "unknown oracle id records 'unknown oracle id'" ($null -ne $g -and $g.detail -eq 'unknown oracle id')
 
+# ---- 2b. per-scenario Bounds contract -----------------------------------------
+# A threshold that looks configured but is not is worse than no knob: the run
+# reports the default and the manifest says otherwise. So every Bounds/WanBounds
+# entry must name an oracle that accepts overrides AND a parameter that oracle
+# really has, checked against the live function signature.
+Write-Host "== per-scenario bounds contract =="
+$spec = Get-OracleBoundSpec
+$badBounds = @()
+foreach ($name in $scenarios.Keys) {
+    $e = $scenarios[$name]
+    foreach ($field in @("Bounds", "WanBounds")) {
+        if (-not $e.ContainsKey($field)) { continue }
+        foreach ($id in $e[$field].Keys) {
+            if (-not $spec.ContainsKey($id)) { $badBounds += "$name.$field -> '$id' takes no bounds"; continue }
+            foreach ($p in $e[$field][$id].Keys) {
+                if ($spec[$id] -notcontains $p) { $badBounds += "$name.$field.$id -> unknown param '$p'" }
+            }
+        }
+    }
+}
+if ($badBounds.Count -gt 0) { $badBounds | ForEach-Object { Write-Host "      bad bound: $_" } }
+Check "every manifest bound names a real oracle + parameter" ($badBounds.Count -eq 0)
+
+# The spec must not drift from the oracles themselves: every declared parameter
+# has to exist on the function the dispatch actually calls.
+$boundFn = @{ smoothness = "Test-Smoothness"; march = "Test-MarchInPlace" }
+$specDrift = @()
+foreach ($id in $spec.Keys) {
+    if (-not $boundFn.ContainsKey($id)) { $specDrift += "no function mapped for spec id '$id'"; continue }
+    $cmd = Get-Command $boundFn[$id] -ErrorAction SilentlyContinue
+    if ($null -eq $cmd) { $specDrift += "spec names missing function $($boundFn[$id])"; continue }
+    foreach ($p in $spec[$id]) {
+        if (-not $cmd.Parameters.ContainsKey($p)) { $specDrift += "$($boundFn[$id]) has no parameter '$p'" }
+    }
+}
+if ($specDrift.Count -gt 0) { $specDrift | ForEach-Object { Write-Host "      spec drift: $_" } }
+Check "bound spec matches the oracle signatures" ($specDrift.Count -eq 0)
+
+# NEGATIVE: a bound must actually reach the oracle. Drive smoothness at a
+# ceiling the fixture exceeds and confirm the verdict follows the override.
+$tmpS = [System.IO.Path]::GetTempFileName()
+Set-Content -Path $tmpS -Value "[00:00:01.000] [JOIN] INFO: SCENARIO SMOOTH active=5000 zeroFrac=0.500 maxStep=10.0 slewSkip=0"
+Reset-GateResults
+$stLoose = Invoke-OneOracle -Id 'smoothness' -HostLog $tmpS -JoinLog $tmpS -Tolerance 0 -ExpectedSkewMs $null -Bounds @{ MaxZeroFrac = 0.60 }
+Reset-GateResults
+$stTight = Invoke-OneOracle -Id 'smoothness' -HostLog $tmpS -JoinLog $tmpS -Tolerance 0 -ExpectedSkewMs $null -Bounds @{ MaxZeroFrac = 0.40 }
+Remove-Item $tmpS -ErrorAction SilentlyContinue
+Check "a manifest bound changes the smoothness verdict" ($stLoose -eq 'PASS' -and $stTight -eq 'FAIL')
+
 # ---- 3. scenario drift (manifest <-> C++ factory) -----------------------------
 Write-Host "== scenario name drift =="
 $cppNames = Get-CppScenarioNames

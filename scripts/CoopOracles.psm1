@@ -93,10 +93,23 @@ function Get-ScenarioManifest {
 # reporting a manifest that names one as a dangling reference.
 function Get-PreRunGates { return @("engine_integrity") }
 
+# Which oracles accept a manifest Bounds override, and which parameter names
+# each will take. The contract check reads this, so a mistyped scenario bound is
+# rejected at check time instead of silently doing nothing at run time - a
+# threshold that looks configured but is not is worse than no knob at all.
+function Get-OracleBoundSpec {
+    return @{
+        smoothness = @("MaxZeroFrac", "MinActiveFrames")
+        march      = @("MaxIdleFrac", "MaxMarchFrac")
+    }
+}
+
 # Run ONE named oracle. Central dispatch keyed by the oracle ids used in the
-# manifest's Gating/Advisory lists.
+# manifest's Gating/Advisory lists. $Bounds carries this scenario's threshold
+# overrides for the ids listed in Get-OracleBoundSpec (splatted onto the call).
 function Invoke-OneOracle {
-    param([string]$Id, [string]$HostLog, [string]$JoinLog, [double]$Tolerance, $ExpectedSkewMs)
+    param([string]$Id, [string]$HostLog, [string]$JoinLog, [double]$Tolerance, $ExpectedSkewMs,
+          [hashtable]$Bounds = @{})
     switch ($Id) {
         "crosscheck"    { return (Test-Crosscheck      -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "npc_track"     { return (Test-NpcTrack        -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
@@ -220,9 +233,9 @@ function Invoke-OneOracle {
         "no_phantom_pickups" { return (Test-NoPhantomPickups -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_loot"   { return (Test-WeaponLoot      -HostFile $HostLog -JoinFile $JoinLog) }
         "rejoin_items"  { return (Test-RejoinItems     -HostFile $HostLog -JoinFile $JoinLog) }
-        "smoothness"    { return (Test-Smoothness      -File $JoinLog) }
+        "smoothness"    { return (Test-Smoothness      -File $JoinLog @Bounds) }
         "anim_truth"    { return (Test-AnimTruth       -File $JoinLog) }
-        "march"         { return (Test-MarchInPlace    -File $JoinLog) }
+        "march"         { return (Test-MarchInPlace    -File $JoinLog @Bounds) }
         "snap_rate"     { return (Test-SnapRate        -File $JoinLog) }
         "snap_rate_squad" { return (Test-SnapRate      -File $JoinLog -SquadOnly -GateName "snap_rate_squad") }
         "suppress_churn" { return (Test-SuppressChurn  -File $JoinLog) }
@@ -335,11 +348,36 @@ function Invoke-RunAnalysis {
                     }
                 }
             }
+            # Per-scenario bounds. Until now the only per-scenario lever on a
+            # motion gate was WanDemote, which switches the gate OFF entirely -
+            # so a scenario that legitimately runs 0.42 against a 0.40 ceiling
+            # stops being judged at all instead of being judged at its own
+            # number. Bounds keep the gate live at a scenario-appropriate
+            # ceiling; WanBounds overlay it under the proxy.
+            $bounds = @{}
+            if ($entry.ContainsKey("Bounds")) { $bounds = $entry.Bounds }
+            if ($WanActive -and $entry.ContainsKey("WanBounds")) {
+                $merged = @{}
+                foreach ($k in $bounds.Keys) { $merged[$k] = $bounds[$k] }
+                foreach ($k in $entry.WanBounds.Keys) {
+                    $o = @{}
+                    if ($merged.ContainsKey($k)) { foreach ($p in $merged[$k].Keys) { $o[$p] = $merged[$k][$p] } }
+                    foreach ($p in $entry.WanBounds[$k].Keys) { $o[$p] = $entry.WanBounds[$k][$p] }
+                    $merged[$k] = $o
+                }
+                $bounds = $merged
+            }
             $preRun = Get-PreRunGates
             foreach ($id in ($gating + $advisory)) {
                 if ($preRun -contains $id) { continue }
+                $b = @{}
+                if ($bounds.ContainsKey($id)) {
+                    $b = $bounds[$id]
+                    $shown = ($b.Keys | Sort-Object | ForEach-Object { "$_=$($b[$_])" }) -join ' '
+                    Write-Host "  (manifest bound for '$id': $shown)"
+                }
                 [void](Invoke-OneOracle -Id $id -HostLog $HostLog -JoinLog $JoinLog `
-                          -Tolerance $Tolerance -ExpectedSkewMs $ExpectedSkewMs)
+                          -Tolerance $Tolerance -ExpectedSkewMs $ExpectedSkewMs -Bounds $b)
             }
         } else {
             Write-Host "  WARNING: scenario '$Scenario' not in manifest; running generic cross-check"
@@ -456,5 +494,5 @@ Export-ModuleMember -Function @(
     "Test-CampApproach",
     "Test-MintDistance", "Test-AntiZombie", "Test-Lifecycle",
     "Get-PanelConnects", "Get-PanelIntents", "Test-PanelConfig",
-    "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"
+    "Get-ScenarioManifest", "Get-OracleBoundSpec", "Invoke-OneOracle", "Invoke-RunAnalysis"
 )

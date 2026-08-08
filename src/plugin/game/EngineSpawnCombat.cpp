@@ -890,6 +890,15 @@ bool pickDuelSubjects(GameWorld* gw, unsigned int outA[5], unsigned int outB[5])
         for (unsigned int i = 0; i < g_npcQuery.size(); ++i) {
             RootObject* o = g_npcQuery[i];
             if (!o || isPlayerSquad(gw, o)) continue;
+            // A body that is already unconscious cannot fight a duel, and
+            // pinning one costs more than a wasted run: combat_kill then
+            // enforces a takedown that produces no bodyState EDGE, so no
+            // event is sent, and the oracle reports "no attributed KO/death"
+            // - a missing-attribution verdict for a victim nobody ever hit.
+            // Measured 2026-08-07: the nearest NPC to the leader had been
+            // knocked out by the town's own brawl, and its designated
+            // opponent stood idle at task 65535 for the whole run.
+            if (bodyIsDown(readBodyState(static_cast<Character*>(o)))) continue;
             Ogre::Vector3 p = o->getPosition();
             float dx = p.x - center.x, dz = p.z - center.z;
             float dd = dx * dx + dz * dz;

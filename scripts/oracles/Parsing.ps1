@@ -90,6 +90,24 @@ function Get-ScenarioSeries {
     return $map
 }
 
+# Every "index,serial" a body has answered to in $File, given the identity the
+# WIRE uses for it. A client that drives someone else's town NPC gets it
+# re-keyed the moment a fight starts - the engine separates the body into a
+# fresh local platoon and renumbers it - so from then on every LOCAL row (the
+# scenario's captureNpcs sweep, its VITALS reads) is filed under a hand the peer
+# has never heard of. To an oracle matching on the wire hand that is
+# indistinguishable from the body despawning. The replicator logs the
+# translation as [rekey]; this follows it.
+function Get-HandAliases {
+    param([string]$File, [string]$WireIndexSerial)
+    $ids = @($WireIndexSerial)
+    foreach ($m in (Select-String -Path $File -Pattern ("\[rekey\] wire=" + [regex]::Escape($WireIndexSerial) + " local=(\d+),(\d+)") -ErrorAction SilentlyContinue)) {
+        $alias = $m.Matches[0].Groups[1].Value + ',' + $m.Matches[0].Groups[2].Value
+        if ($ids -notcontains $alias) { $ids += $alias }
+    }
+    return ,$ids
+}
+
 # Find the first timestamped marker line matching $Pattern in $File and return its
 # ms-since-midnight in the HOST clock frame, or $null.
 function Get-MarkerTimeMs {
