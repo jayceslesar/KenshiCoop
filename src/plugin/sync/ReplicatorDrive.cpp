@@ -238,6 +238,33 @@ void Replicator::applyTargets(GameWorld* gw) {
         canonicalOf_[c] = it->first; // capture translation (combat subjects)
         debugMark(c, 0, "DRV");
 
+        // Say the translation out loud. A driven town NPC gets re-keyed the
+        // moment a fight starts (separateIntoMyOwnSquad moves it into a fresh
+        // local platoon and renumbers it), so every LOCAL enumeration - the
+        // scenario's captureNpcs sweep included - reports it under a hand the
+        // peer has never heard of. Nothing downstream could tell that from a
+        // despawn: combat_kill read "victim vanished 14 s before the KO event"
+        // as no post-event samples, for a run in which everything worked.
+        {
+            unsigned int lh[5] = { 0, 0, 0, 0, 0 };
+            if (engine::readObjectHand(reinterpret_cast<RootObject*>(c), lh) &&
+                (lh[3] != it->first.i || lh[4] != it->first.s ||
+                 lh[0] != it->first.t || lh[1] != it->first.c ||
+                 lh[2] != it->first.cs)) {
+                Key lk; lk.t = lh[0]; lk.c = lh[1]; lk.cs = lh[2];
+                lk.i = lh[3]; lk.s = lh[4];
+                std::map<Key, Key>::iterator rk = rekeyLogged_.find(it->first);
+                if (rk == rekeyLogged_.end() ||
+                    (rk->second < lk) || (lk < rk->second)) {
+                    rekeyLogged_[it->first] = lk;
+                    char rb[160]; _snprintf(rb, sizeof(rb) - 1,
+                        "[rekey] wire=%u,%u local=%u,%u localc=%u,%u",
+                        it->first.i, it->first.s, lk.i, lk.s, lk.c, lk.cs);
+                    rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+                }
+            }
+        }
+
         // Every driven body is damage-guarded (locally-simulated hits must not
         // mutate the local-only medical model; outcomes arrive as host events).
         if (dmgGuard_) engine::addDamageGuard(c);
@@ -262,6 +289,12 @@ void Replicator::applyTargets(GameWorld* gw) {
         float ax, ay, az;
         bool haveActual = engine::readPos(c, &ax, &ay, &az);
         bool hostMoving = (out.cMoving != 0) || (out.cSpeed > MOVE_EPS);
+        // Edge-detect the source teleport once per body per tick, before any of the
+        // carve-outs can `continue` past it (see Driven::prevInterpMode).
+        int  interpMode  = d.interp.lastMode();
+        bool teleportEdge = (interpMode == EntityInterp::SM_SEG_SNAP) &&
+                            (d.prevInterpMode != EntityInterp::SM_SEG_SNAP);
+        d.prevInterpMode = interpMode;
         // A conscious bed pose (USE_BED / USE_BED_ORDER / SLEEP_ON_FLOOR) is a
         // STATIONARY anchored pose, but a sleeper streams currentlyMoving=1 (the
         // climb-in / in-bed idle sets the movement flag while cSpeed stays 0).
@@ -377,6 +410,28 @@ void Replicator::applyTargets(GameWorld* gw) {
             engine::CarryRead lcr;
             bool locallyCarried = engine::readCarry(c, &lcr) && lcr.beingCarried;
             if (coop::bodyIsCarried(out.bodyState) || locallyCarried) {
+                // Remember a KO'd passenger so the down path can re-assert the
+                // moment the shoulder lets go. Sticky while carried: a lossy
+                // bodyState batch must not disarm the bridge on the one tick it
+                // matters. Cleared when the owner genuinely revives the passenger.
+                if (coop::bodyIsDown(out.bodyState)) d.carriedDown = true;
+                else if (d.fresh && !d.koLatched && !d.deathLatched &&
+                         !coop::bodyIsDown(engine::readBodyState(c)))
+                    d.carriedDown = false;
+            }
+            // The carve-out exists to protect a LOCAL SHOULDER ATTACH from the
+            // down override, so it is the local attach - not the streamed bit -
+            // that decides. Our copy's carrier ends its carry natively (an NPC
+            // carrier keeps its local AI so the carry animates), and the streamed
+            // BODY_CARRIED bit outlives that by a beat. Skipping on the streamed
+            // bit alone left a body with no attach to protect standing upright at
+            // the old shoulder spot, un-driven, until the bit cleared: carry_order
+            // sampled it there (bs=0 at the exact carry position) while the owner
+            // had already ragdolled the same body 21 u away (bs=3). The owner's
+            // drop is atomic - detach and ragdoll in one call - so the peer must
+            // not have an upright frame either. No attach, no carve-out: fall
+            // through and let the down path knock it down and co-locate it.
+            if (locallyCarried) {
                 // Quiet the passenger's own AI like every other carve-out that
                 // skips the drive (the furniture branch below, and the main path
                 // at the walk-drive). This `continue` used to leave a driven
@@ -720,11 +775,16 @@ void Replicator::applyTargets(GameWorld* gw) {
         // deathLatched/koLatched from the old key onto the new one (2026-07-15);
         // without that carry a dead body that re-containers would fall through
         // to the drive path below and the local AI would stand it back up.
+        // d.carriedDown is the drop-transient bridge (armed in the carried carve-out):
+        // it forces the down treatment on the release tick even when BOTH the streamed
+        // and local samples momentarily read upright mid-fall. It is a one-shot - the
+        // moment the body reads down again the bridge has done its job and clears.
         if (!crawling &&
-            (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched)) {
+            (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched ||
+             d.carriedDown)) {
             unsigned short localBs = engine::readBodyState(c);
             if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
-            else                            engine::holdDown(c);
+            else                          { engine::holdDown(c); d.carriedDown = false; }
             // A ragdoll/KO falls independently on each client (and the join's local
             // AI may have walked the body elsewhere before the down state arrived),
             // so co-locate it with the host's down position when it has drifted.
@@ -964,14 +1024,30 @@ void Replicator::applyTargets(GameWorld* gw) {
                 }
                 bool sustained = d.combatOverTick != 0 &&
                                  (now - d.combatOverTick) >= combatConvergeMs_;
-                bool srcTeleport = (d.interp.lastMode() == EntityInterp::SM_SEG_SNAP);
+                // The EDGE, not the level: lastMode stays SM_SEG_SNAP until the next
+                // sample lands, so keying on it made "follow the teleport" a standing
+                // condition rather than a one-off (67 snaps on one hand at drift 0.0,
+                // 79 churn snaps/min). One teleport, one follow.
+                bool srcTeleport = teleportEdge;
                 // A WAITING stance has no chase to justify a warp - it only converges.
                 bool trueLeave = !hostWaiting &&
                                  (drift > combatBigSnapDist_ || srcTeleport ||
                                   (sustained && srcVel >= COMBAT_SNAP_VEL));
+                // The snap cooldown exists so a correction that CANNOT stick (mid-
+                // stagger, stale interp) does not re-fire every frame at a constant
+                // drift. A source TELEPORT is not that: it is a discrete, unambiguous
+                // event that cannot repeat at frame rate, and until we follow it the
+                // two screens are running the same fight in two places. mint_aggro
+                // measured the cost of pacing it - the host teleports the hostile
+                // squad from 450 u to 12 u, and the join's minted proxies were still
+                // fighting 211-306 u away, closing only one 3 s snap at a time.
                 if (trueLeave &&
-                    (now - d.combatSnapTick) >= COMBAT_SNAP_COOL_MS) {
+                    (srcTeleport || (now - d.combatSnapTick) >= COMBAT_SNAP_COOL_MS)) {
                     engine::applyRaw(c, out);
+                    // Whatever the local AI was doing, it decided it at the OLD place:
+                    // the goal outlives the teleport and walks the copy straight back,
+                    // which is what turned one displacement into a standing one.
+                    if (srcTeleport) engine::clearGoals(c);
                     d.combatSnapTick = now;
                     d.combatOverTick = 0;
                     d.haveDest = false; // position jumped: force a fresh slide dest
@@ -1033,10 +1109,29 @@ void Replicator::applyTargets(GameWorld* gw) {
         // (clearGoals), re-armed it next batch (another order), and the AI reset
         // wandered it until the snap teleported it - the crowd artifact's second
         // driver, alongside the waiting-stance re-issue loop.
+        // The hold is a bet that the fight is still on, and it costs a body that
+        // is driven by nothing at all for as long as it lasts: no order, no
+        // converge band, no park. A copy whose local AI picks its own enemy in
+        // that window is free to run, and at 5x it runs a long way. mint_aggro
+        // caught the whole shape - the host had 'Soo' idle at task 65535 with
+        // fight=0, while the join's minted copy of it charged 400 u at the join's
+        // own squad and only stopped when the census park teleported it back.
+        // Divergence is the tell a blip is not: a real gap in a real fight keeps
+        // the copy near the body it stands for. Past the true-leave distance,
+        // stop betting - disarm now and let the ordinary drive walk it home.
         if (d.combatArmed) {
-            if ((now - d.combatSeenTick) < COMBAT_DISARM_MS) {
+            float heldDrift = haveActual
+                ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
+            if ((now - d.combatSeenTick) < COMBAT_DISARM_MS &&
+                heldDrift <= combatBigSnapDist_) {
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
                 continue;
+            }
+            if (heldDrift > combatBigSnapDist_) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[combat] hold BREAK hand=%u,%u drift=%.1f gap=%lums",
+                    out.hIndex, out.hSerial, heldDrift, now - d.combatSeenTick);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
             d.combatArmed = false;
             d.combatOrders = 0;
@@ -1596,6 +1691,14 @@ void Replicator::applyTargets(GameWorld* gw) {
             }
             float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
                                      : (REISSUE_DIST + 1.0f);
+            // Re-issue stays keyed on the target having MOVED, including after a
+            // cancel. Re-issuing the moment the source's velocity crosses back over
+            // the threshold was tried and is worse: with no hysteresis a source
+            // hovering near NPC_MOVE_VEL alternates cancel and re-order frame by
+            // frame, and each re-order restarts the locomotion so the body never
+            // builds speed (zeroFrac 0.388 -> 0.474 on leader_move). Waiting for a
+            // metre of target movement is the hysteresis.
+            bool sourceMoving = vlen > NPC_MOVE_VEL;
             if (moved > REISSUE_DIST) {
                 float spd = out.cSpeed + gapNewest * catchupK_;
                 float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
@@ -1605,6 +1708,35 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (isSquad) ++walkReissueSquad_;
                 else         ++walkReissueNpc_;
                 d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
+                d.walkHalted = false; d.walkStallF = 0;
+            } else if (!d.walkHalted && haveActual && !sourceMoving) {
+                // The source has stopped feeding us new ground. The debounced
+                // classifier deliberately holds the walk VERDICT through the stop
+                // (dropping it on an instantaneous sample flaps the body - measured
+                // 37 -> 1071 walk->rest flips/min on npc_sync), but the ORDER does
+                // not have to outlive the walk. An order outstanding on a body that
+                // is not translating is exactly what holds currentlyMoving with no
+                // movement - the holdStop frames the march gate scores, and the
+                // marching the player sees. Two ways to get there, and arrival
+                // alone only catches the first:
+                //   * the body reached the point and stands on it, or
+                //   * it never will - blocked, or aiming at a lead point projected
+                //     ahead of a source that has since stopped (WAN stretches the
+                //     lead to seconds, which is why leader_move fails march there
+                //     while its clean twin passes).
+                // Cancel the goal without teleporting; the verdict is left alone.
+                // One-shot, re-armed by the next real walkTo, so it cannot fight
+                // the re-issue - and the stall arm needs ~200 ms of evidence so a
+                // single blocked frame mid-catchup does not drop a live order.
+                float adv = d.haveActual ? dist3(ax, ay, az, d.lx, d.ly, d.lz)
+                                         : (WALK_STALL_ADV + 1.0f);
+                if (adv <= WALK_STALL_ADV) ++d.walkStallF;
+                else                       d.walkStallF = 0;
+                bool atDest = dist3(ax, ay, az, d.dx, d.dy, d.dz) <= WALK_ARRIVE_DIST;
+                if (atDest || d.walkStallF >= WALK_STALL_FRAMES) {
+                    engine::haltMovement(c);
+                    d.walkHalted = true; d.walkStallF = 0;
+                }
             }
             d.parked = false;
             // Locomotion mirror for a DRIVEN SQUAD member (Phase 1b gait fix):
@@ -1697,7 +1829,27 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (timeSlew_ > 0.99f && timeSlew_ < 1.01f) {
                 ++activeFrames_;
                 ++d.activeF;
-                if (step < 0.01f) { ++zeroWhileActive_; ++d.zeroF; }
+                if (step < 0.01f) {
+                    ++zeroWhileActive_; ++d.zeroF;
+                    // Attribute the frame (see the zp* declarations). Ordered
+                    // most-definitive first: a body that is down cannot walk no
+                    // matter what else is true of it.
+                    if      (coop::bodyIsDown(out.bodyState))      ++zpDown_;
+                    else if (coop::bodyIsCarried(out.bodyState))   ++zpCarried_;
+                    else if (out.bodyState & (BODY_IN_BED | BODY_IN_CAGE)) ++zpFurn_;
+                    else if (out.bodyState & BODY_CHAINED)         ++zpChain_;
+                    else if (coop::bodyIsCrawling(out.bodyState))  ++zpCrawl_;
+                    else if (isSquad && out.cMoving == 0)          ++zpSquadIdle_;
+                    else if (out.bodyState & BODY_SNEAK)           ++zpSneak_;
+                    // Free and upright. Did the body move RECENTLY, or is it stuck?
+                    // A render frame that outran the engine's character-update step
+                    // reads zero without anything being wrong; a body that has not
+                    // advanced for ZERO_ALIAS_MS while its source walks is frozen.
+                    else if (d.advMs != 0 && (now - d.advMs) < ZERO_ALIAS_MS)
+                                                                   ++zpAlias_;
+                    else                                           ++zpStall_;
+                }
+                else d.advMs = now;
                 if (step > maxStep_) maxStep_ = step;
             } else {
                 ++slewSkipFrames_;

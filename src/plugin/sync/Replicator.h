@@ -790,6 +790,9 @@ private:
         bool         parked;         // settled at rest (avoid re-halting the clip)
         bool         haveDest;       // dx/dy/dz hold a previously issued destination
         float        dx, dy, dz;     // last issued walk destination
+        bool         walkHalted;     // the outstanding order was cancelled on arrival (one-shot,
+                                     //   re-armed by the next real walkTo) - see the walk branch
+        unsigned int walkStallF;     // consecutive frames the ordered body advanced ~nothing
         bool         suppressed;     // NPC pulled off the local AI update list
         unsigned long lastSeenMs;    // last ingest for this hand (stale-entry pruning)
         // Stage 5 rest-pose reproduction.
@@ -807,6 +810,12 @@ private:
         bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
         bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
         bool         deathLatched;    // a reliable EVT_DEATH pinned this body down PERMANENTLY
+        bool         carriedDown;     // a KO'd passenger, remembered ACROSS the drop. Leaving a
+                                      //   shoulder is a physical transient: the body detaches and
+                                      //   falls for a few frames before the engine re-flags it
+                                      //   down, and the streamed sample can be mid-transient too,
+                                      //   so neither side reads down on the release tick. This
+                                      //   bridges that hole - see the carried carve-out.
         bool         combatArmed;     // Stage 3c: a melee-attack order is currently issued
         unsigned long combatTick;     // when the attack order was (re-)issued (re-arm throttle)
         unsigned int combatOrders;    // orders issued this combat episode (re-issue backoff)
@@ -888,6 +897,14 @@ private:
         // zeroFrac regression can name its worst offenders in the stat line.
         unsigned long zeroF;
         unsigned long activeF;
+        unsigned long advMs;   // last tick this body actually advanced (zeroFrac audit)
+        int          prevInterpMode; // last tick's EntityInterp::lastMode(). lastMode is a
+                                     //   STICKY classification of the newest sample, not an
+                                     //   event: it keeps reading SM_SEG_SNAP for every frame
+                                     //   after a source teleport until a new sample lands.
+                                     //   Anything that must happen ONCE per teleport has to
+                                     //   edge-detect against this (a cooldown-exempt combat
+                                     //   snap keyed on the level fired 67x at drift 0.0).
         // Last tick this body's stream cadence classified MID-tier. A body
         // that just handed off mid -> near (raid walking into the 20 Hz
         // bubble) may owe one large reconciliation snap for divergence
@@ -895,11 +912,11 @@ private:
         // (like young-ring coverage snaps), not steady-state near tracking.
         unsigned long midSeenMs;
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
-                   haveDest(false), dx(0), dy(0), dz(0),
+                   haveDest(false), dx(0), dy(0), dz(0), walkHalted(false), walkStallF(0),
                    suppressed(false), lastSeenMs(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
                    taskTick(0), taskRetries(0), taskNoneTick(0), detached(false), downApplied(false),
-                   koLatched(false), deathLatched(false),
+                   koLatched(false), deathLatched(false), carriedDown(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
@@ -912,7 +929,7 @@ private:
                    sneakTick(0), proneTick(0), crawlDrive(false),
                    velPeak(0.0f), moveSeenMs(0), wasMoving(false),
                    restEnterMs(0), walkBranchPrev(false),
-                   zeroF(0), activeF(0), midSeenMs(0) {
+                   zeroF(0), activeF(0), advMs(0), prevInterpMode(-1), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
         }
     };
@@ -1017,6 +1034,9 @@ private:
     // (r=1 forever - the fight only renders on the attacker's client).
     // Refilled every drive tick; pruned alongside drivenSeen_.
     std::map<Character*, Key> canonicalOf_;
+    // Last LOCAL hand reported for each wire key, so the [rekey] translation
+    // line is emitted on change rather than every drive tick.
+    std::map<Key, Key>        rekeyLogged_;
     // Step-5 hysteresis: consecutive-frame counters per hand so a brief stream
     // hiccup doesn't suppress (needs ~1 s unstreamed) and a boundary NPC doesn't
     // flicker back (needs ~2 s streamed dwell to restore). Spike 18: the hard
@@ -1077,6 +1097,9 @@ private:
     unsigned long             midSliceMs_; // last slice advance (50 ms cadence:
                                            // the slice must persist across a
                                            // whole net tick to be sampled)
+    unsigned int              midFastPromoted_; // mid bodies streamed at the full
+                                           // near-band rate last tick because they
+                                           // were RUNNING (see the promotion pass)
     // v38 census position parking (pack-hidden investigation, 2026-07-11):
     // the host position per census row. A census-PRESENT NPC is exempt from
     // culling, but its two locally-simulated copies can wander arbitrarily
@@ -1552,6 +1575,33 @@ private:
     unsigned long zeroWhileActive_;
     float         maxStep_;
     unsigned long slewSkipFrames_; // active frames excluded while clock-slewing
+    // zeroFrac population audit. A frozen-while-active frame is only a DEFECT if
+    // the body could have walked that frame; the metric currently scores bodies
+    // that structurally cannot (player_ko reads 1.000 with maxStep 0.0 - exactly
+    // what a knocked-out body must read). Bucket every scored zero frame by what
+    // the body WAS, so the share that is unfixable-by-definition is visible before
+    // anyone tries to move the number. Emitted as "SCENARIO ZEROPOP".
+    unsigned long zpDown_;       // down / ragdoll / dead
+    unsigned long zpCarried_;    // on someone's shoulder
+    unsigned long zpFurn_;       // in a bed or cage
+    unsigned long zpChain_;      // shackled
+    unsigned long zpCrawl_;      // crippled, moving under its own power
+    unsigned long zpSneak_;      // crouched
+    unsigned long zpSquadIdle_;  // squad body scored active by cSpeed alone: hostMoving
+                                 //   ORs currentlyMoving with cSpeed > MOVE_EPS, and
+                                 //   cSpeed is the locomotion speed SETTING, which stays
+                                 //   high on a standing body (a parked Garru streams
+                                 //   15.2) - so a squad body at rest is scored active
+    // Upright and free - the whole population, as it turned out: the audit measured
+    // 100% of scored zero frames here and 0 in every state above, because a body
+    // that cannot walk `continue`s out of the drive long before the scoring block.
+    // So the two live explanations are both about the free body, and they call for
+    // opposite responses:
+    unsigned long zpAlias_;      //   it advanced within the last ZERO_ALIAS_MS - the render
+                                 //   frame simply outran the engine's character-update step,
+                                 //   so the per-frame sample aliased. Invisible to a player.
+    unsigned long zpStall_;      //   it has not advanced for ZERO_ALIAS_MS or more: a real
+                                 //   freeze while the source walks. The defect.
 
     // Interp/drive telemetry (protocol 36 jumpiness instrumentation): per-sample
     // regime counts from EntityInterp::lastMode() (EXTRAP/CLAMP = the buffer

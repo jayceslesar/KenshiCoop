@@ -23,6 +23,8 @@ Replicator::Replicator()
       starveHoldMs_(10000), starveHeldNow_(0),
       leaderOnly_(true), streamNpcs_(false),
       activeFrames_(0), zeroWhileActive_(0), maxStep_(0.0f), slewSkipFrames_(0),
+      zpDown_(0), zpCarried_(0), zpFurn_(0), zpChain_(0), zpCrawl_(0),
+      zpSneak_(0), zpSquadIdle_(0), zpAlias_(0), zpStall_(0),
       interpLerp_(0), interpSingle_(0), interpClampOld_(0),
       interpExtrap_(0), interpSegSnap_(0),
       hardSnapSquad_(0), hardSnapNpc_(0), hardSnapMid_(0),
@@ -52,7 +54,7 @@ Replicator::Replicator()
       censusPubTrunc_(false), censusFreshPrev_(false), censusFreshChkMs_(0),
       censusStaleMs_(0), censusStaleEdges_(0), proxyDriftLogMs_(0),
       camHintSendMs_(0), peerCamMs_(0),
-      midCursor_(0), midSliceMs_(0),
+      midCursor_(0), midSliceMs_(0), midFastPromoted_(0),
       censusParkDist_(0.0f), censusParks_(0),
       censusPrevMs_(0), censusWalkDist_(0.0f), censusWalks_(0),
       censusFreezeAi_(true),
@@ -177,6 +179,7 @@ void Replicator::resetSession() {
     drivenChars_.clear();
     drivenSeen_.clear();       // recently-driven grace (pointers dangle after swap)
     canonicalOf_.clear();      // capture-translation reverse map (same pointers)
+    rekeyLogged_.clear();      // and the change-detector for its [rekey] line
     jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
     suppressed_.clear();
@@ -536,6 +539,18 @@ void Replicator::logSmoothSummary() {
               activeFrames_, zeroWhileActive_, zeroFrac, maxStep_, slewSkipFrames_);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
+
+    // zeroFrac population audit (see the zp* declarations): what the frozen
+    // frames actually WERE. Everything but `free` is a body that could not have
+    // walked that frame, so it bounds how much of zeroFrac is even addressable.
+    char zp[208];
+    _snprintf(zp, sizeof(zp) - 1,
+              "SCENARIO ZEROPOP zero=%lu down=%lu carried=%lu furn=%lu chain=%lu "
+              "crawl=%lu sneak=%lu squadIdle=%lu alias=%lu stall=%lu",
+              zeroWhileActive_, zpDown_, zpCarried_, zpFurn_, zpChain_,
+              zpCrawl_, zpSneak_, zpSquadIdle_, zpAlias_, zpStall_);
+    zp[sizeof(zp) - 1] = '\0';
+    coop::logLine(zp);
 
     // Anim-truth oracle: fraction of translating frames that did NOT report a
     // real walk state. Low == engine is walking the body (Stage 3 goal); high ==

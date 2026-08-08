@@ -84,7 +84,20 @@ const float REPARK_DIST = 1.0f;   // at rest, re-place if it drifts past this
 const float CATCHUP_K   = 2.0f;   // gap-proportional speed boost (chase a moving tgt)
                                   // (default for catchupK_ - env-tunable, proto 36)
 const float REISSUE_DIST = 1.0f;  // re-issue the walk order only when tgt moved this far
+const float WALK_ARRIVE_DIST = 2.0f; // ...and cancel it once the body is this close to the
+                                  // issued point while the source has stopped (march-in-place:
+                                  // an order outstanding on a body that already stands there
+                                  // holds currentlyMoving with no translation)
+const float WALK_STALL_ADV = 0.02f; // per-frame advance below which a walk is going nowhere
+const unsigned int WALK_STALL_FRAMES = 15; // ...for this many frames (~200 ms) before the order
+                                  // is cancelled as futile. Covers the body that never REACHES
+                                  // its point - blocked, or aiming at a lead point projected
+                                  // before the source stopped - which arrival alone misses.
 const float LEAD_SECONDS = 0.6f;  // project the walk target this far along source velocity
+// zeroFrac audit: how long a driven body may go without advancing before a
+// zero-step frame stops being render/update-cadence aliasing and starts being a
+// freeze. One engine character-update step is well inside this.
+const unsigned long ZERO_ALIAS_MS = 100;
 const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "walking"
                                   // (vs a fidget/turn in place -> treat as at rest)
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose

@@ -291,9 +291,53 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // body is furniture-anchored. So stream carriers at the full near-band
     // cadence - no quota, no mover gate. Carriers are a handful of guards at
     // most, and MAX_PUBLISH still bounds the pass.
+    //
+    // Fast movers are promoted here too, for the same reason and by the same
+    // rule: what a body needs from the wire is set by how fast it moves, not by
+    // how far away it is. Between two samples of the ~2 Hz rotation a running
+    // body covers more ground than the snap band is wide, so the catch-up walk
+    // can never close the gap - the drive teleports, waits out
+    // NPC_SNAP_COOL_MS, and teleports again. Each of those snaps is individually
+    // correct; the repetition is the artefact. mint_aggro measures it plainly:
+    // a single charging hand snapped 9-15 times in 52 s at a median drift of
+    // 87-196 u, every snap classified "chase". Nearest-first and capped, so a
+    // stampede cannot crowd out the near band or hand the peer a whole field to
+    // drive at 20 Hz (the sim-cost lesson behind MID_BAND_MAX).
     if (streamNpcs_ && !midBand_.empty() && n < MAX_PUBLISH) {
+        // Where to put the bar, measured rather than guessed: the cSpeed of the
+        // bodies that actually needed a mid-tier snap on camp_approach clusters
+        // at 14-16 with a tail to 80, while the strollers that never needed one
+        // sit at 4-10. 12 takes the cluster and leaves the strollers on the
+        // rotation, which matters because promotion is not free - every row here
+        // is a row in every snapshot, and at 8 the cap saturated on a whole town.
+        const float        MID_FAST_SPEED = 12.0f;
+        // A hard ceiling on how much of the mid band can buy its way to the
+        // near-band rate, because the cost lands on the PEER's sim: at 16 a
+        // busy camp promoted the full quota on every sweep and the join's
+        // driven bodies started freezing outright (zeroFrac 0.16 -> 0.73,
+        // near-tier snaps 6 -> 74) - the same budget lesson as MID_BAND_MAX,
+        // arrived at from the other direction. Nearest-first, so what fits is
+        // what the peer is closest to.
+        // KENSHICOOP_MID_FAST overrides it, and 0 turns promotion off - the
+        // control arm for measuring what this pass is worth on a given scene.
+        static int fastCap = -1;
+        if (fastCap < 0) {
+            const char* e = getenv("KENSHICOOP_MID_FAST");
+            fastCap = (e && e[0]) ? atoi(e) : 8;
+            if (fastCap < 0) fastCap = 0;
+        }
+        const unsigned int MID_FAST_MAX   = (unsigned int)fastCap;
+        // ...and a distance ceiling, which is the other half of affording it. A
+        // runner 1500 u out is not a chase anyone can see; it is just a body the
+        // census will place correctly a second from now. Only inside this ring
+        // does the difference between 2 Hz and 20 Hz show on the peer's screen,
+        // and confining the spend there is what keeps a busy camp - which always
+        // has more than eight bodies running somewhere - from paying for all of
+        // them. The mid band starts at MID_NEAR_EDGE (260 u).
+        const float MID_FAST_EDGE = 700.0f;
         const unsigned int nearEnd0 = n;
         unsigned int szc = (unsigned int)midBand_.size();
+        unsigned int nFast = 0;
         for (unsigned int i = 0; i < szc && n < MAX_PUBLISH; ++i) {
             const Key mk = midBand_[i].k;
             bool dup = false;
@@ -306,9 +350,16 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (!engine::captureNpcByHand(gw, mk.i, mk.s, mk.t, mk.c, mk.cs,
                                           &buf[n]))
                 continue;
-            if (!coop::taskIsCarry(buf[n].task)) continue;
+            bool promote = coop::taskIsCarry(buf[n].task);
+            if (!promote && nFast < MID_FAST_MAX &&
+                midBand_[i].dist <= MID_FAST_EDGE && buf[n].cMoving != 0 &&
+                buf[n].cSpeed >= MID_FAST_SPEED) {
+                promote = true; ++nFast;
+            }
+            if (!promote) continue;
             ++n;
         }
+        midFastPromoted_ = nFast;
     }
     if (streamNpcs_ && !midBand_.empty() && n < MAX_PUBLISH) {
         const unsigned int nearEnd = n;
@@ -1031,9 +1082,10 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         // one reason a row is dropped here, and this names it.
         char b[320];
         _snprintf(b, sizeof(b) - 1,
-                  "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
+                  "[census] sent n=%u radius=%.0f mid=%u fast=%u anchors=%u%s"
                   " enum=%u notmine=%u proxyrow=%u attnR=%.0f",
-                  m, censusRadius_, (unsigned)midBand_.size(), na, det,
+                  m, censusRadius_, (unsigned)midBand_.size(),
+                  midFastPromoted_, na, det,
                   n, nNotMine, nProxyRow, attentionRadius_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the

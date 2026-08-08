@@ -90,6 +90,14 @@ public:
         return dt;
     }
 
+    // LOCAL arrival time of the newest snapshot (0 = nothing received yet). The
+    // ring times above are the SENDER's clock; this is the only thing that says
+    // whether the stream is still live right now. The walk/rest debounce uses it
+    // to tell a sample DROUGHT (no evidence - keep holding the walk verdict)
+    // apart from a CONFIRMED stop (samples arriving, and they say the source is
+    // standing still - stop walk-ordering it).
+    unsigned long lastArrivalMs() const { return lastArrival_; }
+
     bool empty() const { return count_ == 0; }
 
     // Ring fill (0..CAP). A young ring (< CAP) means this entity was (re-)
