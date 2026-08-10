@@ -85,6 +85,7 @@ Replicator::Replicator()
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
+      fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeBrake_(true),
       timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
@@ -320,6 +321,12 @@ void Replicator::resetSession() {
     researchSampleMs_ = 0;
     deedSampleMs_ = 0;
     deedAuditMs_ = 0;
+    // A coordinated load re-instantiates every runtime fixture, so both halves
+    // of the protocol-55 pairing are stale: re-announce and re-match from
+    // scratch rather than translate a hand into a destroyed object.
+    fixtureSampleMs_ = 0;
+    fixtureOut_.clear();
+    fixtureMap_.clear();
     contCensusMs_ = 0;
     authReassertMs_ = 0;
     // Config gates, ownRanks_ and every OUTBOUND seq counter are deliberately

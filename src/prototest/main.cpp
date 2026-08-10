@@ -117,6 +117,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(DeedPacket)",              sizeof(DeedPacket),              78); // v54: deeds
+    CHECK_EQ("sizeof(FixturePacket)",           sizeof(FixturePacket),           90); // v55: fixture identity
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
     CHECK_EQ("sizeof(CellClaimPacket)",         sizeof(CellClaimPacket),         21); // v49: cell claim
     CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        18); // v50: transfer verdict
@@ -309,8 +310,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v54: property-deed ownership)",
-             (int)PROTOCOL_VERSION, 54);
+    CHECK_EQ("PROTOCOL_VERSION (v55: runtime-fixture identity)",
+             (int)PROTOCOL_VERSION, 55);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -493,6 +494,7 @@ static void testRoundTrips() {
     roundTrip<ProdPacket>("ProdPacket", (u8)PKT_PROD);
     roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
     roundTrip<DeedPacket>("DeedPacket", (u8)PKT_DEED);
+    roundTrip<FixturePacket>("FixturePacket", (u8)PKT_FIXTURE);
     roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
     roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
 
@@ -1379,6 +1381,7 @@ static void testFlushWorldStateContract() {
     ProdPacket      pr;  std::memset(&pr,  0, sizeof(pr));
     ResearchPacket  rp;  std::memset(&rp,  0, sizeof(rp));
     DeedPacket      de;  std::memset(&de,  0, sizeof(de));
+    FixturePacket   fx;  std::memset(&fx,  0, sizeof(fx));
     BuildPlacePacket  bp; std::memset(&bp,  0, sizeof(bp));
     BuildStatePacket  bs; std::memset(&bs,  0, sizeof(bs));
     BuildDoorPacket   bd; std::memset(&bd,  0, sizeof(bd));
@@ -1399,7 +1402,7 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (33).
+    // --- Push one sentinel into every WORLD-STATE queue (34).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1423,6 +1426,7 @@ static void testFlushWorldStateContract() {
     in.pushProd(1, pr);
     in.pushResearch(1, rp);
     in.pushDeed(1, de);
+    in.pushFixture(1, fx);
     in.pushBuildPlace(1, bp);
     in.pushBuildState(1, bs);
     in.pushBuildDoor(1, bd);
@@ -1475,6 +1479,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("prod",        InboundProd,        drainProd);
     WS_EMPTY("research",    InboundResearch,    drainResearch);
     WS_EMPTY("deed",        InboundDeed,        drainDeed);
+    WS_EMPTY("fixture",     InboundFixture,     drainFixture);
     WS_EMPTY("buildPlace",  InboundBuildPlace,  drainBuildPlace);
     WS_EMPTY("buildState",  InboundBuildState,  drainBuildState);
     WS_EMPTY("buildDoor",   InboundBuildDoor,   drainBuildDoor);

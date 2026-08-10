@@ -176,6 +176,10 @@ function Invoke-OneOracle {
         "body_state"    { return (Test-NpcBodyState    -HostFile $HostLog -JoinFile $JoinLog) }
         "crawl_move"    { return (Test-CrawlMove       -HostFile $HostLog -JoinFile $JoinLog) }
         "craft_order"   { return (Test-CraftOrder      -HostFile $HostLog -JoinFile $JoinLog) }
+        "mine_pose"     { return (Test-MinePose        -JoinFile $JoinLog) }
+        "mine_identity" { return (Test-MineIdentity    -JoinFile $JoinLog) }
+        "mine_output"   { return (Test-MineOutput      -JoinFile $JoinLog) }
+        "mine_clear"    { return (Test-MineClear       -JoinFile $JoinLog) }
         "down_order"    { return (Test-DownOrder       -HostFile $HostLog -JoinFile $JoinLog) }
         "death_order"   { return (Test-DeathOrder      -HostFile $HostLog -JoinFile $JoinLog) }
         "combat_probe"  { return (Test-CombatProbe     -HostFile $HostLog) }
@@ -460,6 +464,7 @@ Export-ModuleMember -Function @(
     "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence",
     "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose", "Test-BedWake", "Test-BedLay",
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",
+    "Test-MinePose", "Test-MineIdentity", "Test-MineOutput", "Test-MineClear",
     "Test-CombatProbe", "Test-CombatOrder", "Test-CombatKill", "Test-DamageGuard",
     "Test-CombatSnapRate", "Test-CombatBattle", "Test-CombatWin", "Test-DeathParity",
     "Get-VitalsSeries", "Test-PlayerCombat", "Test-AssaultTown", "Test-PcAssault", "Get-CombatParity", "Test-PlayerKo", "Test-MedicOrder",

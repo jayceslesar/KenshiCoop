@@ -653,41 +653,130 @@ function Test-CraftOrder {
     return (Add-GateResult -Name "craft_order" -Status $v -Metrics @{ preRatio = $preRatio; postRatio = $postRatio })
 }
 
-# mine_pose (2026-07-14 mining-sync fix): a player mining an ore node operates a
-# MINE BUILDING (task 87/221 "Operating machine") whose operate spot sits ~8-9 m
-# from the resolved building origin. The join must REPRODUCE that work pose
-# (applyTaskOrder r=2 = posed at fixture), not PARK it (r=3 = fixture rejected as
-# "far") the way the old single 6 m seat gate did - a parked miner shows no mining
-# animation on the peer. Scans a JOIN log for the pose-apply results on operate-
-# machine tasks and asserts posed dominates. Runs against a MANUAL mining session
-# log (the automated harness has no terrain resource nodes); invoke as:
-#   . scripts\oracles\Npc.ps1; Test-MinePose -JoinFile <Kenshi-Join>\KenshiCoop_join.log
+# mine_pose: a player mining an ore node operates a MINE BUILDING (task 87/221
+# "Operating machine"), and the join must REPRODUCE that work pose - applyTaskOrder
+# r=2, posed at the fixture - or the peer renders a miner standing still. Two
+# distinct bugs have produced that symptom, and the apply result tells them apart:
+#   r=3  the fixture resolved but was rejected as "far" (the 2026-07-14 bug: a
+#        single 6 m seat gate rejected a correct mine whose origin sits ~9-100 m
+#        from its operate spot)
+#   r=1  the fixture did not resolve AT ALL (the 2026-08-09 protocol-55 bug: a
+#        mine is instantiated per client for a terrain node, so the streamed hand
+#        named nothing here)
+#
+# JUDGED ON CONVERGENCE, NOT ON A RATIO, and the difference is load-bearing. r=1 on
+# the FIRST apply is expected and benign: the pose rides a 20 Hz stream while the
+# protocol-55 pairing rides a reliable ~1 Hz one, so the first frame reliably loses
+# the race and is retried once the pairing lands. A ratio test fails that correct
+# behaviour (the verified mine1 run scores 2 posed / 1 missing = 0.67). What
+# actually distinguishes a working client is where each miner ENDS UP, so this
+# asserts the LAST apply per hand is r=2. Both historical bugs end parked, so both
+# are still caught. Counts are reported as metrics for diagnosis.
 function Test-MinePose {
-    param([string]$JoinFile, [int[]]$WorkTasks = @(87, 221), [double]$MinRatio = 0.70)
+    param([string]$JoinFile, [int[]]$WorkTasks = @(87, 221))
     if (-not (Test-Path $JoinFile)) {
         Write-Host "  MINE-POSE FAIL - join log not found: $JoinFile"
         return (Add-GateResult -Name "mine_pose" -Status FAIL -Detail "no join log")
     }
-    $rx = [regex]'\[pose\] applyOrder .*\btask=(\d+)\b.*\br=(-?\d+)\b'
-    $posed = 0; $parked = 0; $other = 0
+    $rx = [regex]'\[pose\] applyOrder hand=(\d+,\d+) task=(\d+)\b.*\br=(-?\d+)\b'
+    $posed = 0; $parked = 0; $missing = 0; $other = 0
+    $final = @{}   # hand -> last apply result seen for a work task
     foreach ($m in (Select-String -Path $JoinFile -Pattern $rx -AllMatches).Matches) {
-        $task = [int]$m.Groups[1].Value
-        $r    = [int]$m.Groups[2].Value
+        $task = [int]$m.Groups[2].Value
         if ($WorkTasks -notcontains $task) { continue }
+        $hand = $m.Groups[1].Value
+        $r    = [int]$m.Groups[3].Value
         if     ($r -eq 2) { $posed++ }
         elseif ($r -eq 3) { $parked++ }
+        elseif ($r -eq 1) { $missing++ }
         else              { $other++ }
+        $final[$hand] = $r
     }
-    $total = $posed + $parked
-    if ($total -lt 1) {
+    if ($final.Count -lt 1) {
         Write-Host "  MINE-POSE FAIL - no operate-machine pose applies (task in $($WorkTasks -join ',')) in join log; order a unit to mine an ore node first"
         return (Add-GateResult -Name "mine_pose" -Status FAIL -Detail "no operate-machine pose applies")
     }
-    $ratio = [Math]::Round($posed / $total, 3)
-    $ok = ($posed -ge 1 -and $ratio -ge $MinRatio)
+    $converged = 0; $stuck = @()
+    foreach ($h in $final.Keys) {
+        if ($final[$h] -eq 2) { $converged++ } else { $stuck += "$h(r=$($final[$h]))" }
+    }
+    $ok = ($stuck.Count -eq 0)
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  MINE-POSE [join] $v - operate pose posed(r=2) $posed / parked(r=3) $parked (ratio=$ratio >= $MinRatio), other=$other, tasks=$($WorkTasks -join ',')"
-    return (Add-GateResult -Name "mine_pose" -Status $v -Metrics @{ posed = $posed; parked = $parked; ratio = $ratio })
+    $stuckTxt = if ($stuck.Count) { " STUCK: $($stuck -join ' ')" } else { "" }
+    Write-Host "  MINE-POSE [join] $v - $converged/$($final.Count) miner(s) ended posed(r=2); applies posed=$posed parked(r=3)=$parked missing(r=1)=$missing other=$other$stuckTxt"
+    return (Add-GateResult -Name "mine_pose" -Status $v -Metrics @{
+        miners = $final.Count; converged = $converged; posed = $posed
+        parked = $parked; missing = $missing })
+}
+
+# mine_identity (protocol 55): the direct witness that a runtime fixture's
+# cross-client identity was bridged. A mine is instantiated per client for a
+# terrain resource node, so the same physical mine carries a different hand on
+# each side (measured on mine1: 148.3812011776 host vs 148.1654907264 join, at an
+# identical position). The join must pair the peer's hand to its own copy and log
+# "[fixture] RECV pair wire=<peer> -> local=<ours>".
+#
+# Requires at least one pair whose wire hand DIFFERS from the local hand. That
+# qualifier is the whole assertion: a save-baked machine announces a hand that
+# already resolves here, which the receiver records as an identity pairing and
+# never logs, so counting bare pair lines would pass on a run where nothing was
+# actually translated.
+function Test-MineIdentity {
+    param([string]$JoinFile)
+    if (-not (Test-Path $JoinFile)) {
+        Write-Host "  MINE-IDENTITY FAIL - join log not found: $JoinFile"
+        return (Add-GateResult -Name "mine_identity" -Status FAIL -Detail "no join log")
+    }
+    $rx = [regex]'\[fixture\] RECV pair wire=([\d.]+) -> local=([\d.]+)'
+    $pairs = 0; $translated = 0; $sample = ""
+    foreach ($m in (Select-String -Path $JoinFile -Pattern $rx -AllMatches).Matches) {
+        $pairs++
+        if ($m.Groups[1].Value -ne $m.Groups[2].Value) {
+            $translated++
+            if (-not $sample) { $sample = "$($m.Groups[1].Value) -> $($m.Groups[2].Value)" }
+        }
+    }
+    $unmatched = @(Select-String -Path $JoinFile -Pattern '\[fixture\] RECV unmatched' -AllMatches).Count
+    $ok = ($translated -ge 1)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  MINE-IDENTITY [join] $v - fixture pairings=$pairs translated=$translated unmatched-rows=$unmatched$(if($sample){" e.g. $sample"})"
+    return (Add-GateResult -Name "mine_identity" -Status $v -Metrics @{
+        pairs = $pairs; translated = $translated; unmatched = $unmatched })
+}
+
+# mine_output (protocol 55, the inventory half of the same bug): the mine's
+# production buffer is host-authored and keyed by the HOST's hand for the mine.
+# Before the fixture pairing existed, every one of those rows hit an unresolvable
+# key on the join and was dropped silently, so the ore a player watched accumulate
+# never crossed. Asserts the join APPLIED (ok=1) at least one production row whose
+# key is a hand it had to TRANSLATE - correlating the prod key against the paired
+# wire hands, so this proves the identity map actually carried the inventory
+# channel rather than merely that some unrelated baked machine ticked over.
+function Test-MineOutput {
+    param([string]$JoinFile)
+    if (-not (Test-Path $JoinFile)) {
+        Write-Host "  MINE-OUTPUT FAIL - join log not found: $JoinFile"
+        return (Add-GateResult -Name "mine_output" -Status FAIL -Detail "no join log")
+    }
+    $paired = @{}
+    $pairRx = [regex]'\[fixture\] RECV pair wire=([\d.]+) -> local=([\d.]+)'
+    foreach ($m in (Select-String -Path $JoinFile -Pattern $pairRx -AllMatches).Matches) {
+        if ($m.Groups[1].Value -ne $m.Groups[2].Value) { $paired[$m.Groups[1].Value] = $true }
+    }
+    $prodRx = [regex]'\[prod\] RECV key=([\d.]+) .*\bok=(\d+)'
+    $applied = 0; $dropped = 0; $onPaired = 0
+    foreach ($m in (Select-String -Path $JoinFile -Pattern $prodRx -AllMatches).Matches) {
+        $key = $m.Groups[1].Value
+        if ([int]$m.Groups[2].Value -eq 1) {
+            $applied++
+            if ($paired.ContainsKey($key)) { $onPaired++ }
+        } else { $dropped++ }
+    }
+    $ok = ($onPaired -ge 1)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  MINE-OUTPUT [join] $v - production rows applied=$applied (on translated fixtures=$onPaired) not-applied=$dropped, translated fixtures known=$($paired.Count)"
+    return (Add-GateResult -Name "mine_output" -Status $v -Metrics @{
+        applied = $applied; onPaired = $onPaired; notApplied = $dropped })
 }
 
 # mine_clear (2026-07-15 job-removal fix): removing a job on the host while the

@@ -1602,6 +1602,94 @@ bool readContainerByHand(const unsigned int cHand[5], ContRead* out) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// Find the resource MINE nearest the leader. Matched on CLASS, not template
+// name the way findWorkFixtureNear matches a bench: a mine is named for the ore
+// it yields ('Copper Resource', 'Iron Resource', ...), so there is no shared
+// substring to key on, while BCTYPE_PRODUCTION picks it out exactly.
+//
+// The radius is wide on purpose. A mine's ORIGIN can sit far from the spot a
+// miner actually occupies - 38.9 m on the mine1 copper node - which is the same
+// offset that exempts work fixtures from the seat distance gate. A 60 u search
+// like the bench one would miss a mine the leader is standing at.
+RootObject* findMineNear(GameWorld* gw) {
+    if (!gw || !g_getObjsFn || !gw->player) return 0;
+    if (gw->player->playerCharacters.size() == 0) return 0;
+    __try {
+        Character* leader = gw->player->playerCharacters[0];
+        if (!leader) return 0;
+        Ogre::Vector3 center = leader->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, 150.0f, BUILDING, 256, 0);
+        unsigned int total = g_npcQuery.size();
+        RootObject* best = 0; float bestD2 = 1e18f;
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o) continue;
+            Building* b = static_cast<Building*>(o);
+            if ((int)b->classType != (int)BCTYPE_PRODUCTION) continue;
+            if (!b->_buildState.isComplete) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - center.x, dz = p.z - center.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) { bestD2 = d2; best = o; }
+        }
+        return best;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// ---- Protocol 55: runtime-fixture identity ---------------------------------
+
+// Horizontal search radius (world units) for pairing a peer's fixture row to a
+// local building. See findFixtureByPosSid for why this is loose.
+static const float FIXTURE_MATCH_DIST = 5.0f;
+
+// Match a peer's fixture description to the LOCAL object that is the same
+// physical thing. Used only when the peer's hand does not resolve here, which
+// for a terrain-node mine is always: each client instantiates its own building
+// for the node, so the hands differ while the POSITION is terrain-anchored and
+// agrees to the decimetre (measured -51566.5,-2515.7 on both clients for the
+// same mine). Position is therefore the match key; the template sid and the
+// class are guards, so a co-located building of a different kind can never be
+// paired. Nearest wins among the candidates that pass both guards.
+//
+// FIXTURE_MATCH_DIST is generous relative to the observed agreement because the
+// cost of a miss is high (no pairing = the original bug) while a false pair is
+// prevented by the guards, not by the radius: two DIFFERENT instances of the
+// same template within a few metres of each other do not occur for the machine
+// classes this channel announces.
+bool findFixtureByPosSid(GameWorld* gw, float x, float y, float z,
+                         const char* sid, int classType, unsigned int out[5]) {
+    if (!gw || !out || !sid || !sid[0] || !g_getObjsFn) return false;
+    (void)y; // horizontal match: a building's origin Y varies with terrain fit
+    bool found = false;
+    __try {
+        Ogre::Vector3 center(x, y, z);
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, FIXTURE_MATCH_DIST, BUILDING, 256, 0);
+        float best = FIXTURE_MATCH_DIST * FIXTURE_MATCH_DIST;
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o) continue;
+            Building* b = static_cast<Building*>(o);
+            if (classType >= 0 && (int)b->classType != classType) continue;
+            GameData* gd = o->getGameData();
+            if (!gd) continue;
+            if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - x, dz = p.z - z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 > best) continue;
+            unsigned int h[5];
+            if (!readObjectHand(o, h)) continue;
+            memcpy(out, h, sizeof(unsigned int) * 5);
+            best = d2;
+            found = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return found;
+}
+
 int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]) {
     (void)gw;
     if (!vHand) return -1;

@@ -525,6 +525,17 @@ struct Config {
     // hatch.
     bool          deedSync;
 
+    // KENSHICOOP_FIXTURE_SYNC (default ON): runtime-fixture identity (protocol
+    // 55) - BOTH clients announce the container/machine-class fixtures near
+    // their interest centers (hand + position + template) and pair each
+    // announcement with their own copy. It carries no gameplay state; it exists
+    // because a MINE is instantiated per client for a terrain node, so the same
+    // mine has a different hand on each side and every channel that quotes that
+    // hand fails: the mining pose does not reproduce (the peer sees no swing
+    // animation) and the mine's output never crosses. "0" is the A/B escape
+    // hatch back to raw hands.
+    bool          fixtureSync;
+
     // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
     // (protocol 34) - the HOST censuses container-bearing buildings (storage
     // chests + the machine classes) in the interest spheres ~1 Hz and

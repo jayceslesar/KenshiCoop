@@ -539,6 +539,12 @@ int  logDuelCombat(GameWorld* gw);
 // workerHand is in readObjectHand layout: [type,container,containerSerial,index,serial].
 bool pickCraftWorker(GameWorld* gw, unsigned int workerHand[5], int* outTask);
 bool orderCraftWorker(GameWorld* gw, const unsigned int workerHand[5], int task);
+// The mine_pose equivalents. The miner is a PLAYER SQUAD member rather than a
+// world NPC (a resource node is in the wilderness, and the join drives rank 0 as
+// a copy - the path the pose must survive); the fixture is class-matched by
+// findMineNear rather than name-matched.
+bool pickMineWorker(GameWorld* gw, unsigned int workerHand[5], int* outTask);
+bool orderMineWorker(GameWorld* gw, const unsigned int workerHand[5], int task);
 // Hold the pinned worker untasked + parked at the prop during the baseline (an idle
 // world NPC patrols out of capture range otherwise). Call each baseline tick.
 bool holdWorkerAtFixture(GameWorld* gw, const unsigned int workerHand[5]);
@@ -2038,6 +2044,24 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
 // SEH-guarded single-container read by local hand. Returns false when the hand
 // does not resolve locally or is not a container-bearing building class.
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out);
+
+// Nearest BCTYPE_PRODUCTION building (a resource mine) to the leader, or null.
+// Class-matched rather than name-matched, and searched wide, because a mine's
+// origin can sit tens of metres from where its miner stands. Drives the
+// mine_pose scenario's fixture pick.
+RootObject* findMineNear(GameWorld* gw);
+
+// ---- Protocol 55: runtime-fixture identity -----------------------------------
+// Resolve a peer's fixture row (world position + template sid + building class)
+// to the LOCAL hand of the same physical object, for fixtures whose hand is
+// client-local rather than save-stable - an ore/stone mine is instantiated per
+// client for a terrain node, so the same mine carries a different index AND
+// serial on each side while sitting at the identical position. Position is the
+// match key; sid and classType are guards. Writes the local hand and returns
+// true on a match, false when nothing here qualifies (zone not loaded yet - the
+// caller keeps using the raw hand, which is correct for save-baked machines).
+bool findFixtureByPosSid(GameWorld* gw, float x, float y, float z,
+                         const char* sid, int classType, unsigned int out[5]);
 
 // ---- Protocol 35: squad management sync --------------------------------------
 // A squad-tab MOVE re-containers the body exactly like a recruit (the hand's

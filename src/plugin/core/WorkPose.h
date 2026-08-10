@@ -13,13 +13,23 @@
 //     seat is right under the body, <~4 m) or the body parks in place instead.
 //
 //   * WORK fixtures (ore/stone mines, wells, production machines, training dummies)
-//     are UNIQUE named buildings. Their hand resolves to the SAME instance at the
-//     SAME world position on both clients (verified in the field: subjpos matched
-//     host vs join to the metre). But a large mine's operate spot can sit 50-100 m
-//     from the building ORIGIN we resolve, so distance-gating a work fixture wrongly
-//     rejects a CORRECT large mine. Work fixtures are therefore NOT distance-gated:
-//     once the hand resolves we trust it and issue the operate order; the engine
-//     paths the body to the machine's own operate point.
+//     are UNIQUE named buildings, so once the right one is in hand there is nothing
+//     to mis-resolve. A large mine's operate spot can sit 50-100 m from the building
+//     ORIGIN we resolve, so distance-gating a work fixture wrongly rejects a CORRECT
+//     large mine. Work fixtures are therefore NOT distance-gated: the caller passes
+//     them as identity-trusted and the engine paths the body to the machine's own
+//     operate point.
+//
+//     CAUTION, and the correction to what this comment used to claim. The original
+//     justification was that a work fixture's hand "resolves to the SAME instance at
+//     the SAME world position on both clients". The position half is true; the hand
+//     half is FALSE for a mine, and believing it cost two bugs. A mine is built at
+//     runtime, per client, for a terrain resource node, so the same mine measured
+//     subj=50,2399902464 on the host and subj=104,1377319296 on the join at an
+//     identical subjpos. The hand therefore has to be TRANSLATED (protocol 55) before
+//     it ever reaches this policy - see Wire.h FixturePacket. What survives is only
+//     the distance rule: identity trust here means "do not re-litigate the fixture by
+//     distance", NOT "the incoming handle is meaningful as-is".
 //
 //   * MEDIC (first-aid) subjects (2026-07-15 medic sync) are the PATIENT CHARACTER,
 //     not a fixture. A squad member's hand resolves cross-client (both clients loaded
@@ -37,7 +47,8 @@
 // (applyTaskOrder returned 3 -> join parked the body idle, no mining animation).
 // Field distances: one mine resolved ~8.9 m from origin, a LARGER mine 57 m (host,
 // ground truth) / 104 m (join). No fixed radius covers both, so work fixtures are
-// trusted by identity (reliable hand) rather than gated by distance.
+// accepted on identity rather than gated by distance - with that identity supplied
+// by the protocol-55 pairing, not by the raw streamed handle.
 
 #ifndef COOP_WORK_POSE_H
 #define COOP_WORK_POSE_H

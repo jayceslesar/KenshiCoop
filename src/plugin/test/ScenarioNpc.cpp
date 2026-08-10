@@ -184,6 +184,123 @@ private:
     unsigned long lastOrderMs_;
 };
 
+// mine_pose (protocol 55, 2026-08-09): the craft_order shape aimed at the fixture
+// family craft_order cannot reach. A crafting bench is BAKED into the shared save,
+// so its hand matches on both clients and the pose reproduces on identity alone. A
+// MINE is not: each client instantiates its own building for a terrain resource
+// node, so the same mine carries a different hand per side, and every channel that
+// quotes that hand fails at once - the pose apply returns 1 and parks the miner
+// with no swing animation, and the production rows keyed to it are dropped. That
+// is why this needed its own gate rather than a craft1 variant, and why the save
+// is mine1: the automated harness had no terrain resource node until this one.
+//
+// The host pins its LEADER (rank 0, host-owned under the inhabit partition, so the
+// join carries it as a driven copy), lets the join watch it idle for a baseline,
+// then orders it onto the node. The join must translate the mine hand through the
+// protocol-55 pairing and reproduce the pose. Logged markers let the oracles split
+// before/after; the judging itself reads the [pose]/[fixture]/[prod] lines rather
+// than anything this class asserts locally.
+class MinePoseScenario : public TimedScenario {
+public:
+    MinePoseScenario()
+        : TimedScenario("mine_pose", 0), recvCount_(0), lastLogMs_(0),
+          orderLogged_(false), haveWorker_(false), task_(0), lastOrderMs_(0),
+          orderOk_(false) {}
+
+    // Pin at local gameplay start, like craft_order: the query needs the world
+    // loaded, and retrying pre-arm costs nothing. Unlike craft_order there is no
+    // hold phase - the miner is a squad member standing where the save put it, so
+    // nothing patrols it away and parking it every tick would fight the drive.
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        if (!ctx.isHost) return;
+        pinWorker(ctx);
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        if (ctx.isHost) {
+            pinWorker(ctx);
+            if (!haveWorker_)
+                coop::logLine("SCENARIO mine worker pin FAILED (no production-class node in range)");
+        }
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.isHost && haveWorker_ && ctx.elapsedMs >= ORDER_AT_MS) {
+            if (!orderLogged_ || ctx.elapsedMs - lastOrderMs_ >= 3000) {
+                lastOrderMs_ = ctx.elapsedMs;
+                orderOk_ = engine::orderMineWorker(ctx.gw, workerHand_, task_);
+                if (!orderLogged_) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO ORDER issued task=%d ok=%d (mine live-order)",
+                              task_, orderOk_ ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    orderLogged_ = true;
+                }
+            }
+        }
+
+        // SQUAD capture, not craft_order's captureNpcs: the miner is a player
+        // squad member, and a resource node sits in wilderness where the world-NPC
+        // census is empty - scoring the join on captureNpcs there fails a perfectly
+        // good run for want of bystanders. Split MEMBER/RECV by tab rank exactly
+        // like bed_pose, so the join's evidence is that it received the OTHER
+        // side's body at all.
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_LOG];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_LOG);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (orderLogged_ && orderOk_) : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    // Longer post-order window than craft_order's. The pose apply lands within a
+    // second, but the production buffer this gate also judges only starts crossing
+    // once the miner has walked to the node and swung a few times - measured ~5 s
+    // from order to the first applied [prod] row on the mine1 node.
+    static const unsigned long ORDER_AT_MS      = 18000;
+    static const unsigned long HOST_DURATION_MS = 76000;
+    static const unsigned long JOIN_DURATION_MS = 58000;
+    static const unsigned int  MAX_LOG          = 40;
+
+    void pinWorker(const ScenarioContext& ctx) {
+        if (haveWorker_) return;
+        haveWorker_ = engine::pickMineWorker(ctx.gw, workerHand_, &task_);
+        if (haveWorker_) {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO mine worker pinned hand=%u,%u,%u,%u,%u task=%d",
+                      workerHand_[3], workerHand_[4], workerHand_[0],
+                      workerHand_[1], workerHand_[2], task_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          orderLogged_;
+    bool          haveWorker_;
+    unsigned int  workerHand_[5];
+    int           task_;
+    unsigned long lastOrderMs_;
+    bool          orderOk_;
+};
+
 // down_order (Stage 2, LIVE transition): the body-state analog of craft_order. The
 // subject starts UPRIGHT (down1 loaded WITHOUT host re-arm, so nothing downs it), the
 // join observes it standing for a baseline window, then at ORDER_AT_MS the HOST knocks
@@ -853,6 +970,7 @@ private:
 Scenario* makeNpcScenario(const std::string& name) {
     if (name == "npc_sync")     return new NpcSyncScenario();
     if (name == "craft_order")  return new CraftOrderScenario();
+    if (name == "mine_pose")    return new MinePoseScenario();
     if (name == "down_order")   return new DownOrderScenario();
     if (name == "death_order")  return new DeathOrderScenario();
     if (name == "spawn_probe")  return new SpawnSyncScenario(/*probe=*/true);

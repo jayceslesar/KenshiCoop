@@ -224,6 +224,8 @@ void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outR
 
 void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pkt); }
 
+void NetLink::queueFixture(const FixturePacket& pkt) { pushLocked(outCs_, outFixture_, pkt); }
+
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
 void NetLink::queueBuildState(const BuildStatePacket& pkt) { pushLocked(outCs_, outBuildState_, pkt); }
@@ -777,6 +779,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dep)
                             && inbound_) {
                             inbound_->pushDeed(dep.ownerId, dep);
+                        }
+                    } else if (type == PKT_FIXTURE) {
+                        // Reliable runtime-fixture identity row (protocol 55):
+                        // symmetric, pairs the sender's hand with our own copy.
+                        FixturePacket fxp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fxp)
+                            && inbound_) {
+                            inbound_->pushFixture(fxp.ownerId, fxp);
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -1494,6 +1504,25 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < deedPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&deedPkts[i], sizeof(DeedPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued runtime-fixture identity rows on CH_RELIABLE
+        // (protocol 55). SYMMETRIC: the pose path is bidirectional, so each side
+        // must be able to translate the other's fixture hands.
+        std::vector<FixturePacket> fixPkts;
+        EnterCriticalSection(&outCs_);
+        fixPkts.swap(outFixture_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < fixPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&fixPkts[i], sizeof(FixturePacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

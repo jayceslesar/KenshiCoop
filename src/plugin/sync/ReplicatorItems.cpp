@@ -186,7 +186,11 @@ void Replicator::applyInventories(GameWorld* gw) {
         if (ownedContainers_.count(it->first) != 0) continue;
         if (ownHands_.count(it->first) != 0) continue;
         const Key& k = it->first;
-        unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        // A mine's container key is the AUTHOR's hand for its own instance of
+        // the node's building, which names nothing here - reconciling it
+        // verbatim was a silent no-op, so the mine's output never crossed.
+        unsigned int cHand[5];
+        handForContainerKey(k, cHand);
         const InvItemEntry* items = it->second.items.empty() ? 0 : &it->second.items[0];
         unsigned int n = (unsigned int)it->second.items.size();
         // Protocol 37 (the race that blinded the detector in run 141024): if this
@@ -1500,7 +1504,8 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
 // ---- Protocol 37: cross-owner transfer intents ------------------------------
 
 void Replicator::xferRebase(GameWorld* gw, const Key& k) {
-    unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
+    unsigned int cHand[5];
+    handForContainerKey(k, cHand);
     std::map<XKey, int>& base = xferBase_[k];
     base.clear();
     if (engine::resolveObjectByHand(cHand) != 0) {
@@ -1579,7 +1584,8 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     InvItemEntry items[64];
     std::map<Key, std::map<XKey, int> > cur;
     for (std::set<Key>::iterator it = tracked.begin(); it != tracked.end(); ++it) {
-        unsigned int cHand[5] = { it->t, it->c, it->cs, it->i, it->s };
+        unsigned int cHand[5];
+        handForContainerKey(*it, cHand);
         if (engine::resolveObjectByHand(cHand) == 0) continue;
         std::map<XKey, int>& tot = cur[*it];
         unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
@@ -1743,12 +1749,13 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         if (appliedXfers_.count(id) != 0) continue; // idempotent (reliable resend / replay)
         appliedXfers_.insert(id);
         if (appliedXfers_.size() > 4096) appliedXfers_.erase(appliedXfers_.begin());
-        unsigned int sHand[5] = { p.sType, p.sContainer, p.sContainerSerial, p.sIndex, p.sSerial };
-        unsigned int dHand[5] = { p.dType, p.dContainer, p.dContainerSerial, p.dIndex, p.dSerial };
         Key sk; sk.t = p.sType; sk.c = p.sContainer; sk.cs = p.sContainerSerial;
         sk.i = p.sIndex; sk.s = p.sSerial;
         Key dk; dk.t = p.dType; dk.c = p.dContainer; dk.cs = p.dContainerSerial;
         dk.i = p.dIndex; dk.s = p.dSerial;
+        // Either end may be a mine the peer emptied, whose hand is its own.
+        unsigned int sHand[5]; handForContainerKey(sk, sHand);
+        unsigned int dHand[5]; handForContainerKey(dk, dHand);
         // Relocate OUR copy of the real item between the same two containers - the
         // conservation move (never fabricates or destroys), so gear survives.
         int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,

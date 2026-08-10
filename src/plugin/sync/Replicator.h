@@ -544,6 +544,25 @@ public:
     // Property-deed sync master enable (KENSHICOOP_DEED_SYNC).
     void setDeedSync(bool v) { deedSync_ = v; }
 
+    // AFTER engine (protocol 55): announce the container/machine-class fixtures
+    // near our interest centers so the peer can pair our hand for each with its
+    // own copy. Rows are STATIC (position + template), so this is first-sight
+    // plus a slow safety resend - the resend doubles as the retry for a peer
+    // whose zone was not loaded when the row first landed. Runs on BOTH sides:
+    // the pose path is bidirectional, and protocol 33/34 are host-authored, so
+    // each direction needs the other's key space.
+    void publishFixtures(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 55): drain received fixture rows and pair each
+    // sender hand with the LOCAL hand of the same physical object, matched on
+    // position with the template sid and building class as guards. Stores only
+    // identity - no gameplay state is written here. An unmatched row records
+    // nothing and waits for the safety resend.
+    void applyFixtures(const SyncContext& ctx);
+
+    // Runtime-fixture sync master enable (KENSHICOOP_FIXTURE_SYNC).
+    void setFixtureSync(bool v) { fixtureSync_ = v; }
+
     // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
     // buildings, placed-building doors, production, research) from one
     // channel-descriptor registry. Replaces the per-channel if-blocks the tick
@@ -803,6 +822,7 @@ private:
         bool         taskBad;        // task not reproducible here (fixture missing/drift)
         unsigned long taskTick;      // when the task was issued (drift grace timer)
         unsigned int taskRetries;    // far-fixture (r=3) attempts (interp-lag retry)
+        bool         fixtureXlateLogged; // one [pose] fixture-xlate line per body
         unsigned long taskNoneTick;  // first tick of the current sustained host->NONE
                                      //   streak (0 = not in one); after TASK_CLEAR_MS
                                      //   of continuous NONE the held pose is released
@@ -917,7 +937,8 @@ private:
                    haveDest(false), dx(0), dy(0), dz(0), walkHalted(false), walkStallF(0),
                    suppressed(false), lastSeenMs(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
-                   taskTick(0), taskRetries(0), taskNoneTick(0), detached(false), downApplied(false),
+                   taskTick(0), taskRetries(0), fixtureXlateLogged(false),
+                   taskNoneTick(0), detached(false), downApplied(false),
                    koLatched(false), deathLatched(false), carriedDown(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
@@ -2030,6 +2051,53 @@ private:
     unsigned long deedSampleMs_;
     unsigned long deedAuditMs_; // last wide-state dump (owner-vs-peer diff)
     bool          deedSync_;
+    // Protocol 55 runtime-fixture identity. A mine is instantiated per client
+    // for a terrain node, so the same physical fixture has a different hand on
+    // each side; without a pairing the pose inject resolves nothing (the miner
+    // parks with no animation) and every prod/container row keyed to it is
+    // dropped. Two halves:
+    //
+    //   fixtureOut_  - PUBLISH bookkeeping: which of OUR fixtures we have
+    //     announced and when, so the channel is first-sight + safety resend
+    //     rather than a per-sample broadcast.
+    //   fixtureMap_  - APPLY result: the PEER's key -> the hand that fixture has
+    //     HERE. Read through localHandForFixtureKey by the pose inject and by
+    //     the prod/container channels. Absent or unresolved means "no pairing
+    //     known", and every caller then falls back to the raw wire hand, which
+    //     is still correct for a save-baked machine.
+    struct FixOut {
+        unsigned long lastSendMs; bool sent;
+        FixOut() : lastSendMs(0), sent(false) {}
+    };
+    struct FixtureRow {
+        unsigned int hand[5]; bool resolved; u32 seqSeen; unsigned long lastMissMs;
+        FixtureRow() : resolved(false), seqSeen(0), lastMissMs(0) {
+            hand[0] = hand[1] = hand[2] = hand[3] = hand[4] = 0;
+        }
+    };
+    std::map<Key, FixOut>     fixtureOut_;
+    std::map<Key, FixtureRow> fixtureMap_;
+    u32           fixtureSeqOut_;
+    unsigned long fixtureSampleMs_;
+    bool          fixtureSync_;
+    // Translate a peer fixture key to the local hand for the same object.
+    // False when we have no pairing (yet) - the caller keeps the raw hand.
+    bool localHandForFixtureKey(const Key& wire, unsigned int out[5]) const;
+    // Release the taskBad park on driven bodies after a new pairing lands, so a
+    // pose that failed while the fixture was unpaired gets one more chance.
+    void unparkForNewFixture();
+    // The LOCAL hand to hand the engine for a container key that came off the
+    // wire. Identity for anything save-baked (a squad member's own hand, a
+    // chest); the protocol-55 pairing for a fixture whose hand is client-local,
+    // where using the key verbatim reads and writes nothing. Keys WE author are
+    // already local and are never translated, so an unlucky collision between
+    // our hand for one fixture and the peer's for another cannot bite.
+    void handForContainerKey(const Key& k, unsigned int out[5]) const {
+        if (ownedContainers_.count(k) == 0 && ownHands_.count(k) == 0 &&
+            localHandForFixtureKey(k, out))
+            return;
+        out[0] = k.t; out[1] = k.c; out[2] = k.cs; out[3] = k.i; out[4] = k.s;
+    }
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the

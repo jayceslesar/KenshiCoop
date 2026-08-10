@@ -571,6 +571,27 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # mine_pose covers the fixture family craft_order structurally cannot: a
+        # crafting bench is BAKED into the shared save, so its hand matches on both
+        # clients and the pose reproduces on identity alone, whereas a MINE is
+        # instantiated per client for a terrain resource node and its hand does not
+        # cross. That difference broke three things at once (protocol 55), so the
+        # three gates here judge three different links in the same chain and a
+        # regression in any one of them is separately diagnosable:
+        #   mine_identity - the pairing crossed and actually TRANSLATED a hand
+        #   mine_pose     - the miner ended up posed at the fixture (the animation)
+        #   mine_output   - a production row APPLIED on a translated fixture (the ore)
+        # mine_pose is primary because it is the reported symptom. mine1 is the only
+        # save with a terrain ore node; before it the harness could not reach this
+        # code path at all and the oracles were manual-only.
+        mine_pose = @{
+            Save = 'mine1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'mine_pose'
+            Gating   = @('mine_pose', 'mine_identity', 'mine_output', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'pose_state')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # ---- body-state / reliable events ----------------------------------------
         down_order = @{
             Save = 'down1'; Setup = ''; Tolerance = 3.0

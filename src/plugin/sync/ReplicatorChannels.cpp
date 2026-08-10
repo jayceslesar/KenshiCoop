@@ -993,7 +993,13 @@ void Replicator::applyProd(const SyncContext& ctx) {
         // hand) or one we MINTED for the host's placement (translation map).
         unsigned int hand[5];
         if (p.keyKind == 0) {
-            for (unsigned int h = 0; h < 5; ++h) hand[h] = p.key[h];
+            // A baked hand resolves directly, but a MINE's does not: it is a
+            // per-client instance for a terrain node, so the host's key names
+            // nothing here and every buffer row for it used to be dropped -
+            // the "mine inventory does not sync" half of the report. Prefer the
+            // protocol-55 pairing, fall back to the raw hand.
+            if (!localHandForFixtureKey(wk, hand))
+                for (unsigned int h = 0; h < 5; ++h) hand[h] = p.key[h];
         } else {
             std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(wk);
             if (ob != ownBuilds_.end()) {
@@ -1313,6 +1319,157 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
     }
 }
 
+// ---- Protocol 55: runtime-fixture identity ----------------------------------
+// See the FixturePacket comment in Wire.h for the measurement that motivates
+// this channel (the same mine carrying hand 50.2399902464 on the host and
+// 104.1377319296 on the join, at an identical world position).
+
+// The census both halves share: the container/machine classes within the
+// interest radius, i.e. exactly the set protocol 33 and 34 key their rows to.
+// Seats and beds are save-baked and deliberately outside it - restricting what
+// is ANNOUNCED is what keeps the furniture protocols on their existing path.
+static const float FIXTURE_CENSUS_RADIUS = 100.0f; // matches prod/store census
+static const unsigned int FIXTURE_MAX_ROWS = 48;
+
+void Replicator::publishFixtures(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    if (!fixtureSync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // census cadence
+    const unsigned long RESEND_MS = 15000; // lost-row AND not-yet-loadable retry
+    unsigned long now = nowMs();
+    if (!sync::gateSampleDue(now, fixtureSampleMs_, SAMPLE_MS)) return;
+    fixtureSampleMs_ = now;
+
+    static engine::ContRead rows[FIXTURE_MAX_ROWS]; // main-thread only
+    unsigned int n = engine::enumContainersNear(gw, FIXTURE_CENSUS_RADIUS, rows,
+                                                FIXTURE_MAX_ROWS);
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::ContRead& r = rows[i];
+        if (!r.sid[0]) continue; // no template = nothing the peer can match on
+        Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
+        k.i = r.hand[3]; k.s = r.hand[4];
+        FixOut& fo = fixtureOut_[k];
+        bool first = !fo.sent;
+        if (!first && (now - fo.lastSendMs) < RESEND_MS) continue;
+        fo.sent = true; fo.lastSendMs = now;
+        FixturePacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_FIXTURE;
+        pkt.ownerId = ownerId;
+        pkt.seq     = fixtureSeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
+        pkt.x = r.x; pkt.y = r.y; pkt.z = r.z;
+        pkt.classType = (u8)r.classType;
+        strncpy(pkt.sid, r.sid, sizeof(pkt.sid) - 1);
+        net.queueFixture(pkt);
+        if (first) { // resends stay silent; a newly seen fixture is the signal
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                      "[fixture] SEND hand=%u.%u.%u.%u.%u cls=%d pos=%.1f,%.1f "
+                      "sid='%s' name='%s' seq=%u",
+                      pkt.hand[0], pkt.hand[1], pkt.hand[2], pkt.hand[3],
+                      pkt.hand[4], r.classType, r.x, r.z, r.sid, r.name, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyFixtures(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    std::deque<InboundFixture> got;
+    in.drainFixture(got);
+    if (got.empty()) return;
+    if (!fixtureSync_) return;
+    unsigned long now = nowMs();
+    for (std::deque<InboundFixture>::iterator it = got.begin(); it != got.end(); ++it) {
+        const FixturePacket& p = it->pkt;
+        Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
+        k.i = p.hand[3]; k.s = p.hand[4];
+        FixtureRow& fr = fixtureMap_[k];
+        if (!sync::gateSeqAccept(fr.seqSeen, p.seq)) continue; // stale/dup row
+        fr.seqSeen = p.seq;
+        if (fr.resolved) continue; // identity is permanent; resends are no-ops
+
+        // Save-baked machines DO cross by hand, and those rows are the majority
+        // in a town. Take the sender's hand as-is when it resolves here to the
+        // same template at the same place - the position/sid agreement is what
+        // makes it a proven pairing rather than a coincidental resolve.
+        engine::ContRead cur;
+        if (engine::readContainerByHand(p.hand, &cur) &&
+            strcmp(cur.sid, p.sid) == 0 &&
+            (cur.x - p.x) * (cur.x - p.x) + (cur.z - p.z) * (cur.z - p.z) <= 25.0f) {
+            memcpy(fr.hand, p.hand, sizeof(unsigned int) * 5);
+            fr.resolved = true;
+            continue; // identity pairing: consumers keep using the wire hand
+        }
+
+        unsigned int lh[5];
+        if (!engine::findFixtureByPosSid(gw, p.x, p.y, p.z, p.sid,
+                                         (int)p.classType, lh)) {
+            // Not loaded here yet. Record nothing and let the safety resend
+            // retry; consumers meanwhile fall back to the raw hand.
+            if (fr.lastMissMs == 0 || (now - fr.lastMissMs) >= 10000) {
+                fr.lastMissMs = now;
+                char b[208];
+                _snprintf(b, sizeof(b) - 1,
+                          "[fixture] RECV unmatched wire=%u.%u.%u.%u.%u cls=%u "
+                          "pos=%.1f,%.1f sid='%s' seq=%u",
+                          p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
+                          (unsigned)p.classType, p.x, p.z, p.sid, p.seq);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            continue;
+        }
+        memcpy(fr.hand, lh, sizeof(unsigned int) * 5);
+        fr.resolved = true;
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+                  "[fixture] RECV pair wire=%u.%u.%u.%u.%u -> local=%u.%u.%u.%u.%u "
+                  "cls=%u pos=%.1f,%.1f sid='%s' seq=%u",
+                  p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
+                  lh[0], lh[1], lh[2], lh[3], lh[4], (unsigned)p.classType,
+                  p.x, p.z, p.sid, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        unparkForNewFixture();
+    }
+}
+
+// A pose can lose the race with its fixture's pairing: the miner's task arrives
+// on the 20 Hz entity stream, applyTaskOrder cannot resolve the unpaired hand,
+// returns 1 and latches taskBad - which is a PERMANENT park until the task
+// changes. The pairing that would have made it work then lands a moment later
+// and nothing retries it, so the body stays parked for the whole mining job.
+// Clearing the latch here is what closes that window.
+//
+// The sweep is deliberately not narrowed to the bodies using this fixture (a
+// Driven does not record its subject): a pairing is a first-sight event, a few
+// per session, and the cost of over-clearing is one extra apply attempt on the
+// next tick for a body that was going to stay bad anyway.
+void Replicator::unparkForNewFixture() {
+    unsigned int n = 0;
+    for (std::map<Key, Driven>::iterator it = targets_.begin();
+         it != targets_.end(); ++it) {
+        Driven& d = it->second;
+        if (!d.taskBad || d.taskApplied) continue;
+        d.taskBad = false; d.taskRetries = 0;
+        ++n;
+    }
+    if (n) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1,
+                  "[fixture] pairing cleared %u parked pose(s) for retry", n);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+bool Replicator::localHandForFixtureKey(const Key& wire, unsigned int out[5]) const {
+    if (!out) return false;
+    std::map<Key, FixtureRow>::const_iterator it = fixtureMap_.find(wire);
+    if (it == fixtureMap_.end() || !it->second.resolved) return false;
+    memcpy(out, it->second.hand, sizeof(unsigned int) * 5);
+    return true;
+}
+
 // Build-site pose subject translation. A construction site is created at RUNTIME,
 // so unlike every other pose fixture its hand is client-local: a placement logged
 // 0.3409.11111.2.3348877056 on the placer and ...2871948288 on the peer. A streamed
@@ -1593,6 +1750,9 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         { &Replicator::doorSync_,     0,                     &Replicator::publishDoors,      &Replicator::applyDoors,      false },
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
         { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
+        // Ahead of prod deliberately: prod rows resolve THROUGH the fixture map,
+        // so a pairing that arrives this tick is usable by the very next row.
+        { &Replicator::fixtureSync_,  0,                     &Replicator::publishFixtures,   &Replicator::applyFixtures,   false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
         { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
         { &Replicator::deedSync_,     0,                     &Replicator::publishDeeds,      &Replicator::applyDeeds,      false }

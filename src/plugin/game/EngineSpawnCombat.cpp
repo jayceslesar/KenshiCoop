@@ -588,6 +588,39 @@ bool pickCraftWorker(GameWorld* gw, unsigned int workerHand[5], int* outTask) {
     return true;
 }
 
+// Identify the miner to drive for the mine_pose gate: a PLAYER SQUAD member, not
+// the non-squad NPC craft_order pins. Two reasons. A terrain resource node sits
+// out in the wilderness where findWorkerNear reliably finds nobody, and mining is
+// a player job in the first place. Rank 0 is host-owned under the inhabit
+// partition, so the join carries this body as a DRIVEN COPY - which is exactly
+// the path the reproduced pose has to survive, and the one that was broken.
+bool pickMineWorker(GameWorld* gw, unsigned int workerHand[5], int* outTask) {
+    if (!findMineNear(gw)) return false; // no node in range - the save is wrong
+    if (!gw->player) return false;
+    Character* w = 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return false;
+        w = gw->player->playerCharacters[0];
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!w) return false;
+    if (!readObjectHand(static_cast<RootObject*>(w), workerHand)) return false;
+    if (outTask) *outTask = OPERATE_MACHINERY;
+    return true;
+}
+
+// Order the pinned miner to work the node. Guarded exactly like orderCraftWorker:
+// re-issuing goalWorkAt while the body is already operating clears and re-adds the
+// goal every tick, thrashing pathing so the pose never settles.
+bool orderMineWorker(GameWorld* gw, const unsigned int workerHand[5], int task) {
+    Character* w = resolveCharByHand(workerHand[3], workerHand[4], workerHand[0],
+                                     workerHand[1], workerHand[2]);
+    if (!w) return false;
+    if (readCharTaskKey(w) == task) return true; // already mining - don't thrash
+    RootObject* mine = findMineNear(gw);
+    if (!mine) return false;
+    return goalWorkAt(w, mine, task);
+}
+
 // Hold the pinned worker UNTASKED at the prop during a craft_order baseline: clear
 // its faction patrol goal and PARK it at the fixture each tick. An idle world NPC
 // otherwise patrols out of the host's capture range (observed: only a handful of

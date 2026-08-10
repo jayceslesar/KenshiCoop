@@ -2203,6 +2203,39 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
             } else {
                 siteUnresolved = true;
             }
+        } else {
+            // A MINE is a runtime object too, for a different reason: each
+            // client instantiates its own building for a terrain resource node,
+            // so the miner's subject hand means nothing here (applyTaskOrder
+            // returned 1 and latched taskBad - the body parked with no mining
+            // animation, which is the reported bug). Translate through the
+            // protocol-55 pairing when we have one.
+            //
+            // Unlike the build-site branch this NEVER latches "unresolved":
+            // only container/machine fixtures are announced, so a seat or bed
+            // subject is simply absent from the map and must keep going with
+            // its save-stable hand, exactly as before.
+            Key sk; sk.t = out.sType; sk.c = out.sContainer;
+            sk.cs = out.sContainerSerial; sk.i = out.sIndex; sk.s = out.sSerial;
+            unsigned int lh[5];
+            if (localHandForFixtureKey(sk, lh) &&
+                (lh[3] != out.sIndex || lh[4] != out.sSerial)) {
+                xlated = out;
+                xlated.sType = lh[0]; xlated.sContainer = lh[1];
+                xlated.sContainerSerial = lh[2];
+                xlated.sIndex = lh[3]; xlated.sSerial = lh[4];
+                posed = &xlated;
+                if (!d.fixtureXlateLogged) {
+                    d.fixtureXlateLogged = true;
+                    char b[208]; _snprintf(b, sizeof(b) - 1,
+                        "[pose] fixture xlate hand=%u,%u task=%u wire=%u.%u.%u.%u.%u"
+                        " -> local=%u.%u.%u.%u.%u",
+                        out.hIndex, out.hSerial, (unsigned)out.task,
+                        sk.t, sk.c, sk.cs, sk.i, sk.s,
+                        lh[0], lh[1], lh[2], lh[3], lh[4]);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
         }
         if (siteUnresolved) {
             // The PLACE row that mints this site rides a DIFFERENT channel, so a

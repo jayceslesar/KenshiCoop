@@ -31,6 +31,11 @@ tools/build_out.txt
 # Ad-hoc debug scratch scripts and captured screenshots
 tools/_*.ps1
 tools/_*.png
+# One-off UI verification captures (menu/banner screenshots). Same rationale as
+# the scratch PNGs above: megabytes of frames that only mean something during
+# the session that took them.
+tools/banner-check/
+tools/manual-check/
 # Scratch dirs follow the same underscore convention as the scratch scripts
 # (extracted crash dumps, one-off captures).
 tools/_*/

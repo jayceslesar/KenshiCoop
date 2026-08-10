@@ -138,6 +138,10 @@ public:
     // Symmetric (either client may buy); first-sight sent + safety-resent by the
     // caller, so a party that buys nothing is silent after the baseline.
     void queueDeed(const DeedPacket& pkt);
+    // MAIN thread: queue a reliable runtime-fixture identity row (protocol 55).
+    // Symmetric and static (a fixture's position/template never change), so this
+    // is first-sight plus a slow safety resend and idles at zero traffic.
+    void queueFixture(const FixturePacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -300,6 +304,8 @@ private:
     std::vector<ResearchPacket>  outResearch_;
     // Reliable property-deed ownership rows (protocol 54). Guarded by outCs_.
     std::vector<DeedPacket>      outDeed_;
+    // Reliable runtime-fixture identity rows (protocol 55). Guarded by outCs_.
+    std::vector<FixturePacket>   outFixture_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;

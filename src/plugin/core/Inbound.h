@@ -247,6 +247,14 @@ struct InboundDeed {
     DeedPacket pkt;
 };
 
+// One received runtime-fixture identity row (protocol 55): a peer names the
+// hand it uses for a fixture and describes where/what it is, so we can pair it
+// with our own copy. Carries no gameplay state - only identity.
+struct InboundFixture {
+    u32           ownerId;
+    FixturePacket pkt;
+};
+
 // One received stealth detection-map snapshot (protocol 20): the detection
 // AUTHORITY (the host's world, where the sneaker is a driven copy) streams who
 // notices the sneaker; the sneaker's OWNER replays the entries between its
@@ -421,7 +429,7 @@ public:
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
-        research_(worldReset_),   deed_(worldReset_),
+        research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
@@ -592,6 +600,11 @@ public:
         InboundDeed id; id.ownerId = ownerId; id.pkt = pkt;
         EnterCriticalSection(&cs_); deed_.push_back(id); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received fixture identity row (protocol 55), owner-tagged.
+    void pushFixture(u32 ownerId, const FixturePacket& pkt) {
+        InboundFixture ifx; ifx.ownerId = ownerId; ifx.pkt = pkt;
+        EnterCriticalSection(&cs_); fixture_.push_back(ifx); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
     void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
         InboundBuildPlace ibp; ibp.ownerId = ownerId; ibp.pkt = pkt;
@@ -753,6 +766,9 @@ public:
     void drainDeed(std::deque<InboundDeed>& out) {
         EnterCriticalSection(&cs_); out.swap(deed_); LeaveCriticalSection(&cs_);
     }
+    void drainFixture(std::deque<InboundFixture>& out) {
+        EnterCriticalSection(&cs_); out.swap(fixture_); LeaveCriticalSection(&cs_);
+    }
     void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
         EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
     }
@@ -873,6 +889,7 @@ private:
     WorldQ<InboundProd>            prod_;
     WorldQ<InboundResearch>        research_;
     WorldQ<InboundDeed>            deed_;
+    WorldQ<InboundFixture>         fixture_;
     WorldQ<InboundBuildPlace>      buildPlace_;
     WorldQ<InboundBuildState>      buildState_;
     WorldQ<InboundBuildDoor>       buildDoor_;

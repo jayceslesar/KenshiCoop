@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 54;
+const u16 PROTOCOL_VERSION = 55;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -75,7 +75,8 @@ enum PacketType {
     PKT_CELL_CLAIM       = 44,// RELIABLE zone-cell presence claim (protocol 49); CellClaimPacket
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
-    PKT_DEED             = 47 // RELIABLE property-ownership row (protocol 54); DeedPacket
+    PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
+    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1114,6 +1115,66 @@ struct DeedPacket {
     u32 hand[5];
     u8  owned;     // 1 = the player faction owns it, 0 = un-owned/sold
     char ownerSid[48]; // new owning faction's GameData stringID ('' = unknown)
+};
+
+// ---- Protocol 55: runtime-fixture identity ----------------------------------
+// An IDENTITY channel, not a state channel: it carries no gameplay value, only
+// the mapping "the fixture I call H is the one you can find at P with template
+// S". Everything else about machines (protocol 33 buffers, protocol 34 contents,
+// the Stage 5 work pose) keeps its existing wire shape and simply resolves its
+// key through the map this builds.
+//
+// Why it exists (2026-08-09 mine sync). Ore/stone MINES are not save objects.
+// Each client instantiates its own production building for a terrain resource
+// node, so the same physical mine carries a DIFFERENT hand - different index AND
+// different serial - on each side, while its world position is identical to the
+// decimetre (the node is terrain data). Measured on the mine1 save, same moment,
+// same character hand on both clients:
+//
+//   [HOST] [seatres] npc=1,32592774 subj=50,2399902464   subjpos=-51566.5,-2515.7
+//   [JOIN] [seatres] npc=1,32592774 subj=104,1377319296  subjpos=-51566.5,-2515.7
+//
+// Every consumer of that hand therefore failed on the peer: applyTaskOrder
+// returned 1 ("fixture not loaded here") and latched taskBad, so a mining body
+// parked with no animation; applyProd dropped every buffer row silently; the
+// container snapshot reconciled into nothing. Both reported bugs - "the mining
+// animation only appears on the miner's own PC" and "the mine's inventory does
+// not sync" - are that one unresolvable hand.
+//
+// The fix is the protocol-27 precedent (a placed building's runtime hand crosses
+// in the PLACER's key space with a receiver-side translation map), generalized
+// to fixtures nobody placed. The wire key is the SENDER's local hand; the
+// receiver matches position + template to its own copy and remembers the pair.
+//
+// SYMMETRIC: each client announces the fixtures near its own interest centers,
+// because the pose path is bidirectional (either side may drive the other's
+// miner) and protocol 33/34 are host-authored. Static rows - a fixture's
+// position and template never change - so this is first-sight plus a slow
+// safety resend, and a party standing still is silent.
+//
+// SCOPE is deliberately the container/machine classes (STORAGE plus the machine
+// set), i.e. exactly what enumContainersNear already walks. Seats and beds are
+// SAVE-BAKED: their hands match across clients (which is why bed_pose passes),
+// so they need no translation and are not announced. Restricting what is
+// ANNOUNCED - rather than gating consumers by task type - is what keeps the
+// furniture protocols on their existing, validated path: a seat hand is never in
+// the map, so the translation is a no-op for it.
+//
+// A receiver that cannot match the row yet (zone not loaded) simply records
+// nothing; the safety resend retries, and every consumer falls back to the raw
+// hand, which is still correct for a genuinely save-baked machine.
+struct FixturePacket {
+    u8  type;      // = PKT_FIXTURE
+    u32 ownerId;   // network player id of the sender
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    // the SENDER's local hand [type, container, containerSerial, index, serial].
+    // This is the key every other channel quotes for this fixture.
+    u32 hand[5];
+    f32 x, y, z;   // world position - the match key (terrain-anchored, so equal
+                   // on both clients even when the hand is not)
+    char sid[48];  // building template GameData stringID - the match guard, so a
+                   // wrong-but-nearby building can never be paired
+    u8  classType; // BuildingClassType, second match guard
 };
 
 // ---- Protocol 27: placed-building sync --------------------------------------
