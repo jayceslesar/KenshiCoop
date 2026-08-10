@@ -1856,6 +1856,15 @@ void Replicator::applyTargets(GameWorld* gw) {
         bool oracleActive = oracleNear &&
                             (isSquad ? hostMoving
                                      : (haveNewest && vlen > NPC_MOVE_VEL));
+        // Motion-onset edge (audit only, see the onset* declarations). Because
+        // the test above is instantaneous, this fires every time the body
+        // RE-ENTERS the scored population, not just when it first walks - which
+        // is precisely the quantity under test.
+        if (oracleActive && !d.oracleActivePrev) {
+            d.oracleOnsetMs = now;
+            ++onsetReentries_;
+        }
+        d.oracleActivePrev = oracleActive;
         if (oracleActive && haveActual && d.haveActual) {
             float step = dist3(ax, ay, az, d.lx, d.ly, d.lz);
             // Smoothness is only scored at steady sim speed. During the
@@ -1870,6 +1879,24 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (timeSlew_ > 0.99f && timeSlew_ < 1.01f) {
                 ++activeFrames_;
                 ++d.activeF;
+                // Age this frame against the body's onset and bucket it with its
+                // zero/advance outcome, so the audit reports a FRACTION per
+                // bucket rather than a raw count that just follows the run's
+                // population. A body scored before any onset was recorded is
+                // charged to steady, which biases against the hypothesis.
+                {
+                    unsigned long onsetAge =
+                        (d.oracleOnsetMs != 0) ? (now - d.oracleOnsetMs)
+                                               : ONSET_SETTLE_MS;
+                    bool zeroStep = (step < 0.01f);
+                    if (onsetAge < ONSET_EARLY_MS) {
+                        ++onActiveEarly_;  if (zeroStep) ++onZeroEarly_;
+                    } else if (onsetAge < ONSET_SETTLE_MS) {
+                        ++onActiveMid_;    if (zeroStep) ++onZeroMid_;
+                    } else {
+                        ++onActiveSteady_; if (zeroStep) ++onZeroSteady_;
+                    }
+                }
                 if (step < 0.01f) {
                     ++zeroWhileActive_; ++d.zeroF;
                     // Attribute the frame (see the zp* declarations). Ordered

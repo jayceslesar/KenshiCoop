@@ -25,6 +25,9 @@ Replicator::Replicator()
       activeFrames_(0), zeroWhileActive_(0), maxStep_(0.0f), slewSkipFrames_(0),
       zpDown_(0), zpCarried_(0), zpFurn_(0), zpChain_(0), zpCrawl_(0),
       zpSneak_(0), zpSquadIdle_(0), zpAlias_(0), zpStall_(0),
+      onsetReentries_(0),
+      onActiveEarly_(0), onActiveMid_(0), onActiveSteady_(0),
+      onZeroEarly_(0), onZeroMid_(0), onZeroSteady_(0),
       interpLerp_(0), interpSingle_(0), interpClampOld_(0),
       interpExtrap_(0), interpSegSnap_(0),
       hardSnapSquad_(0), hardSnapNpc_(0), hardSnapMid_(0),
@@ -560,6 +563,24 @@ void Replicator::logSmoothSummary() {
               zpCrawl_, zpSneak_, zpSquadIdle_, zpAlias_, zpStall_);
     zp[sizeof(zp) - 1] = '\0';
     coop::logLine(zp);
+
+    // Motion-onset audit (see the onset* declarations): is zeroFrac reporting
+    // stutter, or is it reporting how often the body re-entered scoring? Each
+    // bucket's fraction is what to read - if early runs far above steady, the
+    // metric is charging render catch-up at motion onset, and the low-sample
+    // runs fail because bursty motion pays that toll repeatedly.
+    float eF = (onActiveEarly_  > 0) ? (float)onZeroEarly_  / (float)onActiveEarly_  : 0.0f;
+    float mF = (onActiveMid_    > 0) ? (float)onZeroMid_    / (float)onActiveMid_    : 0.0f;
+    float sF = (onActiveSteady_ > 0) ? (float)onZeroSteady_ / (float)onActiveSteady_ : 0.0f;
+    char on[240];
+    _snprintf(on, sizeof(on) - 1,
+              "SCENARIO ONSET reentries=%lu earlyN=%lu earlyZero=%lu earlyFrac=%.3f "
+              "midN=%lu midZero=%lu midFrac=%.3f steadyN=%lu steadyZero=%lu steadyFrac=%.3f",
+              onsetReentries_, onActiveEarly_, onZeroEarly_, eF,
+              onActiveMid_, onZeroMid_, mF,
+              onActiveSteady_, onZeroSteady_, sF);
+    on[sizeof(on) - 1] = '\0';
+    coop::logLine(on);
 
     // Anim-truth oracle: fraction of translating frames that did NOT report a
     // real walk state. Low == engine is walking the body (Stage 3 goal); high ==

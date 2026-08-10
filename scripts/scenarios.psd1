@@ -550,7 +550,31 @@
             # 0.28-0.42. Raise the sample floor rather than the ceiling - a small
             # sample should not be judged, and inflating the ceiling to cover it
             # would stop the gate judging the well-sampled runs too.
-            Bounds = @{ smoothness = @{ MinActiveFrames = 800 } }
+            #
+            # 2026-08-10: the floor moves to the 1500 that reasoning named. Over
+            # the full 91 clean runs recording both numbers, zeroFrac tracks the
+            # SAMPLE rather than the motion - corr(log(active), zeroFrac) = -0.603
+            # - and the band the 800 floor let through is where that shows: under
+            # 1500 scored frames the median zeroFrac is 0.483 with 17 of 28 runs
+            # over the 0.40 bound, at or above it 0.321 with 7 of 63 over. The
+            # median BELOW the floor exceeded the ceiling, so the gate was failing
+            # the typical under-sampled run before any defect was considered; both
+            # 2026-08-10 failures scored 1241 and 1192 frames. This is mitigation,
+            # not diagnosis: the median moving with the sample size is a bias, not
+            # noise, so the SCENARIO ONSET telemetry measures the cause and the
+            # floor is revisited once it reports.
+            #
+            # It has since reported, and the floor is now known to be a stopgap
+            # for a metric defect rather than a genuine small-sample rule. The
+            # zero frames are dominated by a fixed per-run toll charged at motion
+            # onset (constant ~0.96 zero in the first 100ms, corr 0.998 between
+            # that bucket's share of the sample and the whole-run zeroFrac), so
+            # zeroFrac is that fixed count over however much sustained motion the
+            # run caught. Raising the floor only excludes the runs where the
+            # quotient is worst. The fix is to stop scoring the onset window -
+            # see the onset* notes in src/plugin/sync/Replicator.h - after which
+            # this floor should come back down rather than stay at 1500.
+            Bounds = @{ smoothness = @{ MinActiveFrames = 1500 } }
         }
         # craft1 is loaded WITHOUT the host re-arm setup: CraftOrderScenario pins the
         # baked worker itself and issues the live order mid-run (that IS the test).

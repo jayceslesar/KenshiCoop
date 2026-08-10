@@ -920,6 +920,15 @@ private:
         unsigned long zeroF;
         unsigned long activeF;
         unsigned long advMs;   // last tick this body actually advanced (zeroFrac audit)
+        // Motion-onset attribution (2026-08-10). The oracle's "source moving"
+        // test is the INSTANTANEOUS stream velocity, so a body whose velocity
+        // hovers near NPC_MOVE_VEL enters and leaves the scored population
+        // repeatedly, and every re-entry is a fresh onset the join's render has
+        // not caught up to yet. These two fields edge-detect that so the zero
+        // frames can be bucketed by age-since-onset and the hypothesis tested.
+        // Reported only - nothing here changes what is scored.
+        bool          oracleActivePrev;
+        unsigned long oracleOnsetMs;
         int          prevInterpMode; // last tick's EntityInterp::lastMode(). lastMode is a
                                      //   STICKY classification of the newest sample, not an
                                      //   event: it keeps reading SM_SEG_SNAP for every frame
@@ -952,7 +961,9 @@ private:
                    sneakTick(0), proneTick(0), crawlDrive(false),
                    velPeak(0.0f), moveSeenMs(0), wasMoving(false),
                    restEnterMs(0), walkBranchPrev(false),
-                   zeroF(0), activeF(0), advMs(0), prevInterpMode(-1), midSeenMs(0) {
+                   zeroF(0), activeF(0), advMs(0),
+                   oracleActivePrev(false), oracleOnsetMs(0),
+                   prevInterpMode(-1), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
         }
     };
@@ -1674,6 +1685,45 @@ private:
                                  //   so the per-frame sample aliased. Invisible to a player.
     unsigned long zpStall_;      //   it has not advanced for ZERO_ALIAS_MS or more: a real
                                  //   freeze while the source walks. The defect.
+
+    // Motion-onset audit (2026-08-10). smoothness fails as a function of HOW
+    // MANY frames it was measured on: corr(log(active), zeroFrac) = -0.603 over
+    // 91 npc_sync runs, and the median moves with the sample (0.483 under 1500
+    // scored frames against 0.321 at or above), which is a bias rather than the
+    // wider scatter a small sample alone would give. Suspicion fell on the
+    // oracle's own gate: NPCs are judged on INSTANTANEOUS stream velocity, so a
+    // body near NPC_MOVE_VEL re-enters the scored population over and over and
+    // pays a fresh render catch-up each time. Bucket every scored frame by its
+    // age since the body's oracle-active onset to find out.
+    //
+    // It measured true, and larger than expected. Over 4 npc_sync runs (which
+    // reproduced the historical bias at corr = -0.583):
+    //   - earlyFrac is a CONSTANT 0.954-0.965 while whole-run zeroFrac ranges
+    //     0.282-0.614. The first 100 ms after an onset is a fixed toll, not a
+    //     quality signal - it reads ~0.96 whether the run passes or fails.
+    //   - zeroFrac is then just the MIX: corr(earlyShare, zeroFrac) = 0.998.
+    //   - re-entries stay ~230-300 per run no matter how long the run scored,
+    //     so that toll is a near-fixed COUNT of zero frames divided by however
+    //     much sustained motion the run happened to catch. That quotient is the
+    //     sample-size bias, arithmetically.
+    //   - most onsets are too short to be walking at all: ~3-4 scored frames
+    //     per re-entry, and midN is small enough that only a handful of the
+    //     ~250 episodes per run survive 100 ms. The gate is admitting fidgets
+    //     and turns-in-place, where the join body correctly does not translate.
+    // Excluding the early bucket turns both failures into passes (0.511->0.209,
+    // 0.614->0.284) and preserves the runs' ranking, so the gate keeps its
+    // discrimination. combat_kill is the control: squad bodies are gated on
+    // hostMoving instead, do not flicker (42-58 re-entries, earlyShare 0.007 -
+    // 0.067), and show no inflation - its 0.307 is real.
+    // Emitted as "SCENARIO ONSET". Reported, never gated: this measures the
+    // cause so the eventual fix is chosen on evidence, following ZEROPOP.
+    unsigned long onsetReentries_;  // oracle-active false->true edges, all bodies
+    unsigned long onActiveEarly_;   // scored frames  < ONSET_EARLY_MS since onset
+    unsigned long onActiveMid_;     //   ONSET_EARLY_MS .. ONSET_SETTLE_MS
+    unsigned long onActiveSteady_;  //   ONSET_SETTLE_MS or older: settled motion
+    unsigned long onZeroEarly_;     // of those, the ones that rendered no advance
+    unsigned long onZeroMid_;
+    unsigned long onZeroSteady_;
 
     // Interp/drive telemetry (protocol 36 jumpiness instrumentation): per-sample
     // regime counts from EntityInterp::lastMode() (EXTRAP/CLAMP = the buffer

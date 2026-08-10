@@ -98,6 +98,13 @@ const float LEAD_SECONDS = 0.6f;  // project the walk target this far along sour
 // zero-step frame stops being render/update-cadence aliasing and starts being a
 // freeze. One engine character-update step is well inside this.
 const unsigned long ZERO_ALIAS_MS = 100;
+// Motion-onset audit buckets: how old a scored frame is, measured from the tick
+// the body ENTERED the oracle-active population. Early is one alias window, so a
+// zero frame there is a body the render has not picked up yet rather than one
+// that stopped; settle matches the drive's own NPC_MOVE_HOLD_MS walk debounce,
+// which is the engine's idea of how long a walk takes to be believed.
+const unsigned long ONSET_EARLY_MS  = 100;
+const unsigned long ONSET_SETTLE_MS = 300;
 const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "walking"
                                   // (vs a fidget/turn in place -> treat as at rest)
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose

@@ -33,10 +33,44 @@ function Test-Smoothness {
     $maxStep  = [double]$line.Matches[0].Groups[3].Value
     $slewSkip = 0
     if ($line.Line -match "slewSkip=(\d+)") { $slewSkip = [int]$Matches[1] }
+    # Motion-onset audit (SCENARIO ONSET). Reported, never gated, like ZEROPOP.
+    # It asked why zeroFrac tracks the SAMPLE SIZE rather than the motion
+    # (corr(log(active), zeroFrac) = -0.603 over 91 npc_sync runs), and the
+    # answer is the oracle's own admission test: a body is scored on its
+    # INSTANTANEOUS velocity, so one hovering near the threshold re-enters over
+    # and over and is charged a fresh render catch-up each time. Measured on 4
+    # npc_sync runs, onsetEarlyFrac is a constant 0.954-0.965 while whole-run
+    # zeroFrac ranges 0.282-0.614, and corr(onsetEarlyShare, zeroFrac) = 0.998:
+    # the verdict is set by how much of the sample sat in that first 100 ms, not
+    # by how well the run rendered. Read onsetSteadyFrac for the motion quality
+    # (0.048-0.247 on the same runs, all well inside the bound). Parsed BEFORE
+    # the sample-floor check on purpose: the under-sampled runs now SKIP, and
+    # they are the ones whose onset behaviour the question is about.
+    $onset = @{}
+    $on = Select-String -Path $File -ErrorAction SilentlyContinue -Pattern ("SCENARIO ONSET reentries=(\d+) " +
+          "earlyN=(\d+) earlyZero=(\d+) earlyFrac=([\d\.]+) " +
+          "midN=(\d+) midZero=(\d+) midFrac=([\d\.]+) " +
+          "steadyN=(\d+) steadyZero=(\d+) steadyFrac=([\d\.]+)") | Select-Object -Last 1
+    if ($null -ne $on) {
+        $g = $on.Matches[0].Groups
+        $onset.onsetReentries  = [int]$g[1].Value
+        $onset.onsetEarlyN     = [int]$g[2].Value
+        $onset.onsetEarlyFrac  = [double]$g[4].Value
+        $onset.onsetMidN       = [int]$g[5].Value
+        $onset.onsetMidFrac    = [double]$g[7].Value
+        $onset.onsetSteadyN    = [int]$g[8].Value
+        $onset.onsetSteadyFrac = [double]$g[10].Value
+        Write-Host ("  [$Label] onset audit - reentries=$($onset.onsetReentries), " +
+                    "early $($onset.onsetEarlyFrac) (n=$($onset.onsetEarlyN)), " +
+                    "mid $($onset.onsetMidFrac) (n=$($onset.onsetMidN)), " +
+                    "steady $($onset.onsetSteadyFrac) (n=$($onset.onsetSteadyN)) [reported, not gated]")
+    }
     if ($active -lt $MinActiveFrames) {
         Write-Host "  [$Label] smoothness SKIP - active=$active (< $MinActiveFrames scored frames; slewSkip=$slewSkip fell in the clock-slew window)"
+        $sm = @{ active = $active; slewSkip = $slewSkip }
+        foreach ($k in $onset.Keys) { $sm[$k] = $onset[$k] }
         return (Add-GateResult -Name "smoothness" -Status SKIP `
-                    -Metrics @{ active = $active; slewSkip = $slewSkip } `
+                    -Metrics $sm `
                     -Detail "only $active scored frames (slewSkip=$slewSkip)")
     }
     # Population audit (SCENARIO ZEROPOP). Reported, never gated - it exists to say
@@ -58,6 +92,7 @@ function Test-Smoothness {
         $m.zeroStall = $stall
         $m.stallFrac = if ($active -gt 0) { [Math]::Round($stall / $active, 3) } else { 0 }
     }
+    foreach ($k in $onset.Keys) { $m[$k] = $onset[$k] }
     $ok = ($zeroFrac -le $MaxZeroFrac)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  [$Label] smoothness $v - zeroFrac=$zeroFrac (<= $MaxZeroFrac), stallFrac=$($m.stallFrac), maxStep=$maxStep, active=$active, slewSkip=$slewSkip"
