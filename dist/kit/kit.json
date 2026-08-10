@@ -1,7 +1,0 @@
-{
-    "role":  "host",
-    "save":  "squad1",
-    "scenario":  "free",
-    "port":  27800,
-    "transport":  "steam"
-}

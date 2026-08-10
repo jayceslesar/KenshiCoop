@@ -1,13 +1,17 @@
 // MultiplayerStartGen - generates dist/mods/KenshiCoop/KenshiCoop.mod, the FCS data
 // half of the KenshiCoop mod. It carries TWO co-op game starts:
 //
-//   "Multiplayer (Wanderer x2)"  vanilla Wanderer start, two wanderers, one squad each.
-//   "Wanderer+ x2"               the same shape with money = 500000. The KenshiCoop
-//                                plugin recognises this start by its squad-2 leader
-//                                template and floors every stat on the player squad
-//                                at 50 (FCS cannot express per-skill values; a
-//                                Character record only carries the grouped
-//                                "combat stats"/"ranged stats"/... fields).
+//   "Multiplayer (Wanderer x2)"   vanilla Wanderer start, two wanderers, one squad each.
+//   "Multiplayer+ (Wanderer x2)"  the same shape with money = 500000. The KenshiCoop
+//                                 plugin recognises this start by its squad-2 leader
+//                                 template and floors every stat on the player squad
+//                                 at 50 (FCS cannot express per-skill values; a
+//                                 Character record only carries the grouped
+//                                 "combat stats"/"ranged stats"/... fields).
+//
+// The two names are a matched pair on purpose: same start, with and without the
+// boost. The "+" variant shipped as "Wanderer+ x2" in v0.50 and was renamed for
+// v0.51 - a DISPLAY name only, so no save is affected (see STRING IDs below).
 //
 // DESIGN RULE (inherited from the original start by zeroit789, PR #15): stay
 // vanilla-equivalent. Squad 1 always reuses the untouched vanilla Wanderer
@@ -45,9 +49,10 @@ const string VanillaSquadId = "45550-gamedata.base";   // SquadTemplate "startof
 const string VanillaCharId = "1533662-rebirth.mod";    // Character "Wanderer"
 const string HubTownId = "18919-Newwworld.mod";        // Town "The Hub" (vanilla Wanderer spawn)
 
-// Money for the "Wanderer+ x2" start. Kenshi has ONE player faction wallet and
-// KenshiCoop replicates it as a single shared pool, so this is 500k for the pair.
-const int WandererPlusMoney = 500000;
+// Money for the "Multiplayer+ (Wanderer x2)" start. Kenshi has ONE player faction
+// wallet and KenshiCoop replicates it as a single shared pool, so this is 500k for
+// the pair.
+const int PlusStartMoney = 500000;
 
 string Sid(int id) => $"{id}-{RecordNamespace}.mod";
 
@@ -160,19 +165,19 @@ var wandererStart = MakeStart(3, "Multiplayer (Wanderer x2)",
     "starts in their own squad, so the host controls squad 1 and the joining player controls squad 2.",
     squad2Id: 2, money: Convert.ToInt32(startValues["money"]));
 
-// 4-6: the "Wanderer+ x2" start. Record 4 is a SEPARATE Character from record 1 even
-// though both spawn a PC called "Wanderer 2" - the StringId is what tells the two
-// starts apart, and record 4's is the MARKER the plugin matches on to apply the stat
-// floor. Keep it in sync with WPX2_MARKER_SID in src/plugin/Plugin.cpp.
+// 4-6: the "Multiplayer+ (Wanderer x2)" start. Record 4 is a SEPARATE Character from
+// record 1 even though both spawn a PC called "Wanderer 2" - the StringId is what tells
+// the two starts apart, and record 4's is the MARKER the plugin matches on to apply the
+// stat floor. Keep it in sync with WPX2_MARKER_SID in src/plugin/Plugin.cpp.
 var plusWanderer = CloneWanderer(4, "Wanderer 2");
-var plusSquad2 = CloneSquad(5, "startoff- Wanderer+ squad 2 (co-op)", 4);
-var plusStart = MakeStart(6, "Wanderer+ x2",
+var plusSquad2 = CloneSquad(5, "startoff- Multiplayer+ squad 2 (co-op)", 4);
+var plusStart = MakeStart(6, "Multiplayer+ (Wanderer x2)",
     "Two seasoned wanderers setting out together with a small fortune behind them.  The same start " +
     "as Multiplayer (Wanderer x2) - each wanderer in their own squad, so the host controls squad 1 " +
     "and the joining player controls squad 2 - but without the early grind.  The 500,000 cats are " +
     "the shared faction wallet both players spend from, and the KenshiCoop plugin raises every stat " +
     "on both characters to 50 on the first tick of a new game.",
-    squad2Id: 5, money: WandererPlusMoney);
+    squad2Id: 5, money: PlusStartMoney);
 
 Item[] items = [wanderer2, wandererSquad2, wandererStart, plusWanderer, plusSquad2, plusStart];
 
@@ -180,9 +185,9 @@ Item[] items = [wanderer2, wandererSquad2, wandererStart, plusWanderer, plusSqua
 var header = new Header(1, "",
     "The data half of KenshiCoop: two co-op game starts. \"Multiplayer (Wanderer x2)\" is the " +
     "vanilla Wanderer start with two wanderers, each already in their own squad, so the host plays " +
-    "squad 1 and the joining player takes squad 2. \"Wanderer+ x2\" is the same start with 500,000 " +
-    "cats in the shared wallet and both characters levelled to 50 in every stat by the plugin. " +
-    "Data-only mod; requires the KenshiCoop plugin for co-op.")
+    "squad 1 and the joining player takes squad 2. \"Multiplayer+ (Wanderer x2)\" is the same start " +
+    "with 500,000 cats in the shared wallet and both characters levelled to 50 in every stat by the " +
+    "plugin. Data-only mod; requires the KenshiCoop plugin for co-op.")
 {
     Dependencies = ["gamedata.base", "Newwworld.mod", "rebirth.mod", "Dialogue.mod"],
 };
@@ -258,7 +263,7 @@ foreach (var (sid, leaderSid) in new[] { (Sid(2), Sid(1)), (Sid(5), Sid(4)) })
 foreach (var (sid, squad2Sid, money) in new[]
          {
              (Sid(3), Sid(2), Convert.ToInt32(startValues["money"])),
-             (Sid(6), Sid(5), WandererPlusMoney),
+             (Sid(6), Sid(5), PlusStartMoney),
          })
 {
     var st = verify.Items.FirstOrDefault(i => i.StringId == sid);
@@ -288,7 +293,7 @@ if (errors.Count > 0)
     return 1;
 }
 Console.WriteLine($"VERIFICATION OK: {items.Length} records, both starts wired to two squads, " +
-                  $"legacy StringIds intact, \"Wanderer+ x2\" money = {WandererPlusMoney}.");
+                  $"legacy StringIds intact, \"Multiplayer+ (Wanderer x2)\" money = {PlusStartMoney}.");
 return 0;
 
 // ---- Helpers -----------------------------------------------------------------

@@ -51,7 +51,7 @@ if errorlevel 1 (
 echo Copied RE_Kenshi.json
 
 REM KenshiCoop.mod is a real FCS data mod now: it carries the "Multiplayer
-REM (Wanderer x2)" and "Wanderer+ x2" co-op game starts (regenerate with
+REM (Wanderer x2)" and "Multiplayer+ (Wanderer x2)" co-op starts (regenerate with
 REM tools\MultiplayerStartGen). The repo owns it, so always overwrite the
 REM install's copy with the repo's (a stale placeholder would hide the starts).
 if not exist "%MOD%" (

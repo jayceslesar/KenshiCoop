@@ -176,7 +176,7 @@ DWORD           g_scenarioDoneTick = 0; // !=0 once RESULT logged; begins captur
 const DWORD     SCENARIO_HOLD_MS  = 4000; // hold synced state on screen for capture
 #endif
 
-// "Wanderer+ x2" game start (dist/mods/KenshiCoop/KenshiCoop.mod). The FCS record
+// "Multiplayer+ (Wanderer x2)" start (dist/mods/KenshiCoop/KenshiCoop.mod). The FCS record
 // sets the 500k shared wallet, but a Kenshi Character record only carries the
 // GROUPED stat fields ("combat stats", "ranged stats", "stealth stats", "strength",
 // "unarmed stats") and randomises them - there is no way to say "50 in everything"
@@ -1533,7 +1533,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             coopLog("[speed] intent hooks installed (setGameSpeed/userPause/togglePause)");
         else
             coopLog("[speed] FAILED to install intent hooks (vote capture degraded)");
-        // "Wanderer+ x2" start: give both wanderers the stat line the start
+        // "Multiplayer+ (Wanderer x2)" start: give both wanderers the stat line the start
         // promises. Raise-only, so it is a FLOOR at 50 - it re-runs on every load
         // of such a world and is a no-op once the characters have trained past it.
         //
@@ -1547,7 +1547,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             unsigned int nb = coop::engine::buffAllPlayerStats(gw, WPX2_STAT_LEVEL);
             char b[128];
             _snprintf(b, sizeof(b) - 1,
-                      "[start] Wanderer+ x2: raised %u PC(s) to %d in every stat",
+                      "[start] Multiplayer+ (Wanderer x2): raised %u PC(s) to %d in every stat",
                       nb, (int)WPX2_STAT_LEVEL);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
         }

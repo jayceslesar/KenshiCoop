@@ -114,7 +114,7 @@ is needed after an edit.
   joining player squad 2 with no manual tab-splitting:
   - **"Multiplayer (Wanderer x2)"** - the plain version, vanilla in every other
     way. Authored by [zeroit789](https://github.com/zeroit789).
-  - **"Wanderer+ x2"** - the same start with **500,000 cats** and both
+  - **"Multiplayer+ (Wanderer x2)"** - the same start with **500,000 cats** and both
     characters at **50 in every stat**, for skipping the early grind. Kenshi has
     a single player wallet and co-op shares it, so the 500,000 is the pair's
     combined purse, not 500,000 each. The stats are a floor applied when the
