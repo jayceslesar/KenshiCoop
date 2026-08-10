@@ -678,7 +678,9 @@ public:
 
     // JOIN: drain received censuses into the latest-wins existence set
     // (censusHands_) consumed by enforceHostAuthority's wide-radius pass.
-    void applyNpcCensus(Inbound& in);
+    // gw is for the per-row ownership check (see the definition): a census row
+    // only speaks for a cell the SENDER owns, judged against OUR map.
+    void applyNpcCensus(GameWorld* gw, Inbound& in);
 
     // Camera hint channel (protocol 43, camera-anchored interest). SYMMETRIC:
     // each side reads its local camera center (engine::cameraCenter), publishes
@@ -1067,6 +1069,32 @@ private:
     // sent it. Defaults to the host, which is who it always was.
     u32                       censusOwner_;
     unsigned long             censusCulls_;   // join: wide-radius suppress count
+    // Rows dropped because OUR map does not put the sender's cell in the
+    // sender's hands. A steady nonzero here is the two maps disagreeing, which
+    // is the condition the 2026-08-08 dual drive needed.
+    unsigned long             censusOffCell_;
+    // Echo yields: world NPCs the join could have authored but left to the host
+    // because the host was already streaming that hand. See the echo guard in
+    // publishOwned. Non-zero means the join stopped feeding a body's own state
+    // back to the client that owns it.
+    unsigned long             cellYields_;
+    std::set<Key>             cellYieldLogged_;   // one [cell] yield line per hand
+    // Our own owner id, latched by publishOwned (which is handed it every frame
+    // and runs before applyTargets in the tick). The drive path needs to know
+    // whether it is the host to apply the host half of the tie-break, and has no
+    // NetLink of its own to ask. 0xFFFFFFFF until the first publish, which keeps
+    // the guard inert rather than letting a join mistake itself for the host.
+    u32                       localId_;
+    // Peer samples the host declined because the body stands in a cell the host
+    // authors - the host half of the tie-break. Pairs with cellYields_, which
+    // counts the join half.
+    unsigned long             hostDriveRefusals_;
+    // How long a peer sample keeps a hand "theirs" for the echo guard. Two net
+    // ticks (50 ms each) plus slack: long enough that a single dropped snapshot
+    // does not hand the body back and forth, short enough that a real handover
+    // - the peer walking out of the cell and falling silent - completes within
+    // a beat instead of leaving the body unwritten.
+    enum { PEER_STREAM_FRESH_MS = 1000 };
     // Phase 0.5 census diagnostics (2026-08-02 field report: "join sees local
     // NPCs the host does not, worsening over long travel"). Four mechanisms in
     // this file can produce that symptom and the logs could not tell them
@@ -1179,6 +1207,15 @@ private:
     // independently on each side. A discrete label has no such window, and a
     // published claim needs a small enumerable token to key a map on anyway.
     bool cellAuth_;   // off => authorityFor is always the host (fail-open)
+    // Co-location collapse: while the squads stand together, hand every cell to
+    // the host. See claimsCoLocated() for why the split stops paying when both
+    // clients already have the same bodies loaded.
+    bool cellCollapse_;
+    // The resolved verdict, recomputed by rebuildClaimedCells whenever a claim
+    // moves. Stored rather than derived per query because authorityFor is on the
+    // hot path and, more importantly, because every reader must see the SAME
+    // verdict within a tick.
+    bool collapsed_;
     struct CellClaim {
         int          cx, cz;
         u32          seq;
@@ -1202,6 +1239,20 @@ private:
     // client present is still the better author of a region neither is standing
     // in, so a vacated cell keeps its owner until somebody else claims it.
     // Fail-open to host survives for cells nobody has ever been to.
+    //
+    // This is LOCAL HISTORY, which is a real hazard for a value both sides must
+    // agree on: our own claim lands in claimSlots_ the instant we send it while
+    // the peer's arrives a round trip later, so a tab that enters a cell and
+    // leaves inside that window leaves the two maps permanently disagreeing.
+    // Replacing it with a neighbourhood radius over the live claim map was tried
+    // on 2026-08-08 (run 134911) and is much worse: derived ownership reaches
+    // every cell near a claim, so the host went from authoring 9 unclaimed rows
+    // a tick to 37, the join went to zero, and the boundary between the two
+    // territories then MOVED with every claim - dual_drive went from 0 shared
+    // hands to 14, with one body held by both sides for 51 s. A stale entry is
+    // one cell wrong; a moving midline is wrong across the whole neighbourhood
+    // every time either squad steps. Keep the history and make the receiver
+    // tolerant of it instead (see applyNpcCensus).
     std::map<std::pair<int, int>, u32> cellLastOwner_;
     // Publisher-side dwell: a tab must read the same NEW cell this many
     // consecutive samples before we claim it, so a body walking the boundary
@@ -2256,6 +2307,7 @@ public:
     // feature is armed.
     void syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId);
     void setCellAuth(bool on) { cellAuth_ = on; }
+    void setCellCollapse(bool on) { cellCollapse_ = on; }
     // Defeat the 1x-during-combat leg of speed arbitration. See Config::
     // speedCombatCap: run_apart's subject is distance, and the cap turned its
     // crossing of bandit country into a five-fold slower run for no benefit,
@@ -2266,14 +2318,56 @@ public:
     // Never returns "nobody" - an unowned region is the case this exists to
     // eliminate.
     u32 authorityFor(GameWorld* gw, float x, float z) const;
+    // authorityFor with its reasoning exposed (KENSHICOOP_DEBUG_CENSUS): a
+    // client publishing rows for cells it does not stand in is either
+    // exercising the deliberate vacated-cell rule or misattributing, and the
+    // verdict alone cannot tell those apart. Same answer as authorityFor, which
+    // is a thin wrapper over it, plus the cell and one of AUTHSRC_*.
+    enum {
+        AUTHSRC_NOMAP  = 0,   // no cell mapping - fail-open to host
+        AUTHSRC_CLAIM  = 1,   // a tab is standing there now
+        AUTHSRC_VACATE = 2,   // cellLastOwner_: claimed once, since left
+        AUTHSRC_OPEN   = 3,   // never claimed by anyone - fail-open to host
+        AUTHSRC_COLLAPSE = 4, // squads share a cell - the host authors everything
+        AUTHSRC_N      = 5
+    };
+    u32 authoritySrc(GameWorld* gw, float x, float z,
+                     int* cx, int* cz, int* src) const;
     // Do WE author it? localId comes from the caller because the Replicator has
     // no NetLink handle of its own.
     bool weAuthor(GameWorld* gw, u32 localId, float x, float z) const {
         return authorityFor(gw, x, z) == localId;
     }
+    // Is the PEER currently writing this hand to us? A fresh entry in targets_
+    // is the strongest available statement that they consider the body theirs -
+    // stronger than a census row, because it is the 20 Hz channel that actually
+    // drives the body rather than the 1 Hz one that merely lists it.
+    bool peerStreamFresh(const Key& k, unsigned long now) const {
+        std::map<Key, Driven>::const_iterator it = targets_.find(k);
+        if (it == targets_.end() || it->second.lastSeenMs == 0) return false;
+        return (now - it->second.lastSeenMs) <= (unsigned long)PEER_STREAM_FRESH_MS;
+    }
 private:
     // Recompute claimedCells_ from claimSlots_. Host wins a contested cell.
     void rebuildClaimedCells();
+    // Are the squads standing together? True when the host holds at least one
+    // claim, the peer holds at least one, and every peer claim names a cell
+    // some host claim also names.
+    //
+    // Reads claimSlots_ rather than claimedCells_ on purpose: the latter has
+    // already resolved a shared cell to the host, which would erase the very
+    // fact being measured. Slots are one per tab, so the nested scan is over a
+    // handful of entries.
+    //
+    // PURE FUNCTION of claimSlots_, and it has to stay one. Both clients
+    // converge on the same slot set, so both derive the same verdict and the
+    // same map - the property that already makes host-wins-ties safe. That is
+    // also why there is no hysteresis: a remembered "currently collapsed" bit
+    // is path-dependent, and two clients reaching one slot set by different
+    // routes would disagree about authorship indefinitely. Flapping is damped
+    // upstream instead, by the CELL_DWELL_N sample dwell a claim must clear
+    // before it moves at all.
+    bool claimsCoLocated() const;
     // Should enforcement leave this body alone? True when we author its cell,
     // or when its author has sent us no census to judge against. Restores the
     // body first if a previous author's verdict had it hidden. Always false

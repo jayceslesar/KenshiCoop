@@ -233,6 +233,47 @@ void Replicator::applyTargets(GameWorld* gw) {
                 tb[sizeof(tb) - 1] = '\0'; coop::logLine(tb);
             }
         }
+        // The host half of the tie-break. The publish-side echo guards make the
+        // JOIN stop speaking for bodies the host owns; this stops the host
+        // LISTENING about bodies it owns. Without both halves the host still
+        // drove its own authored body from whatever the join had said about it
+        // while continuing to publish it, so the join followed the host, the
+        // host followed the join, and the same NPC wore a green DRV label on
+        // both screens (observed 2026-08-08, run 215534: one Holy Sentinel over
+        // two consecutive dumps).
+        //
+        // Asymmetric on purpose, and this is the whole reason it is safe. The
+        // symmetric version of this check - both sides refusing streams for
+        // cells they claim - was tried earlier the same day and reverted: a body
+        // straddling a boundary sits in "our" cell on BOTH clients at once, so
+        // both refused, both fell back to local AI, and the copies drifted apart
+        // with nothing left to pull them together (world-NPC position parity
+        // 0.751 -> 0.389, combat 0.51 -> 0.069). With only the host refusing,
+        // the join always has someone to follow, so a contested body converges
+        // on the host's copy instead of diverging.
+        //
+        // Judged on where OUR copy stands, not on the streamed position: the
+        // sample is interpolated and can extrapolate across a boundary, and the
+        // question being asked is about the body we are about to move.
+        // Proxies are exempt: a minted body exists only because the peer streams
+        // it and has no local AI to fall back on, so refusing to drive one just
+        // strands it wherever it was minted.
+        //
+        // d.fresh is deliberately left ALONE. enforceHostAuthority builds its
+        // 'keep' set from it, and keep is what stops a body being suppressed -
+        // so clearing it here would have the host hide the very bodies it
+        // authors and is simulating (run 220905: 'Holy Sentinel' missing from
+        // 52 of the join's samples). Not driving a body and not knowing about it
+        // are different statements; only the first one is meant here.
+        if (cellAuth_ && localId_ == (u32)CELL_OWNER_HOST && !viaProxy &&
+            !engine::isLocalPlayerChar(gw, c)) {
+            float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+            if (engine::readPos(c, &hx, &hy, &hz) &&
+                weAuthor(gw, localId_, hx, hz)) {
+                ++hostDriveRefusals_;
+                continue;
+            }
+        }
         drivenChars_.insert(c);
         drivenSeen_[c] = now; // recently-driven grace for the authority passes
         canonicalOf_[c] = it->first; // capture translation (combat subjects)

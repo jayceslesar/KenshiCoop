@@ -186,7 +186,9 @@ Check "every manifest bound names a real oracle + parameter" ($badBounds.Count -
 
 # The spec must not drift from the oracles themselves: every declared parameter
 # has to exist on the function the dispatch actually calls.
-$boundFn = @{ smoothness = "Test-Smoothness"; march = "Test-MarchInPlace" }
+$boundFn = @{ smoothness = "Test-Smoothness"; march = "Test-MarchInPlace"
+              dual_drive = "Test-DualDrive"; lockpick_escape = "Test-LockpickEscape"
+              pc_dupes = "Test-PcDuplicates" }
 $specDrift = @()
 foreach ($id in $spec.Keys) {
     if (-not $boundFn.ContainsKey($id)) { $specDrift += "no function mapped for spec id '$id'"; continue }

@@ -273,12 +273,16 @@ bool readFurniture(Character* c, FurnitureRead* out) {
 bool readShackle(Character* c, ShackleRead* out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
+    out->lockpickChance = -1.0f;   // not measured (see ShackleRead)
     if (!c) return false;
     __try {
         out->chained = c->isChained;
         LockedArmour* sh = g_getShacklesFn ? g_getShacklesFn(c) : 0;
         out->hasShackleItem = (sh != 0);
         out->lockPresent    = (sh != 0 && sh->lock != 0);
+        if (out->lockPresent && g_getLockpickChanceFn) {
+            out->lockpickChance = g_getLockpickChanceFn(c, sh->lock);
+        }
         const hand& o = c->slaveOwner;
         out->owner[0] = (unsigned int)o.type;
         out->owner[1] = o.container;
@@ -317,26 +321,46 @@ void shackleDbgTick(GameWorld* gw, bool isHost) {
     if (lastMs != 0 && (now - lastMs) < 1000) return;
     lastMs = now;
 
-    // Prisoners/slaves are world NPCs (never the local player squad), so the
-    // census walk enumerates them with a live Character* + hand. Log only the
-    // bodies that matter (chained or carrying a shackle item) to keep the
-    // manual-session trace readable.
     static const unsigned int MAXN = 64;
     Character* chars[MAXN];
     EntityState st[MAXN];
-    unsigned int n = listNpcs(gw, chars, st, MAXN);
-    for (unsigned int i = 0; i < n; ++i) {
-        ShackleRead sr;
-        if (!readShackle(chars[i], &sr) || !sr.valid) continue;
-        if (!sr.chained && !sr.hasShackleItem) continue;
-        char b[192];
-        _snprintf(b, sizeof(b) - 1,
-                  "[shackledbg] host=%d hand=%u,%u chained=%d shackleItem=%d "
-                  "lock=%d owner=%u,%u",
-                  isHost ? 1 : 0, st[i].hIndex, st[i].hSerial,
-                  sr.chained ? 1 : 0, sr.hasShackleItem ? 1 : 0,
-                  sr.lockPresent ? 1 : 0, sr.owner[3], sr.owner[4]);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    // TWO populations, because "prisoner" is a role, not an allegiance. The
+    // world-NPC walk finds the caged strangers this trace was written for
+    // (camp/jailed), but on a prisoner START the caged bodies are the PLAYER's
+    // own squad - rebirth1 opens with both PCs in a Rebirth cage - and
+    // listNpcs excludes the local squad by construction, so on exactly the
+    // save the lockpick-escape work needs, the old trace saw nothing at all.
+    for (int pass = 0; pass < 2; ++pass) {
+        unsigned int n = 0;
+        if (pass == 0) {
+            n = listNpcs(gw, chars, st, MAXN);
+        } else {
+            n = captureSquad(gw, /*leaderOnly*/ false, st, MAXN);
+            // captureSquad reports transforms, not bodies; resolve each hand
+            // back to the Character* the shackle reads need.
+            for (unsigned int i = 0; i < n; ++i) chars[i] = resolve(st[i]);
+        }
+        for (unsigned int i = 0; i < n; ++i) {
+            ShackleRead sr;
+            if (!chars[i]) continue;
+            if (!readShackle(chars[i], &sr) || !sr.valid) continue;
+            int slave = readSlaveState(chars[i]);
+            // A squad prisoner can be mid-escape with the shackle already off,
+            // which is the transition this whole scenario is about - so on the
+            // squad pass, slave state alone is enough to stay interesting.
+            if (!sr.chained && !sr.hasShackleItem && !(pass == 1 && slave > 0))
+                continue;
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                      "[shackledbg] host=%d who=%s hand=%u,%u chained=%d "
+                      "shackleItem=%d lock=%d pick=%.3f slave=%d owner=%u,%u",
+                      isHost ? 1 : 0, (pass == 0) ? "npc" : "squad",
+                      st[i].hIndex, st[i].hSerial,
+                      sr.chained ? 1 : 0, sr.hasShackleItem ? 1 : 0,
+                      sr.lockPresent ? 1 : 0, sr.lockpickChance,
+                      slave, sr.owner[3], sr.owner[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
     }
 }
 

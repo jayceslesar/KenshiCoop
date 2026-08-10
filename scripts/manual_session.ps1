@@ -115,14 +115,29 @@ param(
     # in the host census. Makes pops and ghosts self-explaining on screen
     # (pair with -Save zoom for long-run wide-camera inspection).
     [switch]$DebugMarkers,
-    # Presence authority (KENSHICOOP_CELL_AUTH=1 on both clients, protocol 49):
-    # each side claims the 4608 u zone cells its own squad tabs are standing in
-    # and AUTHORS the NPC census there, instead of the host authoring everywhere.
-    # Split the pair across two towns and the join keeps its own population
-    # instead of having it culled and re-minted from the host's stream. OFF by
-    # default (fail-open to host authority); this is the switch that arms it.
-    # Pair with -DebugMarkers to see the handover on screen.
-    [switch]$CellAuth,
+    # Presence authority (KENSHICOOP_CELL_AUTH, protocol 49): each side claims
+    # the 4608 u zone cells its own squad tabs are standing in and AUTHORS the
+    # NPC census there, instead of the host authoring everywhere. Split the pair
+    # across two towns and the join keeps its own population instead of having
+    # it culled and re-minted from the host's stream.
+    #
+    # ON by default since v0.47 (see Config.cpp), so a plain manual session
+    # already runs with it - the switch to reach for here is -NoCellAuth, which
+    # pins it OFF for an A/B against unconditional host authority. Note the
+    # scenario tier does NOT inherit the default: Set-CoopDiagEnv pins it to 0
+    # for every scenario that does not ask for it in its manifest DiagEnv.
+    # Pair either way with -DebugMarkers to see the handover on screen.
+    [switch]$NoCellAuth,
+    # Co-location collapse (KENSHICOOP_CELL_COLLAPSE): while both squads claim the
+    # SAME 4608 u cell, every claimed cell resolves to the host, so standing
+    # together behaves as unconditional host authority did and only the join
+    # drives. ON by default; -NoCollapse pins it off for the A/B. Ignored when
+    # -NoCellAuth is given, since the host already owns everything there.
+    #
+    # With -DebugMarkers this is directly visible: collapsed, green DRV tags
+    # appear on the join only; walk a tab into the next cell and the host starts
+    # showing them too as the split resumes.
+    [switch]$NoCollapse,
     # Record where you walk (KENSHICOOP_TRACK_MOVE=1): one [track] line per squad
     # tab per second, with position, cell and whether it is moving. Log-only.
     # Use it to capture a route for a scenario to follow: the cell claims a session
@@ -345,8 +360,15 @@ function Set-CoopEnv {
     $env:KENSHICOOP_DEBUG_MARKERS = if ($DebugMarkers) { "1" } else { "" }
     # Presence authority MUST match on both clients: each side publishes claims and
     # reads the peer's, so one side alone would author its cells while the other
-    # went on enforcing host authority over the same bodies.
-    $env:KENSHICOOP_CELL_AUTH    = if ($CellAuth) { "1" } else { "" }
+    # went on enforcing host authority over the same bodies. Pinned explicitly in
+    # BOTH directions rather than left unset, so the session does not silently
+    # change meaning if the plugin-side default moves again.
+    $env:KENSHICOOP_CELL_AUTH    = if ($NoCellAuth) { "0" } else { "1" }
+    # Same reasoning as the line above: the collapse verdict has to be computed
+    # identically on both sides or the two would disagree about who authors a
+    # shared cell, so pin it explicitly rather than relying on the plugin default
+    # being the same in both installs.
+    $env:KENSHICOOP_CELL_COLLAPSE = if ($NoCollapse) { "0" } else { "1" }
     # Track on BOTH: each client can only see its own tabs' true positions, and
     # the interesting comparison is what the two logs say about the same walk.
     $env:KENSHICOOP_TRACK_MOVE   = if ($TrackMove) { "1" } else { "" }

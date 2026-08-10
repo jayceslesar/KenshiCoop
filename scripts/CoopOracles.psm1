@@ -101,6 +101,9 @@ function Get-OracleBoundSpec {
     return @{
         smoothness = @("MaxZeroFrac", "MinActiveFrames")
         march      = @("MaxIdleFrac", "MaxMarchFrac")
+        dual_drive = @("MinOverlapMs", "MaxHands", "MinSamples")
+        lockpick_escape = @("BudgetS", "MinMove")
+        pc_dupes   = @("DupRadius", "ExpectPcs", "MinSamples", "StackFracMax")
     }
 }
 
@@ -197,6 +200,8 @@ function Invoke-OneOracle {
         "speed_probe"   { return (Test-SpeedProbe      -HostFile $HostLog) }
         "shackle_probe" { return (Test-ShackleProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "shackle_sync"  { return (Test-ShackleSync     -HostFile $HostLog -JoinFile $JoinLog) }
+        "lockpick_escape" { return (Test-LockpickEscape -HostFile $HostLog -JoinFile $JoinLog @Bounds) }
+        "pc_dupes"        { return (Test-PcDuplicates -HostFile $HostLog -JoinFile $JoinLog @Bounds) }
         "combat_crowd"  { return (Test-CombatCrowd     -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "combat_battle" { return (Test-CombatBattle    -HostFile $HostLog -JoinFile $JoinLog) }
         "combat_win"    { return (Test-CombatWin       -HostFile $HostLog -JoinFile $JoinLog) }
@@ -245,6 +250,7 @@ function Invoke-OneOracle {
         "travel_parity" { return (Test-TravelParity    -HostFile $HostLog -JoinFile $JoinLog) }
         "split_far"     { return (Test-SplitFar        -HostFile $HostLog -JoinFile $JoinLog) }
         "split_far2"    { return (Test-SplitFar2       -HostFile $HostLog -JoinFile $JoinLog) }
+        "dual_drive"    { return (Test-DualDrive       -HostFile $HostLog -JoinFile $JoinLog @Bounds) }
         "run_apart"     { return (Test-RunApart        -HostFile $HostLog -JoinFile $JoinLog) }
         "town_arrive"   { return (Test-TownArrive      -HostFile $HostLog -JoinFile $JoinLog) }
         "town_pop_parity" { return (Test-TownPopParity -HostFile $HostLog -JoinFile $JoinLog) }
@@ -476,6 +482,9 @@ Export-ModuleMember -Function @(
     "Test-SpeedProbe",
     "Test-ShackleProbe",
     "Test-ShackleSync",
+    "Get-EscapeSeries", "Get-EscapeFreedMs", "Get-EscapeMoveAfter",
+    "Get-EscapeHeldAt", "Get-EscapeHeldEdges", "Test-LockpickEscape",
+    "Test-PcDuplicates",
     "Test-CombatCrowd",
     "Test-SplitInterest",
     "Test-InventorySync", "Test-InventoryBidir", "Test-InventoryEquip",
@@ -488,7 +497,7 @@ Export-ModuleMember -Function @(
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",
     "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
-    "Test-SplitFar", "Test-SplitFar2", "Test-RunApart",
+    "Test-SplitFar", "Test-SplitFar2", "Test-DualDrive", "Test-RunApart",
     "Get-TownArriveData", "Get-TownAuditRows", "Test-TownArrive", "Test-TownPopParity",
     "Test-WorldParity", "Test-CellProbe",
     "Test-CampApproach",

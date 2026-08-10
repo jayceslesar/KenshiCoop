@@ -1256,6 +1256,242 @@ function Test-ShackleSync {
     return (Add-GateResult -Name "shackle_sync" -Status $v -Metrics $m -Detail $detail)
 }
 
+# Parse the lockpick_escape series into an ordered list of samples. One hand
+# (the subject) per run, so a flat list beats the per-hand hashtable the other
+# shackle parsers use.
+function Get-EscapeSeries {
+    param([string]$File)
+    $out = New-Object System.Collections.ArrayList
+    $rx = 'SCENARIO ESCAPE hand=(\d+),(\d+) t=(\d+) side=(\w+) chained=(\d) ' +
+          'shackleItem=(\d) lock=(\d) pick=(-?[\d.]+) slave=(-?\d+) furn=(-?\d+) ' +
+          'bs=(\d+) pick_stat=(-?[\d.]+) pos=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)'
+    foreach ($l in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $l.Matches[0].Groups
+        [void]$out.Add(@{
+            Hand    = "$($g[1].Value),$($g[2].Value)"
+            T       = [long]$g[3].Value
+            Side    = $g[4].Value
+            Chained = [int]$g[5].Value
+            Item    = [int]$g[6].Value
+            Lock    = [int]$g[7].Value
+            Pick    = [double]$g[8].Value
+            Slave   = [int]$g[9].Value
+            Furn    = [int]$g[10].Value
+            Bs      = [int]$g[11].Value
+            Stat    = [double]$g[12].Value
+            X       = [double]$g[13].Value
+            Y       = [double]$g[14].Value
+            Z       = [double]$g[15].Value
+        })
+    }
+    return $out
+}
+
+# lockpick_escape: the anchored-to-free crossing, judged on BOTH clients.
+#
+# The gate is deliberately built around the fact that the escape is the
+# ENGINE's: we cannot command a lockpick, so a run where the subject never gets
+# out is not automatically our bug, and the oracle has to say which kind of
+# not-out it was. getLockpickChance is what makes that possible - it separates
+# "the engine rated the attempt impossible" from "the AI never tried" from "the
+# read lever never resolved" - so a non-escape reports the reason instead of a
+# bare FAIL, and only a CROSS-CLIENT disagreement is treated as our defect.
+#
+# What is actually gated:
+#   premise  - both clients found the subject and saw it held to begin with
+#   crossing - if the owner released it, the peer must release it too, within
+#              BudgetS, and it must STAY released (protocol 42's SHACKLE RELOCK
+#              re-asserts a shackle when a peer's copy looks wrongly unshackled,
+#              and a real escape looks exactly like that until the owner's
+#              stream catches up - a relapse here is that self-heal fighting a
+#              legitimate escape, which is the most valuable thing this can find)
+#   motion   - a freed prisoner must be loose on both sides, not pinned
+function Test-LockpickEscape {
+    param(
+        [string]$HostFile,
+        [string]$JoinFile,
+        [double]$BudgetS = 10.0,
+        [double]$MinMove = 20.0
+    )
+    $h = Get-EscapeSeries -File $HostFile
+    $j = Get-EscapeSeries -File $JoinFile
+    $m = @{ hostSamples = $h.Count; joinSamples = $j.Count }
+    $why = @()
+
+    if ($h.Count -lt 1) { $why += "host never emitted SCENARIO ESCAPE (no subject latched)" }
+    if ($j.Count -lt 1) { $why += "join never emitted SCENARIO ESCAPE (no subject latched)" }
+    if ($why.Count -gt 0) {
+        Write-Host "  LOCKPICK-ESCAPE FAIL - $($why -join '; ')"
+        return (Add-GateResult -Name "lockpick_escape" -Status "FAIL" -Metrics $m -Detail ($why -join "; "))
+    }
+
+    # Same body on both sides, or nothing below compares like with like.
+    $hHand = $h[0].Hand; $jHand = $j[0].Hand
+    $m.hostHand = $hHand; $m.joinHand = $jHand
+    if ($hHand -ne $jHand) {
+        $d = "subject hand differs: host=$hHand join=$jHand"
+        Write-Host "  LOCKPICK-ESCAPE FAIL - $d"
+        return (Add-GateResult -Name "lockpick_escape" -Status "FAIL" -Metrics $m -Detail $d)
+    }
+
+    $held = { param($s) ($s.Chained -eq 1 -or $s.Lock -eq 1 -or $s.Furn -eq 2 -or $s.Furn -eq 3) }
+    $hHeld = @($h | Where-Object { & $held $_ }).Count
+    $jHeld = @($j | Where-Object { & $held $_ }).Count
+    $m.hostHeldSamples = $hHeld; $m.joinHeldSamples = $jHeld
+    if ($hHeld -lt 1 -or $jHeld -lt 1) {
+        $d = "premise: subject was never held (hostHeld=$hHeld joinHeld=$jHeld) - rebirth1 should start caged"
+        Write-Host "  LOCKPICK-ESCAPE FAIL - $d"
+        return (Add-GateResult -Name "lockpick_escape" -Status "FAIL" -Metrics $m -Detail $d)
+    }
+
+    # The engine's own verdict on whether an escape was ever possible.
+    $picks = @($j | Where-Object { $_.Pick -ge 0 } | ForEach-Object { $_.Pick })
+    $m.maxPick  = if ($picks.Count -gt 0) { ($picks | Measure-Object -Maximum).Maximum } else { -1 }
+    $m.pickStat = ($j | Select-Object -Last 1).Stat
+
+    $hFree = Get-EscapeFreedMs -File $HostFile
+    $jFree = Get-EscapeFreedMs -File $JoinFile
+    $m.hostFreedMs = $hFree; $m.joinFreedMs = $jFree
+
+    # Which path opened the door. The scenario prefers the engine's own escape
+    # and falls back to an owner-side release; both cross the same anchored ->
+    # free boundary, and the gate below judges the crossing identically. The
+    # distinction is recorded because it is the thing most likely to change
+    # under us: the day getLockpickChance stops returning 0 on this fixture,
+    # forced=0 is how we find out.
+    $m.forced = if (Select-String -Path $JoinFile -Pattern 'SCENARIO ESCAPE force ' `
+                                  -ErrorAction SilentlyContinue) { 1 } else { 0 }
+
+    if ($jFree -lt 0 -and $hFree -lt 0) {
+        # Never released at all - by the engine OR by us. The pick chance says
+        # which half of that is interesting.
+        $why =
+            if ($m.maxPick -lt 0) { "getLockpickChance never resolved (read lever missing)" }
+            elseif ($m.maxPick -eq 0) { "engine rated the attempt at 0 chance throughout" }
+            else { "engine gave up to $($m.maxPick) chance but the AI never attempted" }
+        $d = if ($m.forced -eq 1) {
+            "forced release did not take: still held after SCENARIO ESCAPE force ($why)"
+        } else {
+            "no escape and no forced release: $why (lockpicking stat reached $($m.pickStat))"
+        }
+        Write-Host "  LOCKPICK-ESCAPE FAIL - $d"
+        return (Add-GateResult -Name "lockpick_escape" -Status "FAIL" -Metrics $m -Detail $d)
+    }
+
+    # One side released and the other did not, or did so far too late.
+    if ($jFree -lt 0 -or $hFree -lt 0) {
+        $missing = if ($jFree -lt 0) { "join" } else { "host" }
+        $d = "one-sided release: $missing never saw the subject freed (host=$hFree join=$jFree ms)"
+        Write-Host "  LOCKPICK-ESCAPE FAIL - $d"
+        return (Add-GateResult -Name "lockpick_escape" -Status "FAIL" -Metrics $m -Detail $d)
+    }
+    $lagS = [math]::Abs($hFree - $jFree) / 1000.0
+    $m.crossLagS = [math]::Round($lagS, 2)
+
+    # Being re-held later is NOT a failure, and an early version of this gate
+    # got that wrong. On rebirth1 the Rebirth guards recapture the escapee and
+    # shackle it to a pole about 30 s out (run 20260808_151120: furn goes 2 ->
+    # 0 -> 3) - that is the game working, not us. The co-op question is whether
+    # the two clients AGREE about the hold at each instant, so this samples the
+    # whole post-release window and counts only disagreements that persist past
+    # the crossing budget, i.e. that are not just one side lagging a transition.
+    $tEnd = [math]::Min(($h | Select-Object -Last 1).T, ($j | Select-Object -Last 1).T)
+    $tStart = [math]::Max($hFree, $jFree)
+    $edges = @(Get-EscapeHeldEdges -Series $h) + @(Get-EscapeHeldEdges -Series $j)
+    $budgetMs = $BudgetS * 1000
+    $steps = 0; $diverged = 0; $worst = ""
+    for ($t = $tStart; $t -le $tEnd; $t += 500) {
+        $hh = Get-EscapeHeldAt -Series $h -AtMs $t -Held $held
+        $jj = Get-EscapeHeldAt -Series $j -AtMs $t -Held $held
+        if ($null -eq $hh -or $null -eq $jj) { continue }
+        $steps++
+        if ($hh -eq $jj) { continue }
+        # Near a transition on either side, a difference is just crossing lag.
+        $near = $false
+        foreach ($e in $edges) { if ([math]::Abs($e - $t) -le $budgetMs) { $near = $true; break } }
+        if (-not $near) {
+            $diverged++
+            if (-not $worst) { $worst = "t=${t}ms host=$hh join=$jj" }
+        }
+    }
+    $m.paritySteps = $steps; $m.parityDiverged = $diverged
+
+    # Free locomotion, measured only while that side considers the subject FREE
+    # - once the guards drag it to a pole, any movement is theirs, not proof
+    # that a released body walks on both clients.
+    $m.hostMove = Get-EscapeMoveAfter -Series $h -AfterMs $hFree -Held $held
+    $m.joinMove = Get-EscapeMoveAfter -Series $j -AfterMs $jFree -Held $held
+
+    $bad = @()
+    if ($lagS -gt $BudgetS) { $bad += "release crossed in ${lagS}s (> ${BudgetS}s)" }
+    if ($diverged -gt 0) {
+        $bad += ("clients disagree on hold state for $diverged of $steps samples " +
+                 "after release (first: $worst)")
+    }
+    if ($m.hostMove -lt $MinMove -or $m.joinMove -lt $MinMove) {
+        $bad += ("freed but not walking (host moved $([math]::Round($m.hostMove,1)) u, " +
+                 "join $([math]::Round($m.joinMove,1)) u; need $MinMove)")
+    }
+
+    $v = if ($bad.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $bad -join "; "
+    $via = if ($m.forced -eq 1) { "forced" } else { "engine-picked" }
+    Write-Host ("  LOCKPICK-ESCAPE $v - freed ($via) host=${hFree}ms join=${jFree}ms " +
+                "(lag $($m.crossLagS)s) maxPick=$($m.maxPick) holdParity=$diverged/$steps " +
+                "moved=$([math]::Round($m.hostMove,1))/$([math]::Round($m.joinMove,1)) u")
+    return (Add-GateResult -Name "lockpick_escape" -Status $v -Metrics $m -Detail $detail)
+}
+
+# First "SCENARIO ESCAPE freed" instant in a log, or -1 if that side never
+# reported the subject released. The scenario emits it once per client.
+function Get-EscapeFreedMs {
+    param([string]$File)
+    $l = Select-String -Path $File -Pattern 'SCENARIO ESCAPE freed side=\w+ hand=[\d,]+ t=(\d+)' `
+                       -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $l) { return -1 }
+    return [long]$l.Matches[0].Groups[1].Value
+}
+
+# Furthest the subject got from where it stood when this side released it,
+# counting only samples where this side still considers it free.
+function Get-EscapeMoveAfter {
+    param($Series, [long]$AfterMs, $Held)
+    $post = @($Series | Where-Object { $_.T -ge $AfterMs -and -not (& $Held $_) })
+    if ($post.Count -lt 2) { return 0.0 }
+    $o = $post[0]
+    $best = 0.0
+    foreach ($s in $post) {
+        $d = [math]::Sqrt((($s.X - $o.X) * ($s.X - $o.X)) + (($s.Z - $o.Z) * ($s.Z - $o.Z)))
+        if ($d -gt $best) { $best = $d }
+    }
+    return $best
+}
+
+# Hold state at an instant: the most recent sample at or before AtMs, or $null
+# if this side had not sampled yet. Sampling by time rather than by index is
+# what lets two logs with different cadences and lengths be compared.
+function Get-EscapeHeldAt {
+    param($Series, [long]$AtMs, $Held)
+    $prior = @($Series | Where-Object { $_.T -le $AtMs })
+    if ($prior.Count -lt 1) { return $null }
+    return [bool](& $Held ($prior[-1]))
+}
+
+# Instants where a side's hold state flips - the moments the other side is
+# allowed to lag behind.
+function Get-EscapeHeldEdges {
+    param($Series)
+    $held = { param($s) ($s.Chained -eq 1 -or $s.Lock -eq 1 -or $s.Furn -eq 2 -or $s.Furn -eq 3) }
+    $edges = @()
+    $prev = $null
+    foreach ($s in @($Series)) {
+        $cur = [bool](& $held $s)
+        if ($null -ne $prev -and $cur -ne $prev) { $edges += $s.T }
+        $prev = $cur
+    }
+    return $edges
+}
+
 # Parse "SCENARIO SNEAK hand=i,s t=ms mode=d bs=n" lines into per-hand series
 # (mirrors Get-FurnSeries). Returns hashtable hand -> list of @{T; Mode; Bs}.
 function Get-SneakSeries {

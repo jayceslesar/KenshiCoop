@@ -2006,9 +2006,410 @@ private:
     bool          sawShackled_;
 };
 
+// ===========================================================================
+// lockpick_escape (rebirth1, BOTH clients) - the anchored-to-free crossing.
+//
+// Every furniture scenario so far moves a body INTO a held state and asserts
+// the peer follows. This one is the release, and the release is the harder
+// direction: an anchored body is pinned by furniture the peer can see, while a
+// freed one is loose in the world and has to start walking on both clients at
+// once. rebirth1 is the fixture because the caged bodies are the PLAYER SQUAD
+// (a Rebirth slave start), so the subject is owned - not a world prisoner
+// either side may drive.
+//
+// The escape is the ENGINE'S, not ours. There is no "pick this lock" entry
+// point, but the engine models prisoner escape natively, so the scenario only
+// removes the reason the AI would not try: it raises the subject's LOCKPICKING
+// to a level at which getLockpickChance is high, and then watches. Everything
+// after the raise - the attempt, the roll, CRIME_LOCKPICKING, the transition to
+// ESCAPING_SLAVE - is the engine's own code path, which is the whole point.
+//
+// The series carries getLockpickChance for a reason worth stating: a run where
+// nothing happens is otherwise unreadable. chance > 0 with no escape means the
+// AI never attempted; chance == 0 means the engine was never going to let it
+// through and waiting longer is pointless; chance < 0 means the read lever
+// itself did not resolve. Those need three different fixes.
+//
+// Log-only pass, like shackle_probe: reaching the end and emitting the series
+// is success here, and Test-LockpickEscape judges the crossing from the two
+// logs. The scenario must NOT decide the escape happened - the whole question
+// is whether both clients agree that it did.
+// escape_cohesion (same class, cohesion mode) extends the above from "did the
+// release cross" to "do the two clients RENDER the same world while the freed
+// body travels". Three additions, and each one exists to remove a different
+// excuse for a disagreement:
+//   * BOTH clients point their camera at the SAME body (the join's escapee), so
+//     the two screenshots are directly comparable and neither side can be
+//     accused of simply looking elsewhere;
+//   * the waypoint is placed just PAST the nearest zone-cell boundary, because
+//     a cell edge is where presence authority changes hands - the seam the
+//     2026-08-08 dual-drive work lives on - so the walk crosses it deliberately
+//     instead of hoping to;
+//   * the per-sample series carries the subject's CELL, so a divergence can be
+//     read against the handover rather than guessed at.
+// Note the camera is not a passive viewport here: protocol 43 folds it into the
+// interest anchors, so aiming both at one body widens what both clients stream
+// around it. That is deliberate - symmetric interest is what makes "do both see
+// the same thing" a fair question - but it means this measures cohesion under a
+// shared spotlight, not under independent attention.
+class EscapeScenario : public TimedScenario {
+public:
+    EscapeScenario(const char* nm, bool cohesion)
+        : TimedScenario(nm, 0), cohesion_(cohesion), lastLogMs_(0),
+          haveSubj_(false), raiseLogged_(false), sawHeld_(false),
+          forceLogged_(false), haveHome_(false), haveTarget_(false),
+          camLogged_(false), lastWalkMs_(0), lastCamMs_(0), freedAtMs_(0),
+          homeX_(0), homeY_(0), homeZ_(0), tgtX_(0), tgtZ_(0) {
+        subjHand_[0] = subjHand_[1] = subjHand_[2] = subjHand_[3] = subjHand_[4] = 0;
+    }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // The JOIN's tab leader escapes: it is the join that owns it, so the
+        // raise is an owner-authoritative write, and the HOST is then the peer
+        // whose driven copy has to follow the release. That is the direction
+        // the dual-drive work made suspect, and the direction protocol 42's
+        // SHACKLE RELOCK self-heal is most likely to fight.
+        const unsigned int SUBJ_RANK = 1;
+        if (!haveSubj_) latchSubject(ctx, SUBJ_RANK);
+
+        // Both clients watch the SAME body, from the first tick, at the cadence
+        // the split scenarios settled on. Re-issued rather than set once because
+        // the engine drops the follow whenever the target is re-anchored - which
+        // a cage exit does.
+        if (cohesion_ && haveSubj_ &&
+            (lastCamMs_ == 0 || ctx.elapsedMs - lastCamMs_ >= CAM_REFOCUS_MS)) {
+            lastCamMs_ = ctx.elapsedMs;
+            focusCamera(ctx);
+        }
+
+        if (haveSubj_ && !raiseLogged_ && ctx.elapsedMs >= RAISE_AT_MS) {
+            raiseLogged_ = true;
+            // Only the OWNER may write stats; the host logs its abstention so
+            // the oracle can tell "the join never raised" from "the host did".
+            bool ok = false;
+            if (!ctx.isHost) {
+                ok = engine::raiseSubjectStat(ctx.gw, subjHand_,
+                                              STAT_LOCKPICKING_ID, RAISE_TO);
+            }
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO ESCAPE raise side=%s hand=%u,%u stat=%d to=%.0f ok=%d",
+                      ctx.isHost ? "host" : "join", subjHand_[3], subjHand_[4],
+                      STAT_LOCKPICKING_ID, RAISE_TO, ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Fallback: if the engine has not let the subject out by FORCE_AT_MS,
+        // the OWNER releases it outright. Measured on rebirth1 (run
+        // 20260808_145843): with lockpicking raised 1 -> 100, getLockpickChance
+        // stayed at exactly 0.000 for the full 180 s - Rebirth's cage locks are
+        // not pickable at any skill, so waiting is not a slow path, it is a
+        // dead one. The lockpick attempt above is still made and still
+        // measured, because if a future fixture or patch makes it viable the
+        // series will say so; but the crossing this scenario exists to test is
+        // anchored -> free, and that must not depend on the engine agreeing to
+        // open the door.
+        if (haveSubj_ && !forceLogged_ && !freedAtMs_ && !ctx.isHost &&
+            ctx.elapsedMs >= FORCE_AT_MS) {
+            forceLogged_ = true;
+            forceRelease(ctx);
+        }
+
+        if (haveSubj_ && (lastLogMs_ == 0 || ctx.elapsedMs - lastLogMs_ >= 500)) {
+            lastLogMs_ = ctx.elapsedMs;
+            logEscapeLine(ctx);
+        }
+
+        // A released prisoner that just stands there proves nothing about the
+        // peer's ability to render a freed body, so the owner walks it away and
+        // keeps re-issuing (the reissue cadence the movement scenarios use).
+        if (haveSubj_ && !ctx.isHost && freedAtMs_ &&
+            (lastWalkMs_ == 0 || ctx.elapsedMs - lastWalkMs_ >= WALK_REISSUE_MS)) {
+            lastWalkMs_ = ctx.elapsedMs;
+            walkAway(ctx);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // Premise, not verdict: the run is only meaningful if we ever found
+            // the caged subject. Whether it got out, and whether both clients
+            // saw it get out, is the oracle's call.
+            passed_ = haveSubj_;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    // StatsEnumerated::STAT_LOCKPICKING. raiseSubjectStat takes the index as an
+    // int (same as stats_sync's hardcoded STRENGTH/STEALTH pair).
+    static const int           STAT_LOCKPICKING_ID = 37;
+    static const unsigned long RAISE_AT_MS      = 10000;
+    // 60 s of watching the raised subject before forcing the release: long
+    // enough that an engine-driven escape would be visible in the series, short
+    // enough to leave most of the window for the crossing itself.
+    static const unsigned long FORCE_AT_MS      = 60000;
+    static const unsigned long WALK_REISSUE_MS  = 4000;
+    static const unsigned long CAM_REFOCUS_MS   = 5000;
+    static const unsigned long HOST_DURATION_MS = 180000;
+    static const unsigned long JOIN_DURATION_MS = 174000;
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const float         RAISE_TO;
+    static const float         WALK_DIST;
+    static const float         WALK_SPEED;
+    // How far PAST the boundary to aim. Far enough that arriving is unambiguous
+    // rather than a body hovering on the line and flapping the claim, close
+    // enough that the leg stays inside one cell's worth of terrain.
+    static const float         PAST_EDGE;
+
+    Character* subject() {
+        return engine::resolveCharByHand(subjHand_[3], subjHand_[4], subjHand_[0],
+                                         subjHand_[1], subjHand_[2]);
+    }
+
+    // Point THIS client's camera at the subject.
+    //
+    // Two resolve paths are tried because run 20260808_183753 showed the host's
+    // camera never moving while the join's tracked perfectly, from identical
+    // code on an identically-resolved hand. The squad-array path is the one
+    // SplitFarScenario uses and is therefore the one known to work on a peer's
+    // body; resolveCharByHand is the fallback. The line reports which pointer
+    // each side used and whether the engine accepted the call, so a repeat of
+    // that asymmetry says WHERE it comes from instead of just that it happened.
+    void focusCamera(const ScenarioContext& ctx) {
+        Character* byHand = subject();
+        Character* bySquad = 0;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        for (unsigned int i = 0; i < n; ++i) {
+            unsigned int h[5]; handFromEntity(sq[i], h);
+            if (h[3] == subjHand_[3] && h[4] == subjHand_[4]) {
+                bySquad = engine::resolve(sq[i]);
+                break;
+            }
+        }
+        Character* use = bySquad ? bySquad : byHand;
+        bool ok = use && engine::cameraFocusOn(ctx.gw, use);
+        if (camLogged_) return;
+        camLogged_ = true;
+        float x = 0, y = 0, z = 0;
+        if (use) engine::readPos(use, &x, &y, &z);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO ESCAPE cam side=%s t=%lu ok=%d src=%s byHand=%d "
+                  "bySquad=%d squadN=%u pos=%.1f,%.1f,%.1f",
+                  ctx.isHost ? "host" : "join", (unsigned long)ctx.elapsedMs,
+                  ok ? 1 : 0, bySquad ? "squad" : "hand", byHand ? 1 : 0,
+                  bySquad ? 1 : 0, n, x, y, z);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Owner-side release: drop BOTH holds, because rebirth1 applies both - the
+    // subject reads furn=2 (prison cage) AND chained=1, and clearing only one
+    // leaves the body anchored with no visible reason why.
+    void forceRelease(const ScenarioContext& ctx) {
+        Character* c = engine::resolveCharByHand(subjHand_[3], subjHand_[4],
+                                                 subjHand_[0], subjHand_[1],
+                                                 subjHand_[2]);
+        if (!c) return;
+        engine::FurnitureRead fr;
+        engine::ShackleRead sr;
+        bool haveFurn = engine::readFurniture(c, &fr) && fr.valid;
+        bool haveSh   = engine::readShackle(c, &sr) && sr.valid;
+        bool okFurn = false, okChain = false;
+        if (haveFurn && (fr.kind == 1 || fr.kind == 2))
+            okFurn = engine::applyFurniture(ctx.gw, c, fr.furn, fr.kind, false);
+        if (haveSh && sr.chained)
+            okChain = engine::applyFurniture(ctx.gw, c, sr.owner, 3, false);
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO ESCAPE force hand=%u,%u t=%lu kind=%d furnOff=%d chainOff=%d",
+                  subjHand_[3], subjHand_[4], ctx.elapsedMs,
+                  haveFurn ? fr.kind : -1, okFurn ? 1 : 0, okChain ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Walk the freed subject away from where it was held, re-issued so a leg
+    // interrupted by terrain or a guard resumes instead of dying quietly.
+    //
+    // lockpick_escape keeps this deliberately dumb - a fixed short offset, a
+    // locomotion probe rather than a pathfinding test, because a caged start is
+    // usually walled in. escape_cohesion needs the opposite: the point is to
+    // cross a cell boundary, so it aims past the nearest one.
+    void walkAway(const ScenarioContext& ctx) {
+        Character* c = subject();
+        if (!c) return;
+        if (!haveHome_) {
+            engine::readPos(c, &homeX_, &homeY_, &homeZ_);
+            haveHome_ = true;
+        }
+        if (!cohesion_) {
+            engine::walkTo(c, homeX_ + WALK_DIST, homeY_, homeZ_, WALK_SPEED);
+            return;
+        }
+        if (!haveTarget_) pickCellTarget(ctx);
+        if (haveTarget_) engine::walkTo(c, tgtX_, homeY_, tgtZ_, WALK_SPEED);
+        else engine::walkTo(c, homeX_ + WALK_DIST, homeY_, homeZ_, WALK_SPEED);
+    }
+
+    // Aim just past the NEAREST zone-cell boundary. All four directions are
+    // probed and the closest wins, because which way the seam runs is a
+    // property of where the fixture's cage happens to sit, not something to
+    // hardcode - and a wrong guess would walk the length of a whole cell.
+    // Falls back to the fixed offset (haveTarget_ stays false) if the mapping
+    // is unreadable, so a bad read degrades to lockpick_escape's behavior
+    // rather than parking the subject at the origin.
+    void pickCellTarget(const ScenarioContext& ctx) {
+        struct Cand { bool axisX; float dir; };
+        static const Cand kCands[4] = {
+            { true,  1.0f }, { true, -1.0f }, { false, 1.0f }, { false, -1.0f }
+        };
+        bool  bestOk = false;
+        float bestDist = 0.0f, bestEdge = 0.0f;
+        bool  bestAxisX = true;
+        float bestDir = 1.0f;
+        for (int i = 0; i < 4; ++i) {
+            const bool  axisX = kCands[i].axisX;
+            const float fixed = axisX ? homeZ_ : homeX_;
+            const float start = axisX ? homeX_ : homeZ_;
+            float edge = 0.0f;
+            if (!findCellEdge(ctx.gw, axisX, fixed, start, kCands[i].dir, &edge))
+                continue;
+            const float d = (edge > start) ? (edge - start) : (start - edge);
+            if (!bestOk || d < bestDist) {
+                bestOk = true; bestDist = d; bestEdge = edge;
+                bestAxisX = axisX; bestDir = kCands[i].dir;
+            }
+        }
+        int cx = 0, cz = 0;
+        engine::cellAt(ctx.gw, homeX_, homeZ_, &cx, &cz);
+        if (bestOk) {
+            const float past = bestEdge + bestDir * PAST_EDGE;
+            tgtX_ = bestAxisX ? past : homeX_;
+            tgtZ_ = bestAxisX ? homeZ_ : past;
+            haveTarget_ = true;
+        }
+        // Emitted once, on the owner, and named so the harness can hang the
+        // screenshot on it: the interesting frame is mid-walk, not at the cage.
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO ESCAPE walk hand=%u,%u t=%lu ok=%d axis=%s dist=%.1f "
+                  "edge=%.1f from=%.1f,%.1f to=%.1f,%.1f cell=%d,%d",
+                  subjHand_[3], subjHand_[4], (unsigned long)ctx.elapsedMs,
+                  haveTarget_ ? 1 : 0, bestAxisX ? "x" : "z", bestDist, bestEdge,
+                  homeX_, homeZ_, tgtX_, tgtZ_, cx, cz);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchSubject(const ScenarioContext& ctx, unsigned int rank) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, rank);
+        if (idx < 0) return;
+        handFromEntity(sq[idx], subjHand_);
+        haveSubj_ = true;
+        // Record the STARTING state next to the identity: the oracle needs a
+        // "before" to call a 1->0 lock transition, and if the fixture ever
+        // drifts to an unshackled start this line is what says so.
+        engine::ShackleRead sr;
+        Character* c = engine::resolveCharByHand(subjHand_[3], subjHand_[4],
+                                                 subjHand_[0], subjHand_[1],
+                                                 subjHand_[2]);
+        bool ok = c && engine::readShackle(c, &sr) && sr.valid;
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO ESCAPE subj side=%s rank=%u hand=%u,%u chained=%d "
+                  "shackleItem=%d lock=%d slave=%d",
+                  ctx.isHost ? "host" : "join", rank, subjHand_[3], subjHand_[4],
+                  (ok && sr.chained) ? 1 : 0, (ok && sr.hasShackleItem) ? 1 : 0,
+                  (ok && sr.lockPresent) ? 1 : 0,
+                  c ? engine::readSlaveState(c) : -1);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // One "SCENARIO ESCAPE" line: the subject's state as THIS client sees its
+    // own copy. Both clients emit it for the same hand, which is what lets the
+    // oracle put the owner's release and the peer's release on one timeline.
+    void logEscapeLine(const ScenarioContext& ctx) {
+        Character* c = engine::resolveCharByHand(subjHand_[3], subjHand_[4],
+                                                 subjHand_[0], subjHand_[1],
+                                                 subjHand_[2]);
+        if (!c) return;
+        engine::ShackleRead sr;
+        if (!engine::readShackle(c, &sr) || !sr.valid) return;
+        engine::FurnitureRead fr;
+        bool haveFurn = engine::readFurniture(c, &fr) && fr.valid;
+        engine::StatsRead st;
+        bool haveStats = engine::readStats(c, &st) && st.valid;
+        float x = 0, y = 0, z = 0;
+        engine::readPos(c, &x, &y, &z);
+        // "Held" must be OBSERVED before "freed" can mean anything: a caged
+        // body need carry no shackle item at all, so an unlatched test would
+        // report the subject free on the first sample and call that an escape.
+        bool held = sr.chained || sr.lockPresent ||
+                    (haveFurn && (fr.kind == 2 || fr.kind == 3));
+        if (held) sawHeld_ = true;
+        // First tick this client saw every hold gone - reported once, so the
+        // oracle reads a crossing instant per side rather than diffing samples.
+        if (sawHeld_ && !freedAtMs_ && !held) {
+            freedAtMs_ = ctx.elapsedMs ? ctx.elapsedMs : 1;
+            char f[144];
+            _snprintf(f, sizeof(f) - 1,
+                      "SCENARIO ESCAPE freed side=%s hand=%u,%u t=%lu",
+                      ctx.isHost ? "host" : "join", subjHand_[3], subjHand_[4],
+                      freedAtMs_);
+            f[sizeof(f) - 1] = '\0'; coop::logLine(f);
+        }
+        // The CELL is appended last so the field order the existing oracle
+        // parses stays byte-identical - cohesion mode adds evidence to the same
+        // line rather than forking the format.
+        int cx = 0, cz = 0;
+        engine::cellAt(ctx.gw, x, z, &cx, &cz);
+        char b[288];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO ESCAPE hand=%u,%u t=%lu side=%s chained=%d "
+                  "shackleItem=%d lock=%d pick=%.3f slave=%d furn=%d bs=%u "
+                  "pick_stat=%.1f pos=%.2f,%.2f,%.2f cell=%d,%d",
+                  subjHand_[3], subjHand_[4], ctx.elapsedMs,
+                  ctx.isHost ? "host" : "join",
+                  sr.chained ? 1 : 0, sr.hasShackleItem ? 1 : 0,
+                  sr.lockPresent ? 1 : 0, sr.lockpickChance,
+                  engine::readSlaveState(c), haveFurn ? fr.kind : -1,
+                  (unsigned)engine::readBodyState(c),
+                  haveStats ? st.stats[STAT_LOCKPICKING_ID] : -1.0f,
+                  x, y, z, cx, cz);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    const bool    cohesion_;
+    unsigned long lastLogMs_;
+    bool          haveSubj_;
+    bool          raiseLogged_;
+    bool          sawHeld_;
+    bool          forceLogged_;
+    bool          haveHome_;
+    bool          haveTarget_;
+    bool          camLogged_;
+    unsigned long lastWalkMs_;
+    unsigned long lastCamMs_;
+    unsigned long freedAtMs_;
+    float         homeX_, homeY_, homeZ_;
+    float         tgtX_, tgtZ_;
+    unsigned int  subjHand_[5];
+};
+
+const float EscapeScenario::RAISE_TO   = 100.0f;
+const float EscapeScenario::WALK_DIST  = 60.0f;
+const float EscapeScenario::WALK_SPEED = 30.0f;
+const float EscapeScenario::PAST_EDGE  = 150.0f;
+
 } // namespace
 
 Scenario* makeCharStateScenario(const std::string& name) {
+    if (name == "lockpick_escape") return new EscapeScenario("lockpick_escape", false);
+    if (name == "escape_cohesion") return new EscapeScenario("escape_cohesion", true);
     if (name == "carry_order")  return new CarryOrderScenario();
     if (name == "npc_carry")    return new NpcCarryScenario();
     if (name == "bed_pose")     return new BedPoseScenario();

@@ -1418,6 +1418,12 @@ struct ShackleRead {
     bool hasShackleItem;   // getChainedModeShackles() != null
     bool lockPresent;      // LockedArmour::lock (0x2F0) != null
     unsigned int owner[5]; // Character::slaveOwner (0x328) hand, all-zero if none
+    // The engine's own per-attempt odds of this character picking that lock,
+    // or < 0 for "not measured" (no lock, or the fn did not resolve). NEGATIVE
+    // AND ZERO MEAN DIFFERENT THINGS and the escape scenario depends on the
+    // difference: 0 says the engine will never let this attempt succeed, so
+    // waiting longer is pointless, while < 0 says we never got to ask.
+    float lockpickChance;
 };
 bool readShackle(Character* c, ShackleRead* out);
 // Jail-probe read lever (KENSHICOOP_JAIL_PROBE): Character::isSlave() as int

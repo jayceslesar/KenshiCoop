@@ -27,7 +27,7 @@ only ever mutates the throwaway AppData copy; drift is discarded each run.
 
 Validation fixtures referenced by `scripts/scenarios.psd1`:
 `sync`, `squad1`, `c`, `duel1`, `down1`, `craft1`, `bedcage1`, `pole1`, `camp`,
-`jailed`, `coopresume`.
+`jailed`, `coopresume`, `rebirth1`.
 
 Debug/exploratory saves (`together`, `separate`, `zoom`, ...) are intentionally NOT
 tracked - drift there is harmless. See the `coop-save-orchestration` skill for the

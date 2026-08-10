@@ -169,6 +169,15 @@ typedef void      (__fastcall* SetChainedModeFn)(Character* self, bool on,
 // Phase 6 shackle read lever: Character::getChainedModeShackles() -> equipped
 // LockedArmour* (shackle item) or null; non-null LockedArmour::lock == locked.
 typedef LockedArmour* (__fastcall* GetShacklesFn)(Character* self);
+// Lockpick read lever: Character::getLockpickChance(DoorLock*) -> the engine's
+// OWN per-attempt success probability for this character against this lock.
+// Read-only, and the point of reading it is to make a non-escape diagnosable:
+// a scenario that raises lockpicking and then waits can fail either because the
+// engine rates the attempt at zero or because the AI never tried, and those
+// need opposite fixes. DoorLock is forward-declared only - the pointer comes
+// straight from LockedArmour::lock and is never dereferenced by us.
+typedef float     (__fastcall* GetLockpickChanceFn)(Character* self,
+                                                    DoorLock* victim);
 // Jail-probe read lever: Character::isSlave() -> SlaveStateEnum (0 NOT_SLAVE /
 // 1 IS_SLAVE / 2 ESCAPING_SLAVE / 3 EX_SLAVE), returned in eax as int.
 typedef int       (__fastcall* IsSlaveFn)(Character* self);
@@ -414,6 +423,7 @@ extern SetFurnModeFn     g_setBedModeFn;
 extern SetFurnModeFn     g_setPrisonModeFn;
 extern SetChainedModeFn  g_setChainedModeFn;
 extern GetShacklesFn     g_getShacklesFn;
+extern GetLockpickChanceFn g_getLockpickChanceFn;
 extern IsSlaveFn         g_isSlaveFn;
 extern SetStealthModeFn  g_setStealthModeFn;
 extern NotifySeeSneakFn  g_notifySeeSneakFn;

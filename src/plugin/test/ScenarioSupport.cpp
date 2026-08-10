@@ -166,4 +166,45 @@ void handFromEntity(const EntityState& e, unsigned int h[5]) {
     h[3] = e.hIndex; h[4] = e.hSerial;
 }
 
+// ---- Zone-cell geometry, measured with the mapping itself -------------------
+// Promoted here from CellProbeScenario when a second TU needed it
+// (escape_cohesion walks a freed prisoner across a cell boundary).
+//
+// getZoneBoundsT would hand back a cell's rect in one call, but it returns a
+// 16-byte class and the first attempt at its hidden-return-pointer convention
+// came back as junk. Walking getMapSector until the coord changes needs no
+// convention at all: it only ever reads an int pair out of RAX, which the
+// zone.X.Y filenames already confirmed is correct.
+bool cellAtAxis(GameWorld* gw, bool axisX, float fixed, float v, int* cx, int* cz) {
+    return axisX ? engine::cellAt(gw, v, fixed, cx, cz)
+                 : engine::cellAt(gw, fixed, v, cx, cz);
+}
+
+bool findCellEdge(GameWorld* gw, bool axisX, float fixed, float start, float dir,
+                  float* outEdge) {
+    if (!outEdge) return false;
+    const float sign = (dir < 0.0f) ? -1.0f : 1.0f;
+    int c0x = 0, c0z = 0;
+    if (!cellAtAxis(gw, axisX, fixed, start, &c0x, &c0z)) return false;
+    const float LIMIT = 60000.0f, STEP = 100.0f;
+    float lo = start, hi = 0.0f;
+    bool bracket = false;
+    for (float d = STEP; d <= LIMIT; d += STEP) {
+        int cx = 0, cz = 0;
+        if (!cellAtAxis(gw, axisX, fixed, start + sign * d, &cx, &cz)) return false;
+        if (cx != c0x || cz != c0z) {
+            lo = start + sign * (d - STEP); hi = start + sign * d; bracket = true; break;
+        }
+    }
+    if (!bracket) return false;
+    for (int i = 0; i < 24; ++i) {   // ~0.004 u on a 100 u bracket
+        float mid = 0.5f * (lo + hi);
+        int cx = 0, cz = 0;
+        if (!cellAtAxis(gw, axisX, fixed, mid, &cx, &cz)) return false;
+        if (cx == c0x && cz == c0z) lo = mid; else hi = mid;
+    }
+    *outEdge = hi;
+    return true;
+}
+
 } // namespace coop

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Functional test runner for KenshiCoop: launch host + join, auto-load a save,
   run for a fixed time (or a compiled scenario), self-exit, then collect
@@ -91,7 +91,17 @@ param(
     # validates that CLOCKSYNC offset estimation + oracle alignment recover it.
     [int]$FakeClockSkewMs = 0,
     # Harness timeout profile from the manifest (loopback|remote).
-    [string]$Profile = "loopback"
+    [string]$Profile = "loopback",
+    # Per-run DiagEnv override, applied AFTER the manifest's own block. For
+    # A/B-ing a channel knob against a scenario WITHOUT editing the committed
+    # manifest, which would change what every other run of that scenario means.
+    # Keys are validated against the same canonical keyset the manifest is, and
+    # the applied map lands in run.json, so a run always says which arm it was.
+    #
+    # Accepts either a hashtable (@{ KEY = 'val' }) or a "KEY=val,KEY2=val2"
+    # string. The string form exists because -File passes every argument as a
+    # string, so a hashtable literal cannot survive being invoked that way.
+    [object]$DiagEnvOverride = @{}
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,6 +122,32 @@ if ($Scenario -ne "" -and $manifest.Scenarios.ContainsKey($Scenario)) {
 }
 if ($Tolerance -eq 0) { $Tolerance = 3.0 }
 if ($Save -eq "") { throw "No -Save given and scenario '$Scenario' has no manifest default." }
+
+# Normalize -DiagEnvOverride to a hashtable, then validate it HERE rather than at
+# apply time: apply happens per client inside the launch path, so a typo would
+# otherwise surface after both games are up and cost a full run to discover.
+$diagOverride = @{}
+if ($DiagEnvOverride -is [hashtable]) {
+    $diagOverride = $DiagEnvOverride
+} elseif ("$DiagEnvOverride" -ne "") {
+    foreach ($pair in ("$DiagEnvOverride" -split ',')) {
+        $t = $pair.Trim()
+        if ($t -eq "") { continue }
+        $kv = $t -split '=', 2
+        if ($kv.Count -ne 2) { throw "DiagEnvOverride '$t' is not KEY=VALUE." }
+        $diagOverride[$kv[0].Trim()] = $kv[1].Trim()
+    }
+}
+if ($diagOverride.Count -gt 0) {
+    $allowedDiagKeys = Get-CoopDiagEnvKeys
+    foreach ($k in $diagOverride.Keys) {
+        if ($allowedDiagKeys -notcontains $k) {
+            throw "DiagEnvOverride key '$k' is not in CoopHarness::CoopDiagEnvKeys."
+        }
+    }
+    $ovr = ($diagOverride.Keys | Sort-Object | ForEach-Object { "$_=$($diagOverride[$_])" }) -join " "
+    Write-Host "  DiagEnv override: $ovr"
+}
 
 # Timeout profile (explicit parameters win over the profile).
 # NOT named $armTimeoutMs: PowerShell variable names are case-insensitive, so
@@ -247,6 +283,7 @@ $runJson = [ordered]@{
     port          = $Port
     profile       = $Profile
     diagEnv       = $(if ($null -ne $manifestEntry -and $manifestEntry.ContainsKey('DiagEnv')) { $manifestEntry.DiagEnv } else { @{} })
+    diagEnvOverride = $diagOverride
     wan           = $Wan
     wanProfile    = $(if ($Wan -ne "") { $manifest.WanProfiles[$Wan] } else { $null })
     wanSeed       = $wanSeed
@@ -318,6 +355,11 @@ function Set-CoopEnv {
     # plugin's Config.cpp no longer hard-codes. Applied hermetically (the whole
     # managed keyset is cleared first) and MODE-AGNOSTIC (host + join match).
     [void](Set-CoopDiagEnv -Entry $manifestEntry)
+    # -DiagEnvOverride wins over the manifest, and only over it: Set-CoopDiagEnv
+    # has already cleared the keyset, so this stays as hermetic as the manifest path.
+    foreach ($k in $diagOverride.Keys) {
+        Set-Item -Path "env:$k" -Value "$($diagOverride[$k])"
+    }
     # Host-only setup/re-arm scene.
     $env:KENSHICOOP_SETUP = if ($Mode -eq "host") { $Setup } else { "" }
     # Legacy in-plugin WAN sim (both clients; entities only).
@@ -423,29 +465,51 @@ $shotsTaken = $false
 if ($Scenario -ne "") {
     # Capture each client at ITS OWN anchor so BOTH screenshots show in-game,
     # mid-action state despite the launch stagger.
+    #
+    # The default anchors fire as soon as the scenario is up, which is right for
+    # a scenario whose interesting state IS its opening. It is wrong for one that
+    # spends a minute setting up: escape_cohesion would photograph a prisoner in
+    # a cage 60 s before the escape it exists to show. So the anchors are
+    # manifest-overridable, and ShotWaitSec exists because a late anchor also
+    # needs a longer wait than the arming timeouts allow.
     $hostAnchor = "SCENARIO MEMBER"
+    $joinAnchor = "SCENARIO RECV"
     $hostShotDelay = 1
     $joinShotDelay = 1
+    $hostShotWait = $ScenarioWaitSec
+    $joinShotWait = $JoinAnchorTimeoutSec
     if ($Scenario -eq "combat_kill") {
         $hostAnchor = "SCENARIO KO enforced"
         $hostShotDelay = 2
         $joinShotDelay = 4
     }
-    if (Wait-ForLogLine -File $hostLog -Pattern $hostAnchor -TimeoutSec $ScenarioWaitSec) {
+    if ($null -ne $manifestEntry) {
+        if ($manifestEntry.ContainsKey("ShotAnchorHost")) { $hostAnchor = $manifestEntry.ShotAnchorHost }
+        if ($manifestEntry.ContainsKey("ShotAnchorJoin")) { $joinAnchor = $manifestEntry.ShotAnchorJoin }
+        if ($manifestEntry.ContainsKey("ShotDelaySec")) {
+            $hostShotDelay = $manifestEntry.ShotDelaySec
+            $joinShotDelay = $manifestEntry.ShotDelaySec
+        }
+        if ($manifestEntry.ContainsKey("ShotWaitSec")) {
+            $hostShotWait = $manifestEntry.ShotWaitSec
+            $joinShotWait = $manifestEntry.ShotWaitSec
+        }
+    }
+    if (Wait-ForLogLine -File $hostLog -Pattern $hostAnchor -TimeoutSec $hostShotWait) {
         Write-Host "Saw host '$hostAnchor'; capturing host shortly after."
         Start-Sleep -Seconds $hostShotDelay
     } else {
-        Write-Warning "No host '$hostAnchor' within $ScenarioWaitSec s; capturing host best-effort."
+        Write-Warning "No host '$hostAnchor' within $hostShotWait s; capturing host best-effort."
     }
     if (Test-Alive $hostPid) { Take-Shot -ProcId $hostPid -Out $hostPng -Label "host" }
     else { Write-Warning "Host already exited before screenshot." }
 
     if ($joinPid -ne 0) {
-        if (Wait-ForLogLine -File $joinLog -Pattern "SCENARIO RECV" -TimeoutSec $JoinAnchorTimeoutSec) {
-            Write-Host "Saw join SCENARIO RECV; capturing join shortly after."
+        if (Wait-ForLogLine -File $joinLog -Pattern $joinAnchor -TimeoutSec $joinShotWait) {
+            Write-Host "Saw join '$joinAnchor'; capturing join shortly after."
             Start-Sleep -Seconds $joinShotDelay
         } else {
-            Write-Warning "No join SCENARIO RECV within $JoinAnchorTimeoutSec s; capturing join best-effort."
+            Write-Warning "No join '$joinAnchor' within $joinShotWait s; capturing join best-effort."
         }
         if (Test-Alive $joinPid) { Take-Shot -ProcId $joinPid -Out $joinPng -Label "join" }
         else { Write-Warning "Join already exited before screenshot." }

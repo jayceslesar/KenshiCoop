@@ -91,6 +91,7 @@ VALIDATION saves are referenced by `scripts/scenarios.psd1` and must stay stable
 | `camp` | validation | Dense prison save (many NPCs): camp_approach, world_parity, shackle_*. |
 | `splitfar1` | validation (fixture) | The pair SPLIT ~5200 u apart with NPCs at BOTH ends: split_far. Baked with `bake_scene.ps1 -Setup splitfar -BaseSave separate`, which parks the non-leader tab at a measured populated point. Re-make it that way, never via `capture_save.ps1` - see the capture-after-a-run warning below. |
 | `jailed` | validation | Join PC caged: jail_probe / jail_soak. |
+| `rebirth1` | validation (fixture) | Rebirth: the JOIN's whole squad is caged as slaves, with the two squads co-located and a zone-cell boundary a short walk away. Drives lockpick_escape and escape_cohesion, and is the co-location bed for authority A/Bs (`tools/authority_ab.ps1`). |
 | `coopresume` | validation (auto-written) | Coordinated save/load transfer target (protocol 31/32). Written by the tests — never hand-edit. |
 | `zoom` | debug | Outside town, camera far out — long-run pop/snap inspection. |
 | `separate` | debug | The pair SEPARATED — testing independent actions across distance. |
@@ -105,7 +106,7 @@ Validation fixtures live under `fixtures/saves/<name>\` (full save folder:
 `quick.save`, `platoon/`, `zone/`, `portraits_texture.png`) - the pristine source
 of truth. The tracked set matches the saves in `scripts/scenarios.psd1`:
 `sync, squad1, squad2, c, duel1, down1, craft1, bedcage1, pole1, camp, jailed, coopresume,
-splitfar1`.
+splitfar1, rebirth1`.
 Debug saves (`together`, `separate`, `zoom`) are NOT tracked; drift there is fine.
 
 - **Restore (automatic):** `run_test.ps1` restores the scenario's save from the

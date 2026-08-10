@@ -466,6 +466,62 @@
             Tier = 'probe'; WanVariant = $false
         }
 
+        # cell_auth_together: presence authority with both squads in ONE cell.
+        #
+        # This is the configuration the suite had no coverage of, and the gap was
+        # not accidental - it follows from two defensible decisions that combine
+        # badly. CoopHarness pins KENSHICOOP_CELL_AUTH=0 so the tier proves the
+        # feature is additive, and the four scenarios that opt back in via
+        # DiagEnv (split_far2, run_apart, town_arrive, town_arrive_far) all exist
+        # to test squads FAR APART, because that is where moving authority is
+        # interesting. Nobody wrote the boring case, so the shipped default was
+        # never exercised with two squads standing in the same cell - and that is
+        # exactly where it breaks. A manual session on 2026-08-08 found the join
+        # publishing 43 census rows for a cell the host owned, and both clients
+        # then driving the same bodies for minutes at a time.
+        #
+        # No new fixture: 'sync' already puts both tabs in one live town
+        # (cell_probe above uses it for that same property). The first cut of
+        # this scenario was just that save plus the shipped flag, and it came
+        # back clean - the join published n=0 enum=47 notmine=47, correctly
+        # declining to author a cell the host owned. Co-location alone is not
+        # the trigger; CONVERGENCE is. So the C++ driver walks the sequence the
+        # manual session took: settle together, park the join's tab into a
+        # neighbouring cell long enough to claim it, then bring it back into the
+        # host's cell. See the class comment in ScenarioProbes.cpp.
+        #
+        # WHAT IT CATCHES TODAY, stated plainly because it is less than hoped.
+        # The scenario reliably reproduces the PUBLISH-side half: after the
+        # return the join keeps publishing ~30 census rows a tick while its own
+        # [cell] MAP lists no cell it owns. It does not yet reproduce the mutual
+        # drive, because that also needs the two clients to DISAGREE about
+        # ownership, and on loopback the claim propagates in under 50 ms - the
+        # two [cell] MAP dumps stay in lockstep through all 13 edge crossings.
+        # Under the WAN profile the disagreement window opens (widest overlap
+        # went 0 s -> 26 s across nine shared hands) but still falls short of
+        # dual_drive's corroboration bar. So the WAN variant is the one with
+        # teeth here, and the gate is honest about passing for now: it is a
+        # non-regression guard on the configuration plus the premise, not a
+        # standing reproduction. The reproduction of record is the 2026-08-08
+        # manual session, which dual_drive fails hard.
+        #
+        # Seconds/KillGraceSec follow the house idiom and outlive both the
+        # scenario's 180 s window and the default 150 s self-exit.
+        cell_auth_together = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            Seconds = 220; KillGraceSec = 190
+            PrimaryGate = 'dual_drive'
+            Gating   = @('dual_drive', 'clock_sync')
+            Advisory = @('cell_probe', 'npc_census', 'existence_parity',
+                         'suppress_churn', 'anti_zombie', 'smoothness')
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1'
+                         # Provenance for every authored row. This is the one
+                         # scenario built to interrogate the publish filter, so
+                         # it is worth the log volume here and nowhere else.
+                         KENSHICOOP_DEBUG_CENSUS = '1' }
+            Tier = 'probe'; WanVariant = $true
+        }
+
         # ---- interest-managed NPCs + pose ----------------------------------------
         npc_sync = @{
             Save = 'sync'; Setup = ''; Tolerance = 3.0
@@ -1709,6 +1765,76 @@
         # shipping, a shared prisoner whose owner reports chained/locked while the
         # peer's driven copy reports it cleared is a FAIL. Shared-hand parity is
         # asserted; the no-shared-hand identity caveat defers to the manual gate.
+        # lockpick_escape: the ANCHORED-TO-FREE crossing on the rebirth1 prisoner
+        # start. Every other furniture scenario puts a body INTO a held state and
+        # checks the peer follows; this is the release, which is harder - an
+        # anchored body is pinned by furniture both sides can see, a freed one has
+        # to start walking on both clients at once.
+        #
+        # rebirth1 is the fixture because its caged bodies are the PLAYER SQUAD, so
+        # the subject is owned rather than a world prisoner either side might drive.
+        # Presence authority is ON: this scenario deliberately stresses the same
+        # authority boundary the 2026-08-08 dual-drive bug lives on, with the squads
+        # co-located in one cell, so dual_drive rides along as a gate.
+        #
+        # Seconds/KillGraceSec outlive the scenario's own 180 s host window: the
+        # engine picks the lock on its own schedule and the run has to be long
+        # enough to find out what that schedule is.
+        lockpick_escape = @{
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1'
+                         KENSHICOOP_DEBUG_SHACKLE = '1' }
+            Save = 'rebirth1'; Setup = ''; Tolerance = 6.0
+            Seconds = 210; KillGraceSec = 200
+            PrimaryGate = 'lockpick_escape'
+            Gating   = @('lockpick_escape', 'clock_sync')
+            Advisory = @('dual_drive', 'existence_parity', 'suppress_churn', 'smoothness')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # escape_cohesion: the same rebirth1 escape, but asking a different
+        # question. lockpick_escape judges one STATE CROSSING (anchored -> free,
+        # agreed by both sides). This judges what the two clients RENDER while
+        # the freed body travels - same roster, same bodies, no player character
+        # drawn twice, no NPC driven by both sides at once.
+        #
+        # The waypoint is placed just past the nearest zone-cell boundary on
+        # purpose: a cell edge is where presence authority changes hands, which
+        # is the seam the 2026-08-08 dual-drive bug lives on, so the escapee
+        # crosses it rather than wandering near it.
+        #
+        # Both clients aim their camera at the JOIN's escapee. That is not just
+        # framing: protocol 43 folds the camera into the interest anchors, so
+        # both sides stream widely around the same body. Symmetric interest is
+        # what makes "do both clients see the same thing" a fair question, but it
+        # does mean this measures cohesion under a SHARED spotlight - a variant
+        # with independent cameras would be the harder case.
+        #
+        # KENSHICOOP_DEBUG_MARKERS puts the authority class on screen over each
+        # body (green DRV, red CULLED, yellow PARKED) because the screenshots are
+        # part of this scenario's evidence, and CELL_AUTH=1 is what makes the
+        # host label its side too (it only runs enforceHostAuthority with the
+        # flag on) - so the two shots are directly comparable.
+        #
+        # Shots are anchored late, on the release rather than on startup: the
+        # default 'SCENARIO MEMBER' anchor fires ~60 s BEFORE the escape and
+        # would photograph a prisoner sitting in a cage. The host anchors on its
+        # own 'freed' observation because the 'walk' line is owner-only.
+        escape_cohesion = @{
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1'
+                         KENSHICOOP_DEBUG_MARKERS = '1'
+                         KENSHICOOP_DEBUG_SHACKLE = '1' }
+            Save = 'rebirth1'; Setup = ''; Tolerance = 6.0
+            Seconds = 210; KillGraceSec = 200
+            ShotAnchorHost = 'SCENARIO ESCAPE freed side=host'
+            ShotAnchorJoin = 'SCENARIO ESCAPE walk'
+            ShotDelaySec = 8; ShotWaitSec = 120
+            PrimaryGate = 'pc_dupes'
+            Gating   = @('pc_dupes', 'world_parity', 'dual_drive', 'clock_sync')
+            Advisory = @('lockpick_escape', 'existence_parity', 'suppress_churn',
+                         'lifecycle', 'anti_zombie', 'smoothness')
+            Tier = 'probe'; WanVariant = $false
+        }
+
         shackle_sync = @{
             DiagEnv = @{ KENSHICOOP_DEBUG_SHACKLE = '1' }
             Save = 'camp'; Setup = ''; Tolerance = 6.0

@@ -71,7 +71,7 @@ void Replicator::debugMark(Character* c, int colorId, const char* tag) {
     }
 }
 
-void Replicator::applyNpcCensus(Inbound& in) {
+void Replicator::applyNpcCensus(GameWorld* gw, Inbound& in) {
     std::deque<InboundNpcCensus> got;
     in.drainNpcCensus(got);
     if (got.empty()) return;
@@ -92,6 +92,26 @@ void Replicator::applyNpcCensus(Inbound& in) {
     censusPos_.clear();
     unsigned int n = (unsigned int)(nc.hands.size() / 5);
     bool havePos = nc.pos.size() >= (size_t)n * 3;
+    // PER-ROW ownership check (2026-08-08). censusOwner_ is one label for the
+    // whole message, so before this the sender's rows spoke for every cell we
+    // happened to resolve to that sender - including cells the sender does not
+    // own. The publish side already filters, but it filters against the
+    // SENDER's map, and the two maps are only eventually equal: a claim reaches
+    // the peer a round trip after it reaches us, so there is always a window in
+    // which each side resolves a cell differently and both believe they author
+    // it. cellLastOwner_ can make such a window permanent (see Replicator.h),
+    // and rebuilding authority out of converged state to close it was measured
+    // strictly worse - so the receiver has to tolerate disagreement rather than
+    // the publisher having to avoid it.
+    //
+    // Judging each row against OUR map is what makes the window harmless: a row
+    // may only speak for a cell we agree the sender owns, so while the two
+    // disagree, each side simply ignores the other's rows about the contested
+    // region and keeps authoring its own copies. Rejected rows are NOT culled
+    // or hidden - a rejection means we think the cell is ours, and
+    // authorHoldsBody already declines to judge anything in a cell we own, so
+    // the body stays ours to author and nobody else's to enforce against.
+    unsigned int nOff = 0;
     for (unsigned int i = 0; i < n; ++i) {
         Key k;
         k.t  = nc.hands[i * 5 + 0];
@@ -99,22 +119,33 @@ void Replicator::applyNpcCensus(Inbound& in) {
         k.cs = nc.hands[i * 5 + 2];
         k.i  = nc.hands[i * 5 + 3];
         k.s  = nc.hands[i * 5 + 4];
-        censusHands_.insert(k);
+        CensusPos cp;
         if (havePos) {
-            CensusPos cp;
             cp.x = nc.pos[i * 3 + 0];
             cp.y = nc.pos[i * 3 + 1];
             cp.z = nc.pos[i * 3 + 2];
-            censusPos_[k] = cp;
         }
+        // Positionless rows cannot be placed in a cell, so they cannot be
+        // judged and are taken at face value, as before.
+        if (cellAuth_ && gw && havePos &&
+            authorityFor(gw, cp.x, cp.z) != nc.ownerId) {
+            ++nOff;
+            continue;
+        }
+        censusHands_.insert(k);
+        if (havePos) censusPos_[k] = cp;
     }
+    censusOffCell_ += nOff;
     censusRecvMs_ = nowMs();
     static unsigned long logTick = 0;
     if ((censusRecvMs_ - logTick) > 10000) {
         logTick = censusRecvMs_;
-        char b[96];
-        _snprintf(b, sizeof(b) - 1, "[census] recv n=%u culls=%lu",
-                  n, censusCulls_);
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+                  "[census] recv n=%u kept=%u offcell=%u culls=%lu (offcell=%lu "
+                  "cellYields=%lu hostRefus=%lu)",
+                  n, n - nOff, nOff, censusCulls_, censusOffCell_, cellYields_,
+                  hostDriveRefusals_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1033,6 +1064,29 @@ void Replicator::rebuildClaimedCells() {
         if (ex == claimedCells_.end()) claimedCells_[cell] = owner;
         else if (owner == (u32)CELL_OWNER_HOST) ex->second = owner;  // host wins ties
     }
+    // CO-LOCATION COLLAPSE. Splitting authorship by cell exists so the host does
+    // not have to author bodies it cannot enumerate, which is a real problem
+    // only while the squads are apart. Standing in one camp, both clients have
+    // the same bodies loaded and the split just runs a contested boundary
+    // through the middle of the shared area - so hand the lot to the host and
+    // let the join drive, exactly as v0.46 did.
+    //
+    // The rewrite below covers the CLAIMED cells; authoritySrc short-circuits
+    // the rest while collapsed_ holds. Both are needed. Rewriting only the
+    // claimed map left the vacated ones (AUTHSRC_VACATE) still pointing at the
+    // join, and a travelling pair leaves a trail of those behind it - so the
+    // host went on deferring to the join for the ground they had just walked
+    // over, while the join, collapsed, published no census for it. Nothing
+    // authored those bodies, and the host froze them as census-absent: 428
+    // freezes in a session where the collapse was otherwise engaged 90% of the
+    // time (manual session 2026-08-09 15:14).
+    collapsed_ = cellCollapse_ && claimsCoLocated();
+    if (collapsed_) {
+        for (std::map<std::pair<int, int>, u32>::iterator it = claimedCells_.begin();
+             it != claimedCells_.end(); ++it) {
+            it->second = (u32)CELL_OWNER_HOST;
+        }
+    }
     // Remember it, so walking out of a cell does not hand it to the host.
     for (std::map<std::pair<int, int>, u32>::const_iterator it = claimedCells_.begin();
          it != claimedCells_.end(); ++it) {
@@ -1040,16 +1094,75 @@ void Replicator::rebuildClaimedCells() {
     }
 }
 
+bool Replicator::claimsCoLocated() const {
+    // Two passes over the slots rather than one, because "every peer claim is
+    // near SOME host claim" needs the host set complete before any peer claim
+    // can be judged.
+    std::vector<std::pair<int, int> > hostCells;
+    std::vector<std::pair<int, int> > peerCells;
+    for (std::map<std::pair<u32, u32>, CellClaim>::const_iterator it = claimSlots_.begin();
+         it != claimSlots_.end(); ++it) {
+        std::pair<int, int> cell(it->second.cx, it->second.cz);
+        if (it->first.first == (u32)CELL_OWNER_HOST) hostCells.push_back(cell);
+        else peerCells.push_back(cell);
+    }
+    // Silence from either side is not co-location. Before the host's first
+    // claim arrives there is nothing to collapse ONTO, and collapsing anyway
+    // would hand the join's own cell to a host that has not spoken yet.
+    if (hostCells.empty() || peerCells.empty()) return false;
+    for (size_t p = 0; p < peerCells.size(); ++p) {
+        // NOT named 'near': MSVC still reserves it (with 'far') from the 16-bit
+        // memory-model keywords, and the parse failure it produces names the
+        // line after the declaration.
+        bool together = false;
+        for (size_t h = 0; h < hostCells.size() && !together; ++h) {
+            // THE SAME cell, not merely a touching one. Chebyshev 1 was tried
+            // first, on the reasoning that a camp straddling a boundary puts the
+            // two tabs in adjacent cells - and split_far2 refuted it on the
+            // first run: its two towns, a cross-country march apart, are cells
+            // 21,31 and 21,32. A cell is thousands of units wide, so "touching
+            // cells" says nothing about whether the squads can see each other,
+            // and the collapse stayed on through the entire separated leg the
+            // split exists to serve (gate 0/3, the join's own cell resolving to
+            // the host).
+            //
+            // Sharing a cell is a weaker statement than being in arm's reach,
+            // but it errs the safe way: a false negative is merely today's
+            // behaviour, while a false positive hands a whole region to a
+            // client that cannot enumerate it. The straddling camp is the
+            // accepted miss - the alternative, comparing squad POSITIONS,
+            // cannot be used here, because those differ per client and a
+            // threshold over them would flip independently on each side.
+            if (peerCells[p] == hostCells[h]) together = true;
+        }
+        if (!together) return false;  // one straggler is enough to keep the split
+    }
+    return true;
+}
+
 u32 Replicator::authorityFor(GameWorld* gw, float x, float z) const {
-    if (!cellAuth_) return (u32)CELL_OWNER_HOST;
-    int cx = 0, cz = 0;
-    if (!engine::cellAt(gw, x, z, &cx, &cz)) return (u32)CELL_OWNER_HOST;
-    std::pair<int, int> cell(cx, cz);
+    int cx = 0, cz = 0, src = 0;
+    return authoritySrc(gw, x, z, &cx, &cz, &src);
+}
+
+u32 Replicator::authoritySrc(GameWorld* gw, float x, float z,
+                             int* cx, int* cz, int* src) const {
+    *cx = 0; *cz = 0; *src = AUTHSRC_NOMAP;
+    if (!cellAuth_ || !engine::cellAt(gw, x, z, cx, cz)) {
+        return (u32)CELL_OWNER_HOST;
+    }
+    // Collapsed: the host authors EVERY cell, not merely the claimed ones. A
+    // vacated cell answering "join" behind a pair walking together is a cell
+    // nobody ends up authoring, because the join publishes nothing while
+    // collapsed - see rebuildClaimedCells.
+    if (collapsed_) { *src = AUTHSRC_COLLAPSE; return (u32)CELL_OWNER_HOST; }
+    std::pair<int, int> cell(*cx, *cz);
     std::map<std::pair<int, int>, u32>::const_iterator it = claimedCells_.find(cell);
-    if (it != claimedCells_.end()) return it->second;
+    if (it != claimedCells_.end()) { *src = AUTHSRC_CLAIM; return it->second; }
     // Nobody is standing here now; the last client that was still speaks for it.
     std::map<std::pair<int, int>, u32>::const_iterator lo = cellLastOwner_.find(cell);
-    if (lo != cellLastOwner_.end()) return lo->second;
+    if (lo != cellLastOwner_.end()) { *src = AUTHSRC_VACATE; return lo->second; }
+    *src = AUTHSRC_OPEN;
     return (u32)CELL_OWNER_HOST;
 }
 
@@ -1124,6 +1237,7 @@ void Replicator::syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ow
         if (!claimSlots_.empty()) {
             claimSlots_.clear(); claimedCells_.clear(); cellLastOwner_.clear();
         }
+        collapsed_ = false;   // no claims, nothing to collapse onto
         return;
     }
     unsigned long now = nowMs();
@@ -1219,9 +1333,15 @@ void Replicator::syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ow
     if (changed || claimMapMs_ == 0 || (now - claimMapMs_) >= 5000) {
         claimMapMs_ = now;
         char b[256];
-        int off = _snprintf(b, sizeof(b) - 1, "[cell] MAP cells=%u slots=%u",
+        // collapse= is the verdict the last rebuild actually applied, not a
+        // fresh evaluation, so the line can never disagree with the authority
+        // the same tick handed out. Appended AFTER slots= so the oracle's map
+        // parser is unaffected - Get-CellMap takes the tail with (.*)$ and then
+        // scans it for 'x,z=owner' triples, which 'collapse=1' cannot match.
+        int off = _snprintf(b, sizeof(b) - 1, "[cell] MAP cells=%u slots=%u collapse=%u",
                             (unsigned)claimedCells_.size(),
-                            (unsigned)claimSlots_.size());
+                            (unsigned)claimSlots_.size(),
+                            collapsed_ ? 1u : 0u);
         if (off < 0) off = 0;
         for (std::map<std::pair<int, int>, u32>::const_iterator mi = claimedCells_.begin();
              mi != claimedCells_.end() && off < (int)sizeof(b) - 32; ++mi) {
@@ -1661,7 +1781,17 @@ void Replicator::censusFreezeDivergedAi(Character* c, const Key& k, float drift)
 void Replicator::pruneDebugMarkers(const std::set<Character*>& live) {
     for (std::map<Character*, DebugMarker>::iterator it = debugMarkers_.begin();
          it != debugMarkers_.end(); ) {
-        if (live.find(it->first) == live.end()) {
+        // A green DRV label is only ever written while a body is being driven,
+        // and nothing re-captions it when the drive stops: the body stays
+        // enumerated, so it stays 'live' here, and the label outlives the fact
+        // it asserts. That turns the HUD into a record of everything this client
+        // has EVER driven, which reads on screen as both clients driving the
+        // same body - the thing the tag exists to let you rule out. Drop it as
+        // soon as the body leaves the driven set; a resumed drive re-creates it
+        // on the next tick.
+        bool staleDrive = (it->second.color == 0) &&
+                          (drivenChars_.find(it->first) == drivenChars_.end());
+        if (staleDrive || live.find(it->first) == live.end()) {
             engine::markerDestroy(it->second.label);
             debugMarkers_.erase(it++);
         } else ++it;

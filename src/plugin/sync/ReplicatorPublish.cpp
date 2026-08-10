@@ -14,6 +14,7 @@
 namespace coop {
 
 void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
+    localId_ = ownerId;   // the drive path reads it; see the host-side guard
     // Capture the OWNED squad subset first, then (Stage 4) the nearby world NPCs.
     // The net layer chunks the whole vector into datagram-sized batches, so the
     // count is only bounded by MAX_PUBLISH (a bar holds well under that).
@@ -255,6 +256,40 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 if (censusRecvMs_ != 0 && (cNow - censusRecvMs_) <= 5000 &&
                     censusHands_.find(keyOf(buf[n + i])) != censusHands_.end())
                     continue;
+                // Echo guard (2026-08-08, the dual-drive fix). captureNpcs
+                // returns every local NPC in the bubble, and a MINTED PROXY is
+                // one - so a body that exists only because the host streams it
+                // gets captured and published straight back. The host then has
+                // its own body's state arriving from the join, drives its copy
+                // from it, and both clients end up in the other's driven set:
+                // the two bodies escape_cohesion caught (Tako, a Holy Sentinel)
+                // were both cases where the join had no native body at all
+                // (lifecycle: DISCOVERED reason=census-miss, "no local body").
+                //
+                // Anything the peer is streaming to us right now is, by that
+                // fact, theirs to write - whatever our cell map says. This
+                // subsumes the census hold above with a 20 Hz signal instead of
+                // a 1 Hz one, but does not replace it: the census also speaks
+                // for bodies too far out to stream.
+                //
+                // Only the JOIN yields, matching rebuildClaimedCells' host-wins
+                // rule. A symmetric guard would let both sides go quiet at once
+                // on a contested body and then both resume when the streams went
+                // stale, oscillating; with a fixed winner the loop just stops.
+                if (ownerId != (u32)CELL_OWNER_HOST &&
+                    peerStreamFresh(keyOf(buf[n + i]), cNow)) {
+                    ++cellYields_;
+                    if (cellYieldLogged_.insert(keyOf(buf[n + i])).second) {
+                        const Key yk = keyOf(buf[n + i]);
+                        char yb[192]; _snprintf(yb, sizeof(yb) - 1,
+                            "[cell] yield hand=%u,%u,%u,%u,%u pos=%.0f,%.0f,%.0f"
+                            " (host streams it)",
+                            yk.t, yk.c, yk.cs, yk.i, yk.s,
+                            buf[n + i].x, buf[n + i].y, buf[n + i].z);
+                        yb[sizeof(yb) - 1] = '\0'; coop::logLine(yb);
+                    }
+                    continue;
+                }
                 if (nPeerAnch > 0 &&
                     !observedByPeer(keyOf(buf[n + i]), peerAnch, nPeerAnch,
                                     buf[n + i].x, buf[n + i].y, buf[n + i].z))
@@ -350,6 +385,13 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (!engine::captureNpcByHand(gw, mk.i, mk.s, mk.t, mk.c, mk.cs,
                                           &buf[n]))
                 continue;
+            // Re-check authorship against the position we just captured.
+            // midBand_ membership was filtered by weAuthor when publishNpcCensus
+            // last rebuilt the list, but that is 1 Hz: across a claim handover
+            // the stale list keeps streaming bodies in a cell that is no longer
+            // ours for up to a second, which is precisely the window the
+            // dual-drive bug lives in. The row is in hand, so the check is free.
+            if (cellAuth_ && !weAuthor(gw, ownerId, buf[n].x, buf[n].z)) continue;
             bool promote = coop::taskIsCarry(buf[n].task);
             if (!promote && nFast < MID_FAST_MAX &&
                 midBand_[i].dist <= MID_FAST_EDGE && buf[n].cMoving != 0 &&
@@ -389,6 +431,9 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (dup) continue;
             if (engine::captureNpcByHand(gw, mk.i, mk.s, mk.t, mk.c, mk.cs,
                                          &buf[n])) {
+                // Same 1 Hz staleness as the promotion loop above: re-check
+                // authorship against the freshly captured position.
+                if (cellAuth_ && !weAuthor(gw, ownerId, buf[n].x, buf[n].z)) continue;
                 // Movers only (Phase 2 refinement, run 112835): a stationary
                 // far NPC is covered by the 1 Hz census position (park
                 // fallback) - streaming it just fed the join a body to drive
@@ -946,6 +991,25 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             ++nNotMine;
             continue;
         }
+        // The same echo guard the entity stream carries, for the same reason.
+        // Gating only the stream left the slower half of the loop intact: the
+        // join would stop streaming a body the host owns but still vouch for it
+        // here, and a census row is what drives the park/walk/FREEZE
+        // reconciliation - so both clients went on correcting one body's
+        // position between them. That is the residue escape_cohesion caught on
+        // 2026-08-08 (run 213339: hand 1,1754760704 held by both for 62 s with
+        // only 2 host / 8 join frames of stream overlap, and both sides calling
+        // it 'mine' in the roster dumps).
+        //
+        // Census is meant to be a superset of what we stream, so anything
+        // dropped here must also be dropped there - it is, by the guard in
+        // publishOwned, which is keyed on the same question about the same hand.
+        if (cellAuth_ && ownerId != (u32)CELL_OWNER_HOST &&
+            peerStreamFresh(k, nowMs())) {
+            ++nNotMine;
+            ++cellYields_;
+            continue;
+        }
         // k, not states[i]: identical for an ordinary body, and the bound hand for
         // a proxy (above). Position stays local - that is where the body actually
         // is, whichever hand names it.
@@ -1097,14 +1161,40 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             dump = (e && e[0] == '1') ? 1 : 0;
         }
         if (dump == 1) {
+            // Authority PROVENANCE for this publish. weAuthor returning true is
+            // the whole mechanism behind the 2026-08-08 dual drive - the join
+            // authored 43 rows while owning no cell - but the verdict alone
+            // cannot say whether that is the deliberate vacated-cell rule
+            // (cellLastOwner_) or a cell nobody ever claimed falling open. The
+            // two need opposite fixes, so count the authored rows by source.
+            unsigned int bySrc[AUTHSRC_N];
+            for (int s = 0; s < (int)AUTHSRC_N; ++s) bySrc[s] = 0;
+            for (unsigned int i = 0; i < n; ++i) {
+                int cx = 0, cz = 0, src = 0;
+                u32 owner = authoritySrc(gw, states[i].x, states[i].z, &cx, &cz, &src);
+                if (owner == ownerId && src >= 0 && src < (int)AUTHSRC_N) ++bySrc[src];
+            }
+            char ab[256];
+            _snprintf(ab, sizeof(ab) - 1,
+                      "[census] auth mine=%u claim=%u vacated=%u open=%u nomap=%u "
+                      "collapsed=%u cells=%u lastOwner=%u",
+                      m, bySrc[AUTHSRC_CLAIM], bySrc[AUTHSRC_VACATE],
+                      bySrc[AUTHSRC_OPEN], bySrc[AUTHSRC_NOMAP],
+                      bySrc[AUTHSRC_COLLAPSE],
+                      (unsigned)claimedCells_.size(), (unsigned)cellLastOwner_.size());
+            ab[sizeof(ab) - 1] = '\0'; coop::logLine(ab);
             for (unsigned int i = 0; i < n; ++i) {
                 char nm[48];
                 engine::charName(chars[i], nm, sizeof(nm));
-                char r[160];
+                int cx = 0, cz = 0, src = 0;
+                u32 owner = authoritySrc(gw, states[i].x, states[i].z, &cx, &cz, &src);
+                char r[256];
                 _snprintf(r, sizeof(r) - 1,
-                          "[census] row %u hand=%u,%u pos=%.0f,%.0f,%.0f name='%s'",
+                          "[census] row %u hand=%u,%u pos=%.0f,%.0f,%.0f "
+                          "cell=%d,%d owner=%u src=%d mine=%d name='%s'",
                           i, states[i].hIndex, states[i].hSerial,
-                          states[i].x, states[i].y, states[i].z, nm);
+                          states[i].x, states[i].y, states[i].z,
+                          cx, cz, owner, src, owner == ownerId ? 1 : 0, nm);
                 r[sizeof(r) - 1] = '\0'; coop::logLine(r);
             }
         }

@@ -1344,7 +1344,7 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // other's. With cellAuth off the two conditions collapse to today's
         // exclusive split, which is what makes the fail-open A/B meaningful.
         if (!g_cfg.isHost || g_cfg.cellAuth) {
-            g_repl.applyNpcCensus(g_inbound);
+            g_repl.applyNpcCensus(gw, g_inbound);
             g_repl.enforceHostAuthority(gw, g_net.localId());
         }
         if (g_cfg.isHost || g_cfg.cellAuth) {
@@ -1983,6 +1983,7 @@ void configureReplicator() {
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setAttentionRadius(g_cfg.attentionRadius);
         g_repl.setCellAuth(g_cfg.cellAuth);
+        g_repl.setCellCollapse(g_cfg.cellCollapse);
         g_repl.setSpeedCombatCap(g_cfg.speedCombatCap);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
         // Camera-anchored interest (protocol 43): engine-side master enable
@@ -2004,6 +2005,7 @@ void configureReplicator() {
                             g_cfg.scenario == "run_apart" ||
                             g_cfg.scenario == "npc_sync" ||
                             g_cfg.scenario == "world_parity" ||
+                            g_cfg.scenario == "escape_cohesion" ||
                             g_cfg.scenario == "jail_probe" ||
                             g_cfg.scenario == "jail_soak" ||
                             g_cfg.jailProbe);  // manual -JailProbe: no scenario name

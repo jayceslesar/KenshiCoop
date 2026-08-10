@@ -379,6 +379,11 @@ void loadConfig(Config& c) {
         // scenario that does not ask for it, which is what keeps the tier a
         // fail-open proof rather than a co-test of this flag.
         c.cellAuth = envOr("KENSHICOOP_CELL_AUTH", "1") != "0";
+        // Co-location collapse: hand every claimed cell to the host while the
+        // squads are on top of each other. Only consulted when cellAuth is on -
+        // with authority off the host already owns everything. "0" restores the
+        // uncollapsed split, which is the arm the A/B compares against.
+        c.cellCollapse = envOr("KENSHICOOP_CELL_COLLAPSE", "1") != "0";
         // Census-band AI freeze: quiesce a diverging census-band body's local
         // AI so it can't flee/aggro the join's guards. DEFAULT ON; the A/B
         // escape hatch restores the position-park-only behavior.
@@ -473,10 +478,11 @@ std::string describeConfig(const Config& c) {
     char b[192];
     _snprintf(b, sizeof(b) - 1,
               " censusR=%.0f mintR=%.0f park=%.0f walk=%.0f snap=%.1f/%.2fs"
-              " armMs=%lu attnR=%.0f cellAuth=%d",
+              " armMs=%lu attnR=%.0f cellAuth=%d cellCollapse=%d",
               c.censusRadius, c.spawnMintRadius, c.censusParkDist,
               c.censusWalkDist, c.snapDist, c.snapSeconds,
-              c.scenarioArmTimeoutMs, c.attentionRadius, c.cellAuth ? 1 : 0);
+              c.scenarioArmTimeoutMs, c.attentionRadius, c.cellAuth ? 1 : 0,
+              c.cellCollapse ? 1 : 0);
     b[sizeof(b) - 1] = '\0';
     s += b;
     return s;

@@ -136,6 +136,17 @@ struct Config {
     // the flag clear for every scenario that does not ask for it.
     bool         cellAuth;          // KENSHICOOP_CELL_AUTH            (on)
 
+    // Co-location collapse (KENSHICOOP_CELL_COLLAPSE, DEFAULT ON): while the two
+    // squads stand in the SAME zone cell, resolve every claimed cell to the
+    // host, so being in one camp together behaves as v0.46 did while
+    // walking apart still gets per-cell authorship. Measured 2026-08-09 over 4
+    // valid runs per arm of escape_cohesion: host authority took dual_drive 4/4
+    // vs 1/4 and world_parity 4/4 vs 1/4 with no smoothness cost, while the same
+    // A/B on split_far2 had the join keep a steady 11 NPCs at its own town under
+    // cell authority against 5/5/23 without it. Hence a rule that switches on
+    // separation rather than a global winner. A/B escape hatch.
+    bool         cellCollapse;      // KENSHICOOP_CELL_COLLAPSE        (on)
+
     // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI, DEFAULT ON): the join
     // suspends the local AI of a census-band body (census-present, unstreamed)
     // that diverges past censusParkDist_, so a captive/working slave can't flee

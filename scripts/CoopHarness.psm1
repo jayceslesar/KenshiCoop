@@ -50,6 +50,24 @@ $script:CoopDiagEnvKeys = @(
     'KENSHICOOP_INV_DUMP'
     'KENSHICOOP_DEBUG_SPEED'
     'KENSHICOOP_DEBUG_SHACKLE'
+    # On-screen authority labels (Replicator::debugMark): green DRV/HI, red
+    # CULLED, yellow PARKED, gray MID, pinned over each judged body. Purely
+    # visual - nothing is logged per body - so this earns its place in the
+    # keyset only for scenarios whose SCREENSHOTS are part of the evidence
+    # (escape_cohesion). Note the join renders the full set but the host only
+    # renders the drive tiers unless KENSHICOOP_CELL_AUTH=1 also puts it through
+    # enforceHostAuthority, so a scenario wanting both sides labelled must set
+    # both keys.
+    'KENSHICOOP_DEBUG_MARKERS'
+    # Co-location collapse: while the two squads claim the SAME zone cell, every
+    # claimed cell resolves to the host, so a shared camp behaves as v0.46 did
+    # while separated squads keep per-cell authorship. Only meaningful with
+    # KENSHICOOP_CELL_AUTH=1 - with authority off the host already owns the map.
+    'KENSHICOOP_CELL_COLLAPSE'
+    # Per-row census publish dump, plus the '[census] auth' provenance summary
+    # that says whether an authored row came from a live claim, the vacated-cell
+    # rule, or a never-claimed cell falling open to the host.
+    'KENSHICOOP_DEBUG_CENSUS'
     'KENSHICOOP_JAIL_PROBE'
     'KENSHICOOP_TASK_SPIKE'
     'KENSHICOOP_JAIL_OBSERVE'

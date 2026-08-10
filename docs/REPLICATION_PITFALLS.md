@@ -408,3 +408,63 @@ up. Latching whatever the pool reads (recording `moved=0|1`) and saving anyway
 carries the unfixed build to the post-load comparison, where the erase is
 visible and named. A negative control has to REACH the assertion, so no step of
 the script may be gated on a precondition that only the fix satisfies.
+
+## 17. Split authority has to be total, or bodies fall between the halves
+
+Cell authority (protocol 49) hands each side the NPC census for the 4608 u zone
+cells its own squad stands in, instead of the host authoring everywhere. Asking
+which of the two models is better turns out to be the wrong question: measured
+per arm on the same build, host authority took `dual_drive` 4/4 against 1/4 and
+`world_parity` 4/4 against 1/4 with no smoothness cost while the squads stood
+together, and the same A/B run apart had the join hold a steady 11 NPCs at its
+own town under cell authority against 5, 5 and 23 without it. Each model wins
+decisively in one regime. So the rule switches on SEPARATION rather than
+electing a global winner: while both squads claim the same cell, every cell
+resolves to the host (`KENSHICOOP_CELL_COLLAPSE`, default on).
+
+Two ways that went wrong, both instructive:
+
+- **A proximity predicate is not a co-location predicate.** The first version
+  collapsed on Chebyshev distance 1, reasoning that adjacent cells are the same
+  neighbourhood. Cells are 4608 u; two towns a long walk apart can sit in
+  adjacent cells, and `split_far2` — the scenario whose entire premise is that
+  the pair is separated — collapsed onto the host and lost the population it
+  exists to protect. Same cell or nothing.
+- **Collapsing the CLAIMED cells is not collapsing the map.** A pair walking
+  together leaves a trail of cells the join claimed a moment ago, and
+  `authoritySrc` kept handing those to the join as last occupant
+  (`AUTHSRC_VACATE`). But a collapsed join publishes no census at all, so bodies
+  standing in that trail were corroborated by nobody, and the host froze them as
+  census-absent — the visible symptom being a town going still behind the
+  players. While collapsed, `authoritySrc` now returns the host for EVERY cell,
+  claimed, vacated or open.
+
+**Rule.** Any scheme that divides authorship must define an author for every
+region, including the ones nobody currently occupies. A cell whose nominal
+author has stopped publishing is worse than a cell with no author at all,
+because the absence reads as a deliberate "this body is gone".
+
+## 18. A marker written on one edge is a record of history, not of state
+
+`KENSHICOOP_DEBUG_MARKERS` pins a colored label to each judged body — green DRV
+for host-driven, red HID for suppressed, yellow LOC for a local-sim copy. The
+DRV label is written every tick a body is driven, and nothing ever removes it
+when the drive stops: the body is still standing there, so the pruner (which
+destroys labels only for bodies that have vanished) keeps vouching for it. The
+label therefore accumulates into "everything this client has driven at any point
+this session", and since both clients accumulate their own, the same NPC ends up
+green on BOTH screens. That reads on screen as two clients driving one body —
+which is the exact fault the tag exists to let you rule out. It cost a long
+detour chasing a dual-drive that the logs plainly denied: the host had refused
+zero bodies, frozen one, and was receiving nothing but the join's own PC.
+
+The fix is to re-derive the label from the live set rather than trust the edge:
+the prune destroys any green label whose body is absent from `drivenChars_`,
+which the drive rebuilds every tick, so a stopped drive loses its tag within the
+2 s prune cadence and a resumed one re-creates it.
+
+**Rule.** Liveness of the SUBJECT is not liveness of the CLAIM. A diagnostic
+asserting a fact that can stop being true has to be re-asserted on a cadence and
+withdrawn when it lapses — otherwise the instrument manufactures the failure it
+was built to detect, and it does so most convincingly in exactly the long
+sessions where you are least able to check it.

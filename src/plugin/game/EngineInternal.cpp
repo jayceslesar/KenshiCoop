@@ -388,6 +388,7 @@ SetFurnModeFn     g_setBedModeFn      = 0;
 SetFurnModeFn     g_setPrisonModeFn   = 0;
 SetChainedModeFn  g_setChainedModeFn  = 0;
 GetShacklesFn     g_getShacklesFn     = 0;
+GetLockpickChanceFn g_getLockpickChanceFn = 0;
 IsSlaveFn         g_isSlaveFn         = 0;
 SetStealthModeFn  g_setStealthModeFn  = 0;
 NotifySeeSneakFn  g_notifySeeSneakFn  = 0;
@@ -1599,7 +1600,12 @@ void resolve() {
     g_setChainedModeFn = (SetChainedModeFn)KenshiLib::GetRealAddress(&Character::setChainedMode);
     // Phase 6 shackle read lever (non-fatal: unresolved -> readShackle reports
     // only Character::isChained, no shackle-item/lock discrimination).
-    g_getShacklesFn = (GetShacklesFn)KenshiLib::GetRealAddress(&Character::getChainedModeShackles);    // Jail-probe slave-state read (non-fatal: unresolved -> readSlaveState = -1).
+    g_getShacklesFn = (GetShacklesFn)KenshiLib::GetRealAddress(&Character::getChainedModeShackles);
+    // Lockpick chance read (non-fatal: unresolved -> readShackle reports
+    // lockpickChance < 0, i.e. "not measured" rather than "zero chance").
+    g_getLockpickChanceFn =
+        (GetLockpickChanceFn)KenshiLib::GetRealAddress(&Character::getLockpickChance);
+    // Jail-probe slave-state read (non-fatal: unresolved -> readSlaveState = -1).
     g_isSlaveFn = (IsSlaveFn)KenshiLib::GetRealAddress(&Character::isSlave);
     // Stealth sync (protocol 20; non-fatal: unresolved -> stealth sync off).
     g_setStealthModeFn = (SetStealthModeFn)KenshiLib::GetRealAddress(&Character::setStealthMode);
@@ -1804,6 +1810,7 @@ void resolve() {
             { (void**)&g_setPrisonModeFn,   "Character::setPrisonMode",      CAP_FURNITURE,     true },
             { (void**)&g_setChainedModeFn,  "Character::setChainedMode",     CAP_CHAIN,         true },
             { (void**)&g_getShacklesFn,     "Character::getChainedShackles", CAP_SHACKLE,       true },
+            { (void**)&g_getLockpickChanceFn,"Character::getLockpickChance", CAP_SHACKLE,      false },
             { (void**)&g_isSlaveFn,         "Character::isSlave",            CAP_SLAVE,         true },
             { (void**)&g_setStealthModeFn,  "Character::setStealthMode",     CAP_STEALTH,       true },
             { (void**)&g_notifySeeSneakFn,  "Character::notifySeeSneaking",  CAP_STEALTH,       true },

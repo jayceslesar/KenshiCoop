@@ -56,6 +56,18 @@ int  tabLeaderIdx(const EntityState* sq, unsigned int n, unsigned int rank);
 // Fill h[5] (readObjectHand layout) from a captured EntityState's hand fields.
 void handFromEntity(const EntityState& e, unsigned int h[5]);
 
+// ---- Zone-cell geometry (shared by cell_probe and escape_cohesion) ----------
+// engine::cellAt with the two coords swapped by axis, so one bisection body
+// serves both axes.
+bool cellAtAxis(GameWorld* gw, bool axisX, float fixed, float v, int* cx, int* cz);
+// The nearest zone-cell BOUNDARY along one axis, searching in the sign of 'dir'
+// (+1 ascending, -1 descending) from 'start'. Bisected rather than computed
+// from a cell-size constant, so it needs no assumption about the grid origin
+// and keeps working if the mapping changes. Returns false when no boundary is
+// found within 60000 u or the mapping is unreadable.
+bool findCellEdge(GameWorld* gw, bool axisX, float fixed, float start, float dir,
+                  float* outEdge);
+
 // ---- Per-domain factory hooks (each returns 0 when the name is not its own;
 // ---- Scenario.cpp's makeScenario chains them) --------------------------------
 

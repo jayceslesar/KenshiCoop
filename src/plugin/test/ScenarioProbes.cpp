@@ -1903,64 +1903,31 @@ private:
     static const unsigned int  MAX_NPC   = 128;
 
     // ---- grid geometry, measured with the mapping itself ---------------------
-    // getZoneBoundsT would hand back a cell's rect in one call, but it returns a
-    // 16-byte class and the first attempt at its hidden-return-pointer convention
-    // came back as junk. Walking getMapSector until the coord changes needs no
-    // convention at all: it only ever reads an int pair out of RAX, which the
-    // zone.X.Y filenames already confirmed is correct. Two consecutive boundaries
-    // give the size; the second one plus its cell index gives the grid origin, and
-    // with both, the coord of any position is predictable - which is the check.
-    bool cellAtV(const ScenarioContext& ctx, bool axisX, float fixed, float v,
-                 int* cx, int* cz) {
-        return axisX ? engine::cellAt(ctx.gw, v, fixed, cx, cz)
-                     : engine::cellAt(ctx.gw, fixed, v, cx, cz);
-    }
-
-    bool findEdge(const ScenarioContext& ctx, bool axisX, float fixed, float start,
-                  float* outEdge) {
-        int c0x = 0, c0z = 0;
-        if (!cellAtV(ctx, axisX, fixed, start, &c0x, &c0z)) return false;
-        const float LIMIT = 60000.0f, STEP = 100.0f;
-        float lo = start, hi = 0.0f;
-        bool bracket = false;
-        for (float d = STEP; d <= LIMIT; d += STEP) {
-            int cx = 0, cz = 0;
-            if (!cellAtV(ctx, axisX, fixed, start + d, &cx, &cz)) return false;
-            if (cx != c0x || cz != c0z) {
-                lo = start + d - STEP; hi = start + d; bracket = true; break;
-            }
-        }
-        if (!bracket) return false;
-        for (int i = 0; i < 24; ++i) {   // ~0.004 u on a 100 u bracket
-            float mid = 0.5f * (lo + hi);
-            int cx = 0, cz = 0;
-            if (!cellAtV(ctx, axisX, fixed, mid, &cx, &cz)) return false;
-            if (cx == c0x && cz == c0z) lo = mid; else hi = mid;
-        }
-        *outEdge = hi;
-        return true;
-    }
-
+    // cellAtAxis / findCellEdge live in ScenarioSupport.cpp: escape_cohesion
+    // needs the same bisection to walk a freed prisoner across a boundary, and
+    // the split TUs carry a no-duplication rule. Two consecutive boundaries
+    // give the size; the second one plus its cell index gives the grid origin,
+    // and with both, the coord of any position is predictable - the check below.
     void sweepAxis(const ScenarioContext& ctx, bool axisX, float fixed, float from,
                    float* outSize) {
         float e1 = 0.0f, e2 = 0.0f;
-        if (!findEdge(ctx, axisX, fixed, from, &e1)) {
+        if (!findCellEdge(ctx.gw, axisX, fixed, from, 1.0f, &e1)) {
             char b[144];
             _snprintf(b, sizeof(b) - 1, "SCENARIO CELL grid axis=%s no-edge within 60000u",
                       axisX ? "x" : "z");
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             return;
         }
-        if (!findEdge(ctx, axisX, fixed, e1 + 1.0f, &e2)) return;
+        if (!findCellEdge(ctx.gw, axisX, fixed, e1 + 1.0f, 1.0f, &e2)) return;
         float size = e2 - e1;
         int cx = 0, cz = 0;
-        if (!cellAtV(ctx, axisX, fixed, e2 + 1.0f, &cx, &cz)) return;
+        if (!cellAtAxis(ctx.gw, axisX, fixed, e2 + 1.0f, &cx, &cz)) return;
         int idx = axisX ? cx : cz;
         float origin = e2 - (float)idx * size;
         // Predict our own coord from (origin, size) and compare with the engine's.
         int selfIdx = (int)floor(((from - origin) / size));
         int ax = 0, az = 0;
-        cellAtV(ctx, axisX, fixed, from, &ax, &az);
+        cellAtAxis(ctx.gw, axisX, fixed, from, &ax, &az);
         int engineIdx = axisX ? ax : az;
         if (size > 0.0f) *outSize = size;
         char b[288];
@@ -2098,9 +2065,362 @@ private:
 };
 const float CellProbeScenario::TOWN_R = 1200.0f;
 
+// ===========================================================================
+// cell_auth_together - the authority CONVERGENCE case: a tab claims a cell,
+// leaves it, and ends up standing in the peer's cell.
+//
+// The suite had no coverage of the shipped presence-authority default with two
+// squads in one place, and the first version of this scenario just held them
+// there for three minutes on the 'sync' save. That run was clean and is worth
+// keeping as the negative control (join published n=0 enum=47 notmine=47 - it
+// correctly declined to author a cell the host owned), but it proved the
+// arrangement alone is not the trigger.
+//
+// The manual session that exposed the bug shows what the extra ingredient is.
+// The join owned nothing until 11:23, published nothing, and was correct. It
+// then CLAIMED cell 21,19, legitimately authored it, and at 11:27 walked out
+// into the host's 22,19 - after which it kept publishing ~43 rows a tick while
+// its own [cell] MAP listed no cell it owned. From there the two clients'
+// authority maps disagreed (at 11:29 the host resolved 22,19 to the JOIN while
+// the join resolved it to the HOST), and once each side believes the other
+// authors a body, both defer, both enforce the peer's census, and the body is
+// driven twice with nobody authoring it.
+//
+// So the sequence is the experiment, in four phases:
+//   SETTLE  together in the host's cell - the arrangement, before anything moves
+//   AWAY    parked into a neighbouring cell, long enough for the claim to form
+//   BACK    returned to the host's cell, having VACATED the claimed one
+//   EDGE    oscillating across the cell boundary itself
+//
+// BACK reproduces the publish-side half on its own: measured 2026-08-08, the
+// join kept publishing 30 census rows a tick for the rest of the run while its
+// own [cell] MAP listed no cell it owned - cellLastOwner_ still crediting the
+// cell it had left. That is by design (Replicator.h documents it, to stop a
+// join walking out of its town from handing the whole town to the host in one
+// tick), and it is harmless for exactly as long as both sides agree about it.
+// In that run they did, so the host deferred and dual_drive was correctly quiet.
+//
+// EDGE is what breaks the agreement. Each side computes the claim from ITS OWN
+// copy of the tab, and two copies of a body standing on a boundary land in
+// different cells - which is how the manual session reached a host resolving
+// 22,19 to the join while the join resolved it to the host. Standing near a
+// boundary is ordinary play, not a contrived edge case: it is what the user was
+// doing when they saw driven markers on both clients.
+//
+// dual_drive judges the whole run. Only BACK and EDGE can produce an overlap:
+// during AWAY the squads really are in different cells, so each side follows
+// the OTHER's bodies and the two sets are disjoint.
+//
+// The excursion is a park, not a walk. What forms a claim is POSITION, and a
+// 5,000 u round trip through a live town is a pathing lottery that would make
+// the setup - not the authority logic - decide whether the run reproduces.
+// Parking then walking a short leg to re-ground is the CampApproach hop
+// precedent. Destination is chosen by asking engine::cellAt for a point the
+// grid puts in a different cell, so it needs no constant for the cell size and
+// no assumption about which way the boundary runs.
+// ===========================================================================
+class CellAuthTogetherScenario : public Scenario {
+public:
+    CellAuthTogetherScenario()
+        : passed_(false), lastMs_(0), samples_(0), phase_(P_SETTLE),
+          haveHome_(false), hx_(0.0f), hy_(0.0f), hz_(0.0f),
+          homeCx_(0), homeCz_(0), awayCx_(0), awayCz_(0),
+          ax_(0.0f), az_(0.0f), haveAway_(false),
+          ex_(0.0f), ez_(0.0f), edx_(0.0f), edz_(0.0f), haveEdge_(false),
+          lastPhase_(P_SETTLE), edgeSlot_(0), edgeHops_(0),
+          crossed_(false), converged_(false), sawTogether_(false),
+          tabs_(0), tabsDistinct_(0) {}
+
+    virtual const char* name() const { return "cell_auth_together"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CELLTOG start role=%s",
+                  ctx.isHost ? "host" : "join");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.elapsedMs - lastMs_ < SAMPLE_MS && lastMs_ != 0) return false;
+        lastMs_ = ctx.elapsedMs;
+
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, /*leaderOnly*/ false, sq, MAX_SQUAD);
+        if (n == 0) return finish(ctx, "no-squad");
+        const int ownRank = ctx.isHost ? 0 : 1;
+        int own = -1;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (tabRankOf(sq, n, i) == ownRank) { own = (int)i; break; }
+        }
+        if (own < 0) return finish(ctx, "no-own-tab");
+        ++samples_;
+
+        if (!haveHome_) {
+            haveHome_ = true;
+            hx_ = sq[own].x; hy_ = sq[own].y; hz_ = sq[own].z;
+            engine::cellAt(ctx.gw, hx_, hz_, &homeCx_, &homeCz_);
+            if (!ctx.isHost) pickAway(ctx);
+        }
+
+        // The JOIN is the mover: the bug is the JOIN authoring cells it has
+        // left, and the host holding still keeps its own claim constant so the
+        // only thing changing across the run is the thing under test. The host
+        // still advances the phase clock so its telemetry is readable alongside
+        // the join's.
+        phase_ = phaseAt(ctx.elapsedMs);
+        if (!ctx.isHost) driveJoin(ctx, sq[own]);
+        else             idleLeg(ctx, sq[own]);
+
+        measureTabs(ctx, sq, n);
+        if (tabs_ >= 2 && tabsDistinct_ == 1) sawTogether_ = true;
+        int cx = 0, cz = 0;
+        engine::cellAt(ctx.gw, sq[own].x, sq[own].z, &cx, &cz);
+        if (phase_ == P_AWAY && (cx != homeCx_ || cz != homeCz_)) crossed_ = true;
+        if (phase_ == P_BACK && cx == homeCx_ && cz == homeCz_)   converged_ = true;
+
+        char b[352];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO CELLTOG %s t=%lu phase=%s pos=%.0f,%.0f cell=%d,%d "
+            "home=%d,%d away=%d,%d crossed=%d converged=%d together=%d "
+            "tabs=%d tabCells=%d",
+            ctx.isHost ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs,
+            phaseName(), sq[own].x, sq[own].z, cx, cz,
+            homeCx_, homeCz_, awayCx_, awayCz_,
+            crossed_ ? 1 : 0, converged_ ? 1 : 0, sawTogether_ ? 1 : 0,
+            tabs_, tabsDistinct_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+
+        if (ctx.elapsedMs >= DURATION_MS) return finish(ctx, "done");
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    enum Phase { P_SETTLE, P_AWAY, P_BACK, P_EDGE };
+    static const unsigned long SAMPLE_MS   = 1000;
+    static const unsigned long SETTLE_MS   = 20000;
+    static const unsigned long AWAY_MS     = 70000;   // claim dwell is 3 samples @1Hz
+    static const unsigned long BACK_MS     = 110000;
+    static const unsigned long DURATION_MS = 180000;
+    static const unsigned long EDGE_PERIOD_MS = 6000;  // > claim dwell (3 s @1Hz)
+    static const unsigned int  MAX_SQUAD   = 64;
+    static const unsigned int  MAX_TABS    = 8;
+    static const float         IDLE_LEG;
+    static const float         EDGE_LEG;    // half-stride either side of the line
+
+    const char* phaseName() const {
+        switch (phase_) {
+            case P_SETTLE: return "settle";
+            case P_AWAY:   return "away";
+            case P_BACK:   return "back";
+            default:       return "edge";
+        }
+    }
+
+    // A point the grid puts in a NEIGHBOURING cell. Probing outward with
+    // engine::cellAt rather than adding a cell-size constant keeps this correct
+    // if the mapping's resolution ever changes, and trying all four directions
+    // means a squad already sitting near one boundary is not a special case.
+    void pickAway(const ScenarioContext& ctx) {
+        static const float DIR[4][2] = { { 1.0f, 0.0f }, { -1.0f, 0.0f },
+                                         { 0.0f, 1.0f }, { 0.0f, -1.0f } };
+        for (float d = 1000.0f; d <= 12000.0f && !haveAway_; d += 1000.0f) {
+            for (int k = 0; k < 4 && !haveAway_; ++k) {
+                float tx = hx_ + DIR[k][0] * d, tz = hz_ + DIR[k][1] * d;
+                int cx = 0, cz = 0;
+                if (!engine::cellAt(ctx.gw, tx, tz, &cx, &cz)) continue;
+                if (cx == homeCx_ && cz == homeCz_) continue;
+                // Half a probe step past the boundary, so a claim-side dwell
+                // sample cannot land back in the home cell.
+                ax_ = tx + DIR[k][0] * 500.0f;
+                az_ = tz + DIR[k][1] * 500.0f;
+                awayCx_ = cx; awayCz_ = cz;
+                haveAway_ = true;
+            }
+        }
+        if (haveAway_) findEdge(ctx);
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CELLTOG away-pick ok=%d home=%d,%d away=%d,%d at=%.0f,%.0f "
+                  "edge=%d at=%.0f,%.0f",
+                  haveAway_ ? 1 : 0, homeCx_, homeCz_, awayCx_, awayCz_, ax_, az_,
+                  haveEdge_ ? 1 : 0, ex_, ez_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The point on the home/away segment where the grid flips, plus the unit
+    // vector across it. Bisection needs no cell-size constant and no assumption
+    // about which axis the boundary runs along - the same reason pickAway probes
+    // rather than computes.
+    void findEdge(const ScenarioContext& ctx) {
+        float lox = hx_, loz = hz_, hix = ax_, hiz = az_;
+        for (int i = 0; i < 28; ++i) {          // ~0.01 u on a 1500 u segment
+            float mx = 0.5f * (lox + hix), mz = 0.5f * (loz + hiz);
+            int cx = 0, cz = 0;
+            if (!engine::cellAt(ctx.gw, mx, mz, &cx, &cz)) return;
+            if (cx == homeCx_ && cz == homeCz_) { lox = mx; loz = mz; }
+            else                                { hix = mx; hiz = mz; }
+        }
+        float dx = ax_ - hx_, dz = az_ - hz_;
+        float len = (float)sqrt((double)(dx * dx + dz * dz));
+        if (len <= 0.0f) return;
+        edx_ = dx / len; edz_ = dz / len;
+        ex_ = 0.5f * (lox + hix); ez_ = 0.5f * (loz + hiz);
+        haveEdge_ = true;
+    }
+
+    Phase phaseAt(unsigned long t) const {
+        Phase p = t < SETTLE_MS ? P_SETTLE
+                : (t < AWAY_MS  ? P_AWAY
+                : (t < BACK_MS  ? P_BACK : P_EDGE));
+        if (p == P_EDGE && !haveEdge_) return P_BACK;   // no line found: hold
+        return p;
+    }
+
+    void driveJoin(const ScenarioContext& ctx, const EntityState& own) {
+        if (phase_ != lastPhase_) {
+            lastPhase_ = phase_;
+            if (phase_ == P_AWAY && haveAway_) parkTab(ctx, ax_, az_);
+            if (phase_ == P_BACK)              parkTab(ctx, hx_, hz_);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO CELLTOG phase=%s t=%lu",
+                      phaseName(), (unsigned long)ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (phase_ == P_EDGE) edgeStep(ctx);
+        idleLeg(ctx, own);
+    }
+
+    // Put the tab alternately on either side of the boundary.
+    //
+    // The first cut WALKED this leg and it did not work: the tab reached the
+    // home-side target every time and stopped ~4 u short of the boundary going
+    // the other way, so it never once crossed and the claim never churned.
+    // Whatever stopped it (terrain, a building footprint) is not worth
+    // diagnosing, because what forms a claim is POSITION - so park across the
+    // line instead and let pathing out of the experiment entirely.
+    //
+    // The period is the point. A claim needs CELL_DWELL_N samples at 1 Hz
+    // before it is published and is re-asserted every CELL_ASSERT_MS, so
+    // crossing every EDGE_PERIOD_MS keeps the claim perpetually mid-flight:
+    // the owner applies its own new cell at once while the peer is still
+    // holding the previous one. That lag IS the disagreement window, and this
+    // reopens it every few seconds instead of once per run.
+    void edgeStep(const ScenarioContext& ctx) {
+        unsigned long slot = ctx.elapsedMs / EDGE_PERIOD_MS;
+        if (edgeSlot_ != 0 && slot == edgeSlot_) return;
+        edgeSlot_ = slot;
+        float s = (slot % 2) ? EDGE_LEG : -EDGE_LEG;
+        parkTab(ctx, ex_ + edx_ * s, ez_ + edz_ * s);
+        ++edgeHops_;
+    }
+
+    // Teleport every member of our own tab, then let idleLeg re-ground them.
+    void parkTab(const ScenarioContext& ctx, float x, float z) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        const int ownRank = ctx.isHost ? 0 : 1;
+        unsigned int moved = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (tabRankOf(sq, n, i) != ownRank) continue;
+            Character* c = engine::resolve(sq[i]);
+            if (!c) continue;
+            // Fan the members out slightly so they do not stack in one spot.
+            float off = (float)moved * 12.0f;
+            if (engine::park(c, x + off, sq[i].y, z, 0.0f)) ++moved;
+        }
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CELLTOG park to=%.0f,%.0f moved=%u",
+                  x, z, moved);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Keep the tab a live, moving subject rather than a statue - a frozen squad
+    // would not exercise the streaming the census enforcement acts on.
+    void idleLeg(const ScenarioContext& ctx, const EntityState& own) {
+        Character* c = engine::resolve(own);
+        if (!c) return;
+        bool legB = ((ctx.elapsedMs / 4000) % 2) != 0;
+        engine::orderMoveTo(c, own.x + (legB ? IDLE_LEG : 0.0f), own.y, own.z);
+    }
+
+    void measureTabs(const ScenarioContext& ctx, const EntityState* sq, unsigned int n) {
+        unsigned int tc[MAX_TABS][2];
+        int cell[MAX_TABS][2];
+        unsigned int nt = 0;
+        for (unsigned int i = 0; i < n && nt < MAX_TABS; ++i) {
+            bool seen = false;
+            for (unsigned int t = 0; t < nt; ++t)
+                if (tc[t][0] == sq[i].hContainer && tc[t][1] == sq[i].hContainerSerial) {
+                    seen = true; break;
+                }
+            if (seen) continue;
+            int cx = 0, cz = 0;
+            if (!engine::cellAt(ctx.gw, sq[i].x, sq[i].z, &cx, &cz)) continue;
+            tc[nt][0] = sq[i].hContainer; tc[nt][1] = sq[i].hContainerSerial;
+            cell[nt][0] = cx; cell[nt][1] = cz;
+            ++nt;
+        }
+        unsigned int distinct = 0;
+        for (unsigned int a = 0; a < nt; ++a) {
+            bool dup = false;
+            for (unsigned int b = 0; b < a; ++b)
+                if (cell[a][0] == cell[b][0] && cell[a][1] == cell[b][1]) { dup = true; break; }
+            if (!dup) ++distinct;
+        }
+        tabs_ = (int)nt; tabsDistinct_ = (int)distinct;
+    }
+
+    // The run only means something if the join actually made the round trip and
+    // the squads were together for it. Assert it here rather than in a comment,
+    // so a save (or a park) that stopped delivering the arrangement fails loudly
+    // instead of handing dual_drive a configuration it was never meant to judge.
+    // Both sides check sawTogether_ as a LATCH rather than the final sample,
+    // because the run deliberately ENDS with the join straddling a boundary.
+    // The host cannot see the join's excursion flags, so it asserts only what it
+    // observes.
+    bool finish(const ScenarioContext& ctx, const char* why) {
+        if (ctx.isHost) passed_ = (samples_ > 0) && (tabs_ >= 2) && sawTogether_;
+        else            passed_ = (samples_ > 0) && haveAway_ && crossed_ &&
+                                  converged_ && sawTogether_ &&
+                                  (!haveEdge_ || edgeHops_ > 0);
+        char b[320];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO CELLTOG verdict role=%s pass=%d why=%s samples=%d "
+            "away=%d edge=%d edgeHops=%u crossed=%d converged=%d together=%d "
+            "tabs=%d tabCells=%d",
+            ctx.isHost ? "host" : "join", passed_ ? 1 : 0, why, samples_,
+            haveAway_ ? 1 : 0, haveEdge_ ? 1 : 0, edgeHops_, crossed_ ? 1 : 0,
+            converged_ ? 1 : 0, sawTogether_ ? 1 : 0, tabs_, tabsDistinct_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return true;
+    }
+
+    bool  passed_;
+    unsigned long lastMs_;
+    int   samples_;
+    Phase phase_;
+    bool  haveHome_;
+    float hx_, hy_, hz_;
+    int   homeCx_, homeCz_, awayCx_, awayCz_;
+    float ax_, az_;
+    bool  haveAway_;
+    float ex_, ez_, edx_, edz_;
+    bool  haveEdge_;
+    Phase lastPhase_;
+    unsigned long edgeSlot_;
+    unsigned int  edgeHops_;
+    bool  crossed_, converged_, sawTogether_;
+    int   tabs_, tabsDistinct_;
+};
+const float CellAuthTogetherScenario::IDLE_LEG = 15.0f;
+const float CellAuthTogetherScenario::EDGE_LEG = 60.0f;
+
 Scenario* makeProbeScenario(const std::string& name) {
     if (name == "spike")        return new SpikeScenario();
     if (name == "cell_probe")   return new CellProbeScenario();
+    if (name == "cell_auth_together") return new CellAuthTogetherScenario();
     if (name == "shop_probe")   return new ShopProbeScenario();
     if (name == "wallet_probe") return new MoneyPoolScenario(/*probe=*/true);
     if (name == "money_sync")   return new MoneyPoolScenario(/*probe=*/false);

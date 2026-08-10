@@ -483,18 +483,25 @@ function Get-WnpcRows {
     $rows = New-Object System.Collections.ArrayList
     if (-not (Test-Path $File)) { return $rows }
     $off = Get-LogClockOffsetMs -File $File
-    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO WNPC hand=(\d+),(\d+),[\d,]+ pos=([\-\d\.,]+) cls=(\w+) name='([^']*)'(?: task=(\d+) pelvis=(-?[\d\.]+) mv=(-?\d+)(?: carry=(-?\d+))?)?"
+    # hand5 keeps the WHOLE emitted tuple (index,serial,type,container,
+    # containerSerial). 'hand' stays index,serial because every existing caller
+    # pairs on it, but index,serial alone is a weak cross-client key for MINTED
+    # bodies - two engines allocate independently, so the same pair can name two
+    # different bodies. Callers that need identity rather than a pairing hint
+    # (dual_drive's roster signal) match on hand5.
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO WNPC hand=(\d+),(\d+),(\d+),(\d+),(\d+) pos=([\-\d\.,]+) cls=(\w+) name='([^']*)'(?: task=(\d+) pelvis=(-?[\d\.]+) mv=(-?\d+)(?: carry=(-?\d+))?)?"
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
         $t = Convert-StampToMs -Groups $g -OffsetMs $off
-        $p = $g[7].Value.Split(',') | ForEach-Object { [double]$_ }
+        $p = $g[10].Value.Split(',') | ForEach-Object { [double]$_ }
         $task = -1; $pelvis = -1.0; $mv = -1; $carry = -1
-        if ($g[10].Success) { $task = [int]$g[10].Value }
-        if ($g[11].Success) { $pelvis = [double]$g[11].Value }
-        if ($g[12].Success) { $mv = [int]$g[12].Value }
-        if ($g[13].Success) { $carry = [int]$g[13].Value }
+        if ($g[13].Success) { $task = [int]$g[13].Value }
+        if ($g[14].Success) { $pelvis = [double]$g[14].Value }
+        if ($g[15].Success) { $mv = [int]$g[15].Value }
+        if ($g[16].Success) { $carry = [int]$g[16].Value }
         [void]$rows.Add(@{ t = $t; hand = "$($g[5].Value),$($g[6].Value)"
-                           pos = $p; cls = $g[8].Value; name = $g[9].Value
+                           hand5 = "$($g[5].Value),$($g[6].Value),$($g[7].Value),$($g[8].Value),$($g[9].Value)"
+                           pos = $p; cls = $g[11].Value; name = $g[12].Value
                            task = $task; pelvis = $pelvis; mv = $mv; carry = $carry })
     }
     return $rows
@@ -1111,6 +1118,227 @@ function Test-SplitFar2 {
     Write-Host "    (* = the cell's owner, the column gate 3 judges)"
     foreach ($line in $table) { Write-Host $line }
     return (Add-GateResult -Name "split_far2" -Status $v -Metrics $metrics -Detail $why)
+}
+
+# dual_drive gate: no body may be FOLLOWED by both clients at the same time.
+#
+# A census enforcement line ([census] park / walk / FREEZE) is a client saying
+# "I am correcting my local copy of this body toward a position the PEER
+# authored" - i.e. I am the FOLLOWER here, not the author. Exactly one client
+# may say that about a given body at a given moment. When both do, neither is
+# authoritative: each is chasing the other, and the body is driven twice.
+#
+# Found live on 2026-08-08 with presence authority on and both squads standing
+# in ONE cell (22,19) that the host owned. The join owned no cells at all, yet
+# published 43 census rows every 10 s ([census] sent n=43 enum=139 notmine=96)
+# and the host obeyed them - 253 culls, 270 parks, 1727 freezes. 43 hands were
+# followed by both clients, 10 of them concurrently, the worst for 314 s.
+#
+# Scored on OVERLAP DURATION, not on the mere fact of overlap. Authority
+# legitimately hands over as squads move between cells, and a handover has a
+# brief window where both sides act on one body; that is the mechanism working.
+# Minutes of it is the defect. So a hand counts only once its concurrent
+# follow time passes $MinOverlapMs.
+#
+# Two properties of the evidence shape the algorithm:
+#
+# 1. The census log lines are rate limited by a GLOBAL static tick, not a
+#    per-hand one (ReplicatorAuthority.cpp: park ~4 lines/s, walk ~1 line/s for
+#    the whole roster). With 43 bodies parked, any ONE hand surfaces roughly
+#    every ten seconds even while it is being followed every frame. So the log
+#    is a sparse SAMPLE of following, never a complete trace, and a detector
+#    that tried to reconstruct exact intervals from it would mostly measure the
+#    limiter. This one instead takes each side's first-to-last span for a hand
+#    and then demands corroboration: $MinSamples enforcement lines from EACH
+#    side landing INSIDE the shared window. Sparse sampling makes that harder
+#    to satisfy, never easier, so the bias is toward missing a marginal case
+#    rather than failing a good run.
+# 2. [census] logs the LOCAL key (index,serial), and for census-band bodies -
+#    world NPCs baked into the save both clients loaded - that key agrees
+#    across clients, which is what makes the cross-log join valid at all. It
+#    would NOT hold for minted bodies. The [life] lines the same bug report
+#    quotes are in the 5-component wire keyspace and deliberately are not mixed
+#    in here.
+function Test-DualDrive {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$MinOverlapMs = 5000, [int]$MaxHands = 0, [int]$MinSamples = 2)
+
+    # ---- Signal 2: the driven ROSTER, straight from the 5 s WNPC dumps --------
+    # Added 2026-08-08 after watching the DRV labels contradict this gate. A
+    # scenario run showed 18 bodies wearing the green DRV marker on BOTH clients
+    # at once, nine of them across consecutive dumps, while the census signal
+    # below reported a worst overlap of 779 ms and PASSED.
+    #
+    # The two signals are not the same measurement and the census one is the
+    # weaker: [census] park/walk/FREEZE fires only when a followed body has
+    # DIVERGED enough to need correcting, and then only as the global rate
+    # limiter allows. cls=drv is the drive set itself - proxy, or a hand with a
+    # FRESH streamed sample in targets_, or drivenChars_ - which is exactly what
+    # debugMark paints green. So this reads what the screen shows.
+    #
+    # Scored on CONSECUTIVE dumps, not on the count of them. Dumps are 5 s apart
+    # and pairing allows +-$WinMs, so a handover landing between the host's dump
+    # and the join's can put one body in one paired dump legitimately. A run of
+    # two consecutive dumps spans >= 5 s and cannot be that. Measuring the run's
+    # first-to-last span in ms makes a single-dump coincidence score 0 and lets
+    # the same $MinOverlapMs bar mean the same thing for both signals.
+    #
+    # Requires auditRows (the manifest's scenario allowlist in Plugin.cpp). When
+    # the dumps are absent this contributes nothing and the census signal decides
+    # alone, which is the pre-2026-08-08 behaviour.
+    #
+    # Matched on the FULL five-component hand, not on index,serial. index,serial
+    # is a local key that agrees across clients for world NPCs baked into the
+    # shared save but not for MINTED bodies, where the two engines allocate
+    # independently and the same pair can name two different bodies - the caveat
+    # the census signal below already documents. run_apart makes it concrete: its
+    # spawned Dust Bandit raids produced five bodies each apparently "drv on
+    # both" for exactly 25 s, with the paired positions a median 1014-2408 u
+    # apart, i.e. two separate raids beside two separate squads.
+    #
+    # Position was tried as the guard first and REJECTED, which is worth
+    # recording: requiring the pair within 120 u cleared run_apart but also
+    # erased a live-observed double-drive on rebirth1. For a body driven by both
+    # clients, positional divergence is the SYMPTOM - each side keeps applying the
+    # other's stream - so proximity is exactly the wrong thing to demand of the
+    # cases that matter most. The container half of the hand carries identity
+    # without assuming anything about where the body ended up.
+    function Get-DrvBothRuns([string]$HostF, [string]$JoinF, [int]$WinMs) {
+        $hostSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $HostF)
+        $joinSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $JoinF)
+        $paired = New-Object System.Collections.ArrayList
+        foreach ($hsamp in $hostSamples) {
+            $jsamp = $null
+            foreach ($cand in $joinSamples) {
+                if ([math]::Abs($cand.t - $hsamp.t) -gt $WinMs) { continue }
+                if ($null -eq $jsamp -or
+                    [math]::Abs($cand.t - $hsamp.t) -lt [math]::Abs($jsamp.t - $hsamp.t)) { $jsamp = $cand }
+            }
+            if ($null -eq $jsamp) { continue }
+            $hDrv = @{}
+            foreach ($row in $hsamp.rows) { if ($row.cls -eq 'drv') { $hDrv[$row.hand5] = $row } }
+            $both = @{}
+            foreach ($row in $jsamp.rows) {
+                if ($row.cls -ne 'drv') { continue }
+                if (-not $hDrv.ContainsKey($row.hand5)) { continue }
+                $both[$row.hand5] = $row.name
+            }
+            [void]$paired.Add(@{ t = $hsamp.t; both = $both })
+        }
+        $best = @{}; $runStart = @{}; $runLast = @{}
+        for ($i = 0; $i -lt $paired.Count; $i++) {
+            $p = $paired[$i]
+            foreach ($hand in $p.both.Keys) {
+                if (-not $runStart.ContainsKey($hand) -or $runLast[$hand] -ne ($i - 1)) {
+                    $runStart[$hand] = $i
+                }
+                $runLast[$hand] = $i
+                $span = $p.t - $paired[$runStart[$hand]].t
+                if (-not $best.ContainsKey($hand) -or $span -gt $best[$hand].ms) {
+                    $best[$hand] = @{ ms = $span; name = $p.both[$hand]
+                                      dumps = ($i - $runStart[$hand] + 1) }
+                }
+            }
+        }
+        return @{ paired = $paired.Count; hands = $best }
+    }
+
+    # Per-hand sorted enforcement sample times on one client, shared clock.
+    # park has FUTILE and ANCHOR-BREAK variants that are equally evidence of
+    # following, hence the optional qualifier.
+    function Get-FollowSamples([string]$File) {
+        $s = @{}
+        if (-not (Test-Path $File)) { return $s }
+        $off = Get-LogClockOffsetMs -File $File
+        $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[census\] " +
+               "(?:park|walk|FREEZE)(?: [A-Z\-]+)? hand=(\d+,\d+)"
+        foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $h = $g[5].Value
+            if (-not $s.ContainsKey($h)) { $s[$h] = New-Object System.Collections.ArrayList }
+            [void]$s[$h].Add((Convert-StampToMs -Groups $g -OffsetMs $off))
+        }
+        return $s
+    }
+
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "dual_drive" -Status SKIP -Detail "missing log")
+    }
+    # Deliberately NOT $H/$J: PowerShell variable names are case-insensitive, so
+    # a $h loop variable below would silently overwrite the host table.
+    $roster = Get-DrvBothRuns $HostFile $JoinFile 3000
+    $rosterBad = @($roster.hands.GetEnumerator() | Where-Object { $_.Value.ms -ge $MinOverlapMs })
+    $rosterWorst = 0; $rosterWorstHand = ""
+    foreach ($e in $roster.hands.GetEnumerator()) {
+        if ($e.Value.ms -gt $rosterWorst) { $rosterWorst = $e.Value.ms; $rosterWorstHand = $e.Key }
+    }
+
+    $hostSeen = Get-FollowSamples -File $HostFile
+    $joinSeen = Get-FollowSamples -File $JoinFile
+    # Both sides must be following SOMETHING before "both at once" is a question
+    # worth asking. With presence authority off the split is exclusive by
+    # construction - the host follows nothing - so the intersection would be
+    # trivially empty and the gate would report a green it never tested.
+    #
+    # The roster signal is exempt from this: it does not need either side to have
+    # logged a reconciliation event, so when it has paired dumps it can answer
+    # even where the census signal is mute. Only skip when NEITHER can speak.
+    if (($hostSeen.Count -eq 0 -or $joinSeen.Count -eq 0) -and $roster.paired -eq 0) {
+        $which = if ($hostSeen.Count -eq 0 -and $joinSeen.Count -eq 0) { "neither client" }
+                 elseif ($hostSeen.Count -eq 0) { "the host" } else { "the join" }
+        Write-Host "  DUAL-DRIVE SKIP - $which follows any body (host=$($hostSeen.Count) join=$($joinSeen.Count) hands); exclusive authority, nothing to contend"
+        return (Add-GateResult -Name "dual_drive" -Status SKIP `
+                    -Metrics @{ hostHands = $hostSeen.Count; joinHands = $joinSeen.Count } `
+                    -Detail "one side follows nothing (cell authority off?)")
+    }
+
+    $shared = @($hostSeen.Keys | Where-Object { $joinSeen.ContainsKey($_) })
+    $offenders = New-Object System.Collections.ArrayList
+    $worst = 0.0; $worstHand = ""
+    foreach ($hand in $shared) {
+        $hs = @($hostSeen[$hand] | Sort-Object); $js = @($joinSeen[$hand] | Sort-Object)
+        $lo = [Math]::Max($hs[0], $js[0])
+        $hi = [Math]::Min($hs[$hs.Count - 1], $js[$js.Count - 1])
+        $ov = $hi - $lo
+        if ($ov -le 0) { continue }          # sequential handover, not concurrent
+        if ($ov -gt $worst) { $worst = $ov; $worstHand = $hand }
+        $hIn = @($hs | Where-Object { $_ -ge $lo -and $_ -le $hi }).Count
+        $jIn = @($js | Where-Object { $_ -ge $lo -and $_ -le $hi }).Count
+        if ($ov -ge $MinOverlapMs -and $hIn -ge $MinSamples -and $jIn -ge $MinSamples) {
+            [void]$offenders.Add(@{ hand = $hand; ms = $ov; hostN = $hIn; joinN = $jIn })
+        }
+    }
+
+    # Either signal alone is enough to condemn a run: they see different parts of
+    # the same fault and neither is a check on the other.
+    $ok = ($offenders.Count -le $MaxHands) -and ($rosterBad.Count -le $MaxHands)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $metrics = @{
+        hostHands = $hostSeen.Count; joinHands = $joinSeen.Count
+        sharedHands = $shared.Count
+        concurrentHands = $offenders.Count
+        worstOverlapMs = [int]$worst
+        drvPairedDumps = $roster.paired
+        drvBothHands = $roster.hands.Count
+        drvSustainedHands = $rosterBad.Count
+        drvWorstMs = [int]$rosterWorst
+        drvWorstHand = $rosterWorstHand
+    }
+    $top = @($offenders | Sort-Object { -$_.ms } | Select-Object -First 5 |
+             ForEach-Object { "$($_.hand) $([int]($_.ms / 1000))s (host $($_.hostN)/join $($_.joinN) lines)" }) -join ', '
+    $drvTop = @($rosterBad | Sort-Object { -$_.Value.ms } | Select-Object -First 5 |
+                ForEach-Object { "$($_.Key) '$($_.Value.name)' $([int]($_.Value.ms / 1000))s ($($_.Value.dumps) dumps)" }) -join ', '
+    $why = if (-not $ok -and $rosterBad.Count -gt $MaxHands) {
+               "$($rosterBad.Count) body(ies) in the DRIVEN SET of both clients across " +
+               "consecutive dumps: $drvTop" +
+               $(if ($offenders.Count -gt $MaxHands) { "; census signal agrees on $($offenders.Count): $top" } else { "" })
+           } elseif (-not $ok) {
+               "$($offenders.Count) body(ies) followed by BOTH clients at once: $top"
+           } else {
+               "no body corroborated as followed by both clients for more than $([int]($MinOverlapMs / 1000))s"
+           }
+    Write-Host "  DUAL-DRIVE $v - $why (census: shared=$($shared.Count) of host $($hostSeen.Count)/join $($joinSeen.Count) followed hands, widest=$([int]($worst / 1000))s on $worstHand; roster: $($roster.hands.Count) hand(s) drv on both over $($roster.paired) paired dump(s), widest=$([int]($rosterWorst / 1000))s on $rosterWorstHand)"
+    return (Add-GateResult -Name "dual_drive" -Status $v -Metrics $metrics -Detail $why)
 }
 
 # world_parity gate: full-roster tiered cross-comparison on a dense save.
@@ -2219,3 +2447,187 @@ function Test-TownPopParity {
     Write-Host "  TOWN-POP-PARITY $v - $why"
     return (Add-GateResult -Name "town_pop_parity" -Status $v -Metrics $metrics -Detail $why)
 }
+
+# escape_cohesion primary gate: is the escaping PLAYER CHARACTER rendered once,
+# and the same once, on both clients?
+#
+# This is deliberately narrower than world_parity, which asks whether paired
+# bodies agree on POSITION. The failure this gate exists for is a body that
+# should not exist at all: a proxy minted beside a native player body, so the
+# player sees themselves twice. world_parity cannot see that - it pairs by hand,
+# and a duplicate carries a DIFFERENT hand, so the extra body is simply never
+# anybody's pair and drops out of every ratio it computes.
+#
+# Four questions per paired 5 s dump, three of them cheap identity checks and
+# one that does the real work:
+#   1. do host and join list the SAME set of cls=pc hands (nobody's PC is
+#      missing from, or extra on, the other client)
+#   2. does any cls=pc hand appear TWICE in one dump (a duplicate that made it
+#      into playerCharacters)
+#   3. is the PC count what the fixture says it should be
+#   4. does a NON-pc body sit within $DupRadius of a PC
+#
+# (4) is the "two copies on screen" detector, and it works because listNpcsWide
+# skips isPlayerSquad: a native player body can only ever appear as cls=pc, so a
+# second copy of it necessarily surfaces as an NPC-classed row stacked on top of
+# a PC row. It is reported at two strengths, and the measurements say to trust
+# only one of them.
+#
+# A stack whose NAME matches the PC's is a copy of that character and very
+# little else, and it is clean: across four dense 'camp' world_parity runs
+# (20260806_100102 / _113219 / _115304 / _115852) nameStacks was 0 in all of
+# them, at every radius tried. So a name match FAILS.
+#
+# An ANONYMOUS stack is just a body standing close, and in a prison fixture that
+# is the normal state of affairs - those same four runs put an unrelated body
+# within 2 u of a PC in 4% to 44% of client-samples, several at a measured
+# distance of exactly 0 (a Holy Sentinel sharing the caged 'Flashbox' transform).
+# There is therefore no radius at which "something is near a PC" means
+# "duplicate", so $StackFracMax defaults to 1.0: the fraction is measured and
+# printed, not gated. A sparse fixture can tighten it from the manifest.
+function Test-PcDuplicates {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$DupRadius = 4.0, [int]$ExpectPcs = 2,
+          [int]$MinSamples = 6, [int]$WinMs = 6000,
+          [int]$GraceMs = 45000, [int]$TailGraceMs = 1000,
+          [int]$MaxParityBad = 1, [double]$StackFracMax = 1.0)
+    $hostSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $HostFile)
+    $joinSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $JoinFile)
+    if ($hostSamples.Count -lt $MinSamples -or $joinSamples.Count -lt $MinSamples) {
+        Write-Host "  pc-dupes SKIP - $($hostSamples.Count) host / $($joinSamples.Count) join dump sample(s)"
+        return (Add-GateResult -Name "pc_dupes" -Status SKIP `
+                    -Metrics @{ hostSamples = $hostSamples.Count; joinSamples = $joinSamples.Count } `
+                    -Detail "too few worldstate dumps")
+    }
+    $joinT0 = $joinSamples[0].t
+    $joinTEnd = $joinSamples[$joinSamples.Count - 1].t
+
+    $used = 0; $parityBad = 0; $repeatBad = 0; $countBad = 0
+    $stackSamples = 0; $nameStacks = 0
+    $worstStack = -1.0
+    $offenders = @{}     # "side|npcName->pcName" -> hit count
+    $parityWhy = @{}     # "side-only hand" -> count
+    $countSeen = @{}     # "host=2 join=1" -> count
+
+    foreach ($hs in $hostSamples) {
+        if (($hs.t - $joinT0) -lt $GraceMs) { continue }
+        if (($hs.t - $joinTEnd) -gt $TailGraceMs) { continue }
+        $js = $null
+        foreach ($cand in $joinSamples) {
+            if ([math]::Abs($cand.t - $hs.t) -gt $WinMs) { continue }
+            if ($null -eq $js -or [math]::Abs($cand.t - $hs.t) -lt [math]::Abs($js.t - $hs.t)) { $js = $cand }
+        }
+        if ($null -eq $js) { continue }
+        $used++
+
+        foreach ($pair in @(@{ side = "host"; s = $hs }, @{ side = "join"; s = $js })) {
+            # (2) a hand listed twice in ONE EMIT. The timestamp has to be exact:
+            # emitPcRows fires twice within ~25 ms on the host (run
+            # 20260808_143039 logged every PC row at both .829 and .852), and the
+            # 1500 ms grouping window folds those into one sample - so "twice in
+            # this sample" would charge 237 duplicates to a run that had none. A
+            # real duplicate is two rows for one hand inside a SINGLE pass over
+            # playerCharacters, and those share a stamp.
+            $seen = @{}
+            foreach ($r in $pair.s.rows) {
+                if ($r.cls -ne "pc") { continue }
+                $k = "$($r.hand)@$($r.t)"
+                if ($seen.ContainsKey($k)) { $repeatBad++ } else { $seen[$k] = 1 }
+            }
+            # One row per body for the geometry below, for the same reason.
+            $pcByHand = @{}; $npcByHand = @{}
+            foreach ($r in $pair.s.rows) {
+                if ($r.cls -eq "pc") { $pcByHand[$r.hand] = $r } else { $npcByHand[$r.hand] = $r }
+            }
+            $pcs = @($pcByHand.Values)
+            # (4) non-pc bodies stacked on a PC
+            $stacked = $false
+            foreach ($r in $npcByHand.Values) {
+                foreach ($p in $pcs) {
+                    $dx = $r.pos[0] - $p.pos[0]
+                    $dy = $r.pos[1] - $p.pos[1]
+                    $dz = $r.pos[2] - $p.pos[2]
+                    $d = [math]::Sqrt($dx * $dx + $dy * $dy + $dz * $dz)
+                    if ($d -gt $DupRadius) { continue }
+                    $stacked = $true
+                    if ($worstStack -lt 0 -or $d -lt $worstStack) { $worstStack = $d }
+                    $key = "$($pair.side)|$($r.cls) '$($r.name)' on '$($p.name)'"
+                    if ($offenders.ContainsKey($key)) { $offenders[$key]++ } else { $offenders[$key] = 1 }
+                    if ($r.name -ne "" -and $r.name -eq $p.name) { $nameStacks++ }
+                }
+            }
+            if ($stacked) { $stackSamples++ }
+        }
+
+        # (1) same PC roster on both clients, and (3) the expected count
+        $hHands = @($hs.rows | Where-Object { $_.cls -eq "pc" } | ForEach-Object { $_.hand } | Sort-Object -Unique)
+        $jHands = @($js.rows | Where-Object { $_.cls -eq "pc" } | ForEach-Object { $_.hand } | Sort-Object -Unique)
+        $only = @($hHands | Where-Object { $jHands -notcontains $_ }) +
+                @($jHands | Where-Object { $hHands -notcontains $_ })
+        if ($only.Count -gt 0) {
+            $parityBad++
+            foreach ($o in $only) {
+                if ($parityWhy.ContainsKey($o)) { $parityWhy[$o]++ } else { $parityWhy[$o] = 1 }
+            }
+        }
+        if ($hHands.Count -ne $ExpectPcs -or $jHands.Count -ne $ExpectPcs) {
+            $countBad++
+            $ck = "host=$($hHands.Count) join=$($jHands.Count)"
+            if ($countSeen.ContainsKey($ck)) { $countSeen[$ck]++ } else { $countSeen[$ck] = 1 }
+        }
+    }
+
+    if ($used -lt $MinSamples) {
+        Write-Host "  pc-dupes SKIP - only $used paired sample(s) after grace"
+        return (Add-GateResult -Name "pc_dupes" -Status SKIP `
+                    -Metrics @{ paired = $used; hostSamples = $hostSamples.Count
+                                joinSamples = $joinSamples.Count } `
+                    -Detail "too few paired dumps after the $([int]($GraceMs/1000))s grace")
+    }
+
+    # Per-SIDE denominator: checks 2 and 4 run once per client per sample.
+    $stackFrac = [math]::Round($stackSamples / [double]($used * 2), 3)
+    $metrics = @{
+        paired = $used; expectPcs = $ExpectPcs; dupRadius = $DupRadius
+        parityBad = $parityBad; repeatBad = $repeatBad; countBad = $countBad
+        stackSamples = $stackSamples; stackFrac = $stackFrac
+        nameStacks = $nameStacks
+        worstStack = [math]::Round($worstStack, 2)
+        hostSamples = $hostSamples.Count; joinSamples = $joinSamples.Count
+    }
+    $top = @($offenders.GetEnumerator() | Sort-Object -Property Value -Descending |
+             Select-Object -First 3 | ForEach-Object { "$($_.Key) x$($_.Value)" })
+    if ($top.Count -gt 0) { $metrics.stackTop = ($top -join "; ") }
+
+    $why = ""
+    if ($nameStacks -gt 0) {
+        $why = "DUPLICATE player body: $nameStacks sample(s) with a non-pc row " +
+               "carrying a PC's own name within $DupRadius u of it - $($top -join '; ')"
+    } elseif ($repeatBad -gt 0) {
+        $why = "a cls=pc hand was listed TWICE in one dump ($repeatBad time(s)) - " +
+               "the duplicate reached playerCharacters"
+    } elseif ($parityBad -gt $MaxParityBad) {
+        $named = @($parityWhy.GetEnumerator() | Sort-Object -Property Value -Descending |
+                   Select-Object -First 3 | ForEach-Object { "$($_.Key) x$($_.Value)" })
+        $why = "PC rosters disagree in $parityBad of $used paired dump(s) " +
+               "(budget $MaxParityBad) - one-sided: $($named -join ', ')"
+    } elseif ($countBad -gt $MaxParityBad) {
+        $named = @($countSeen.GetEnumerator() | Sort-Object -Property Value -Descending |
+                   Select-Object -First 3 | ForEach-Object { "$($_.Key) x$($_.Value)" })
+        $why = "PC count is not $ExpectPcs in $countBad of $used paired dump(s) " +
+               "(budget $MaxParityBad) - saw $($named -join ', ')"
+    } elseif ($stackFrac -gt $StackFracMax) {
+        $why = "bodies stacked on a PC in $stackFrac of client-samples " +
+               "(max $StackFracMax, closest $($metrics.worstStack) u) - $($top -join '; ')"
+    }
+    $v = if ($why) { "FAIL" } else { "PASS" }
+    if (-not $why) {
+        $why = "$ExpectPcs player character(s), same hands on both clients, no " +
+               "duplicate of any of them over $used paired dump(s) (bodies within " +
+               "$DupRadius u in $stackFrac of client-samples, none name-matching, " +
+               "reported)"
+    }
+    Write-Host "  PC-DUPES $v - $why"
+    return (Add-GateResult -Name "pc_dupes" -Status $v -Metrics $metrics -Detail $why)
+}
+
