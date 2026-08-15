@@ -1,5 +1,5 @@
 # Build setup
 
-This document has moved to keep a single canonical copy (Phase 1 doc hygiene).
-
-See [`resources/BUILD_SETUP.md`](../resources/BUILD_SETUP.md).
+The developer build/test/ship loop now lives in [`DEVELOPING.md`](DEVELOPING.md),
+and `scriptsootstrap_windows.ps1` sets up the toolchain idempotently. See also
+[`ENGINE_FACTS.md`](ENGINE_FACTS.md) for the deps-pin and patch specifics.

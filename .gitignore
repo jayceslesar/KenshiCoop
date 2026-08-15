@@ -78,3 +78,6 @@ nul
 
 # Local-only maintainer notes (release process, etc.) - not for the public repo
 *.local.md
+
+# Agent scratch (PR drafts, notes)
+.claude/
