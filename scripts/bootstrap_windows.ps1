@@ -54,8 +54,14 @@ Sect "Toolchain"
 # MSBuild via VS2022 Build Tools.
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (Test-Path $vswhere) {
-    $vsPath = & $vswhere -latest -requires Microsoft.Component.MSBuild -property installationPath 2>$null
-    if ($vsPath) { Ok "MSBuild present ($vsPath)" }
+    $vsPath = & $vswhere -latest -property installationPath 2>$null
+    $msbuild = $null
+    if ($vsPath) {
+        $msbuild = Get-ChildItem -Path (Join-Path $vsPath "MSBuild") -Filter "MSBuild.exe" -Recurse -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+    }
+    if ($msbuild) { Ok "MSBuild present ($msbuild)" }
+    elseif ($vsPath) { Ok "Visual Studio present ($vsPath); MSBuild resolved by build_plugin.cmd" }
     else { Manual "VS2022 Build Tools with the VCTools workload (winget install Microsoft.VisualStudio.2022.BuildTools, add 'Desktop development with C++')." }
 } else {
     Manual "Visual Studio Installer / vswhere not found - install VS2022 Build Tools (winget install Microsoft.VisualStudio.2022.BuildTools)."
@@ -183,28 +189,34 @@ $patches = @(
     @{ file = Join-Path $enet "host.c";     marker = $null; patch = Join-Path $repo "third_party\enet\patches\0002-enet-socket-hooks.patch" }
 )
 if (Test-Path $enetH) {
-    # Heuristic: patch 0002 introduces enet_set_socket_hooks; if that symbol is
-    # present anywhere the socket-hooks patch is applied. Patch 0001 is C89
-    # for-loop conversions - detect by trying a --check apply.
-    $hooksApplied = Select-String -Path (Join-Path $enet "include\enet\enet.h") -Pattern "enet_set_socket_hooks" -Quiet -ErrorAction SilentlyContinue
+    # The patches carry repo-root-relative paths (a/third_party/enet/enet/...),
+    # so they must be checked/applied from the REPO ROOT, not from inside $enet.
+    # A patch that applies clean is NOT yet applied; one that reverse-applies
+    # clean already is. git's stderr is captured so its "does not apply" noise
+    # never surfaces as a PowerShell error.
+    function Test-GitApply([string]$patch, [string]$extra) {
+        $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+        & git -C $repo apply --check $extra "$patch" 2>$null | Out-Null
+        $rc = $LASTEXITCODE
+        $ErrorActionPreference = $prev
+        return $rc -eq 0
+    }
     foreach ($p in @("0001-enet-c89-for-loops.patch", "0002-enet-socket-hooks.patch")) {
         $pf = Join-Path $repo "third_party\enet\patches\$p"
         if (-not (Test-Path $pf)) { Manual "patch file missing: $p"; continue }
-        if ($p -like "0002*" -and $hooksApplied) { Ok "ENet patch applied: $p"; continue }
-        # Does it apply cleanly (i.e. NOT yet applied)?
-        $check = & git -C $enet apply --check "$pf" 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        if (Test-GitApply $pf "--reverse") { Ok "ENet patch applied: $p"; continue }
+        if (Test-GitApply $pf "") {
             if ($CheckOnly) { Skip "would apply ENet patch $p" }
             else {
-                & git -C $enet apply "$pf" 2>&1 | Out-Null
-                if ($LASTEXITCODE -eq 0) { Fixed "applied ENet patch $p" }
-                else { Manual "ENet patch $p failed to apply - apply it by hand (run from $enet)." }
+                $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+                & git -C $repo apply "$pf" 2>$null | Out-Null
+                $rc = $LASTEXITCODE
+                $ErrorActionPreference = $prev
+                if ($rc -eq 0) { Fixed "applied ENet patch $p" }
+                else { Manual "ENet patch $p failed to apply - apply from repo root by hand." }
             }
         } else {
-            # Fails --check: usually already applied (reverse applies clean).
-            $rev = & git -C $enet apply --reverse --check "$pf" 2>&1
-            if ($LASTEXITCODE -eq 0) { Ok "ENet patch applied: $p" }
-            else { Manual "ENet patch $p neither applies nor reverses cleanly - inspect $enet by hand." }
+            Manual "ENet patch $p neither applies nor reverses cleanly - inspect $enet by hand."
         }
     }
 }
