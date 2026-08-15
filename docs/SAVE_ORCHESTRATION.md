@@ -1,16 +1,9 @@
----
-name: coop-save-orchestration
-description: >-
-  Load and orchestrate Kenshi saves for KenshiCoop debugging and validation.
-  Covers how saves auto-load (env vars + %LOCALAPPDATA%\kenshi\save), which
-  script drives which job (manual_session.ps1 for hands-on debugging,
-  run_test.ps1 / regress.ps1 for validation, bake_scene.ps1 for fixtures), the
-  catalog of named saves and their uses (sync, squad1, duel1, camp, separate,
-  together, ...), and the rule that validation saves must never be overwritten
-  because the host connect-push bakes the live world over the loaded save and
-  clobbers the fixture. Use when launching a co-op session, picking a save for a
-  scenario, baking a fixture, or before doing anything that loads/writes a save.
----
+# Save orchestration & manual sessions
+
+> Working guide for loading/orchestrating Kenshi saves in KenshiCoop, and for
+> running a hands-on two-client session. (Folded in from the former Cursor
+> skills so the knowledge stays with the repo.)
+
 
 # KenshiCoop Save Orchestration
 
@@ -147,3 +140,67 @@ Rules:
   scenario it feeds still passes, then `-Promote` / capture it.
 - If a functional test regresses for no code reason, suspect fixture rot in the
   REPO copy: re-bake (or re-make) the save, promote it, and re-run.
+
+---
+
+  the latest mod build in game.
+disable-model-invocation: true
+---
+
+# Manual Free-Play Session (title screen, side-by-side ultrawide)
+
+A "manual free test" = both clients (host + join) launched on this one machine,
+tiled side-by-side on the ultrawide, left running with NO self-exit and NO
+scenario, so the user drives both characters and eyeballs sync.
+
+`-TitleScreen` boots BOTH clients to the Kenshi main menu with no auto-load and
+no auto-connect. The user then loads a save and goes ONLINE via F2 by hand - the
+real remote-play flow, with full control over which save and connection role.
+
+`scripts/manual_session.ps1` still does the side-by-side ultrawide layout by
+default: it resizes each client to 1720x1440 via `set_video_mode.ps1` (2x1720 =
+3440 wide) and tiles them host-left / join-right on the widest monitor via
+`arrange_windows.ps1`, re-pinning through the load screen.
+
+## Launch command
+
+```
+powershell -ExecutionPolicy Bypass -File scripts/manual_session.ps1 -TitleScreen
+```
+
+This builds the latest DLL, deploys it to both installs, sizes + tiles the two
+windows on the ultrawide, launches host then join to the main menu, and returns
+immediately (windows stay up until closed).
+
+## In-game connect (by hand, after launch)
+1. Load the SAME save on both clients (Continue / Load). NPC sync is
+   resolve-by-hand, so both MUST be on identical saves.
+2. On each window press F2 -> set Connection ONLINE: host role on one client,
+   join role on the other. UDP loopback is preset.
+3. Free-play: each window drives its own character; watch it render/follow on
+   the other.
+
+Do co-op free play on a DEBUG save (`together`, `separate`, `zoom`, or a
+throwaway), NEVER a validation/fixture save (`sync`, `squad1`, `duel1`,
+fixtures): on connect the host `armConnectPush()` bakes the live world over the
+loaded save and rots the fixture. See the `coop-save-orchestration` skill.
+
+## Common variations
+- Reuse the current build (skip the ~minutes-long compile): add `-SkipBuild`.
+- Colored authority markers on the join (green DRV / red HID / yellow LOC):
+  add `-DebugMarkers`.
+- Do not resize/tile (leave windows as-is): add `-NoTile`.
+- Auto-load + auto-connect instead of the title screen: drop `-TitleScreen` and
+  pass `-Save "together" -Inhabit` (host owns rank 0, join owns the rest).
+
+`-Sync` is NOT needed on a single machine - both installs read the same
+per-user save folder.
+
+## Preconditions
+- Windowed mode: tiling requires `kenshi.cfg` Full Screen = No (the script sets
+  the video mode; if a window won't tile, confirm it launched windowed).
+- The join install exists (`scripts/setup_join_install.cmd` created
+  `%USERPROFILE%\Kenshi-Join`).
+
+## Ending the session
+Close both game windows (no auto-exit, no screenshots).

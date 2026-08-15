@@ -18,6 +18,15 @@ automatically.
 > development. Expect rough edges, desyncs, and crashes. Two players is the
 > current design target.
 
+> **This is a maintained fork** (`jayceslesar/KenshiCoop`). It tracks upstream
+> and adds fixes ahead of them landing there — the current focus is making the
+> world-item / inventory replication correct (grey free-item duplicates, the
+> theft bypass, and stolen/free items not vanishing on the peer are fixed here).
+> Both players must run the **same build** — the protocol version is checked at
+> the handshake and a mismatch is rejected. Grab a matched build from the
+> [Releases](https://github.com/jayceslesar/KenshiCoop/releases) page. Developer
+> docs: [`CLAUDE.md`](CLAUDE.md) (working conventions) and [`docs/`](docs).
+
 ## How it works
 
 - `KenshiCoop.dll` is loaded into the game by RE_Kenshi. It hooks the engine via
@@ -36,7 +45,8 @@ src/netsim/       Protocol simulator
 src/prototest/    Wire-protocol unit tests
 src/tunneltest/   Steam-tunnel socket-hook tests
 scripts/          Build, deploy, session, and automated-test tooling (PowerShell)
-docs/             Build guide, engine/API reference, replication pitfalls
+docs/             API reference, replication pitfalls, engine-facts ledger,
+                  save orchestration, developer guide (see docs/ index below)
 third_party/      ENet patches, VC10 compat shim (deps are fetched, not committed)
 ```
 
