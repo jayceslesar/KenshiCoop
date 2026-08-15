@@ -263,6 +263,19 @@ public:
     // applyInventories so the re-home beats the inventory reconcile.
     void applyWeaponPickups(GameWorld* gw, Inbound& in);
 
+    // AFTER engine (protocol 56, BOTH clients): drain received save-native pickup
+    // notices - a peer consumed a ground item the stream never carries (an owned
+    // town/shop item the ownership filter excludes, or a free save-native both
+    // clients loaded) - and destroy OUR still-on-ground copy, located by the
+    // shared identity, template + position (an item's engine hand is per-session
+    // and does not resolve on the other client). Guarded: the match must be a
+    // LIVE ground item of the notice's sid within NATIVE_POS_TOL of the sender's
+    // position, and a copy already in a local bag or already gone is left alone,
+    // so replays, echoes and near-misses are no-ops.
+    void applyNativeTakes(GameWorld* gw, Inbound& in);
+    void sendNativeTaken(NetLink& net, u32 ownerId, const unsigned int ihand[5],
+                         const char* sid, float x, float y, float z, const char* kind);
+
     // BEFORE engine, every tick (Phase W3 convergence): keep groundedWeapons_ honest.
     // Nothing used to prune it, so a cached ground Item* survived the object's despawn and
     // a later re-home handed a dead pointer to the engine. Two jobs:
@@ -1470,6 +1483,17 @@ private:
     // so netId spaces are per-sender and culls are scoped to their owner.
     std::map<std::pair<u32, u32>, WorldProxy> worldProxies_;
     u32                        nextWorldNetId_;
+    // Protocol 56 native-pickup watch: the owned save-natives the spatial scan SAW but
+    // (correctly) excluded from the stream, keyed by their LOCAL hand. Each
+    // publish pass re-resolves every watched hand: entered-a-bag -> send a
+    // PKT_NATIVE_TAKEN notice; unloaded/despawned -> silently forget (never a notice -
+    // an unload must not delete the peer's copy). appliedNativeTakes_ dedupes received
+    // (ownerId, takeId) pairs under reliable resend. Both reset in resetSession().
+    struct NativeWatch { char stringID[48]; float x, y, z; unsigned long lastSeenMs; };
+    std::map<Key, NativeWatch>      nativeWatch_;
+    u32                             nextNativeTakeId_;
+    std::set<std::pair<u32, u32> >  appliedNativeTakes_;
+
     // Load-census latch: false after launch/reload; the first publishWorldItems
     // pass whose scan sees the world populated logs the native census and sets
     // this true. Bookkeeping only (every scan-only item is baseline regardless,
