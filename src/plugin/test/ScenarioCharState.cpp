@@ -1152,8 +1152,16 @@ private:
 // Test-CagePeer gates author/apply/occupancy/no-eject/exit-clean.
 class CagePeerScenario : public TimedScenario {
 public:
-    CagePeerScenario()
-        : TimedScenario("cage_peer_sync", 0), recvCount_(0), lastLogMs_(0), haveL1_(false),
+    // Generalized third-party furniture placement (protocol 36), either direction:
+    //   ownerRank = the tab that OWNS the subject body (KOs/holds/frees it);
+    //   the OTHER client is the ACTOR that places the peer-owned body into the
+    //   furniture (kind_: 1=bed, 2=cage). cage_peer_sync = join owns, host places
+    //   (the guard-jail case). bed_peer_sync = host owns, join places (upstream
+    //   #72.1 - a player bedding a downed ally; the case that used to eject).
+    CagePeerScenario(const char* name, int kind, unsigned int ownerRank)
+        : TimedScenario(name, 0), kind_(kind), ownerRank_(ownerRank),
+          ownerIsHost_(ownerRank == 0),
+          recvCount_(0), lastLogMs_(0), haveL1_(false),
           lastHoldMs_(0), downDone_(false), putDone_(false), outDone_(false),
           putOk_(false), lastPutMs_(0) {}
 
@@ -1162,11 +1170,11 @@ public:
     virtual bool onTick(const ScenarioContext& ctx) {
         if (!haveL1_) latchL1(ctx);
 
-        if (!ctx.isHost && haveL1_) {
-            // Owner-side KO + hold (the join owns L1).
+        if (ctx.isHost == ownerIsHost_ && haveL1_) {
+            // Owner-side KO + hold (this client owns the subject).
             if (!downDone_ && ctx.elapsedMs >= DOWN_AT_MS) {
                 bool ok = engine::orderDownSubject(ctx.gw, l1Hand_);
-                logAct("join down", ok);
+                logAct("owner down", ok);
                 downDone_ = true;
             }
             if (downDone_ && ctx.elapsedMs < HOLD_UNTIL_MS &&
@@ -1176,20 +1184,20 @@ public:
                     l1Hand_[3], l1Hand_[4], l1Hand_[0], l1Hand_[1], l1Hand_[2]);
                 if (c) engine::holdDown(c);
             }
-            // Owner-authored exit: the join frees its own body.
+            // Owner-authored exit: the owner frees its own body.
             if (!outDone_ && ctx.elapsedMs >= OUT_AT_MS) {
-                bool ok = engine::putSubjectInFurniture(ctx.gw, l1Hand_, KIND, false);
-                logAct("join out", ok);
+                bool ok = engine::putSubjectInFurniture(ctx.gw, l1Hand_, kind_, false);
+                logAct("owner out", ok);
                 outDone_ = true;
             }
         }
-        if (ctx.isHost && haveL1_ && ctx.elapsedMs >= PUT_AT_MS &&
+        if (ctx.isHost != ownerIsHost_ && haveL1_ && ctx.elapsedMs >= PUT_AT_MS &&
             ctx.elapsedMs < OUT_AT_MS &&
             (!putDone_ || (!putOk_ && ctx.elapsedMs - lastPutMs_ >= 3000))) {
-            // The guard action: the HOST places the peer-owned driven copy.
+            // The actor places the peer-owned driven copy into the furniture.
             lastPutMs_ = ctx.elapsedMs;
-            putOk_ = engine::putSubjectInFurniture(ctx.gw, l1Hand_, KIND, true);
-            if (!putDone_) { logAct("host put", putOk_); putDone_ = true; }
+            putOk_ = engine::putSubjectInFurniture(ctx.gw, l1Hand_, kind_, true);
+            if (!putDone_) { logAct("actor put", putOk_); putDone_ = true; }
         }
 
         if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
@@ -1204,21 +1212,24 @@ public:
                 logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
                 if ((unsigned int)r != ownRank) sawPeer = true;
             }
-            if (!ctx.isHost && sawPeer) ++recvCount_;
+            if (ctx.isHost == ownerIsHost_ && sawPeer) ++recvCount_;
             if (haveL1_) logFurnLine(ctx.elapsedMs);
         }
 
         unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
         if (ctx.elapsedMs >= dur) {
-            passed_ = ctx.isHost ? (putDone_ && putOk_)
-                                 : (downDone_ && outDone_ && recvCount_ >= 1);
+            bool actor = (ctx.isHost != ownerIsHost_);
+            passed_ = actor ? (putDone_ && putOk_)
+                            : (downDone_ && outDone_ && recvCount_ >= 1);
             return true;
         }
         return false;
     }
 
 private:
-    static const int           KIND = 2; // cage (setPrisonMode)
+    const int          kind_;        // 1=bed, 2=cage
+    const unsigned int ownerRank_;   // tab that owns the subject (0=host, 1=join)
+    const bool         ownerIsHost_;
     static const unsigned long DOWN_AT_MS      = 8000;
     static const unsigned long PUT_AT_MS       = 14000;
     static const unsigned long HOLD_UNTIL_MS   = 42000;
@@ -1230,20 +1241,20 @@ private:
     void latchL1(const ScenarioContext& ctx) {
         EntityState sq[MAX_SQUAD];
         unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
-        int idx = tabLeaderIdx(sq, n, 1);
+        int idx = tabLeaderIdx(sq, n, ownerRank_);
         if (idx < 0) return;
         handFromEntity(sq[idx], l1Hand_);
         haveL1_ = true;
         char b[128];
         _snprintf(b, sizeof(b) - 1, "SCENARIO FURN L1 hand=%u,%u kind=%d",
-                  l1Hand_[3], l1Hand_[4], KIND);
+                  l1Hand_[3], l1Hand_[4], kind_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
     void logAct(const char* what, bool ok) {
         char b[144];
         _snprintf(b, sizeof(b) - 1, "SCENARIO FURNACT %s hand=%u,%u kind=%d ok=%d",
-                  what, l1Hand_[3], l1Hand_[4], KIND, ok ? 1 : 0);
+                  what, l1Hand_[3], l1Hand_[4], kind_, ok ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
@@ -2419,7 +2430,8 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "cage_put")     return new FurnPutScenario(2);
     if (name == "chain_put")    return new FurnPutScenario(3);
     if (name == "pole_put")     return new FurnPutScenario(4);
-    if (name == "cage_peer_sync") return new CagePeerScenario();
+    if (name == "cage_peer_sync") return new CagePeerScenario("cage_peer_sync", /*kind=*/2, /*ownerRank=*/1);
+    if (name == "bed_peer_sync")  return new CagePeerScenario("bed_peer_sync",  /*kind=*/1, /*ownerRank=*/0);
     if (name == "sneak_probe")  return new SneakProbeScenario();
     if (name == "sneak_pose")   return new SneakPoseScenario();
     if (name == "sneak_detect") return new SneakDetectScenario();

@@ -953,6 +953,18 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
         }
+        # bed_peer_sync (upstream #72.1): the REVERSE direction of cage_peer_sync -
+        # the HOST owns the subject and the JOIN places its downed body into a BED.
+        # Before the fix, third-party furniture authoring was host-only, so a join
+        # placing a peer's body had no authoring path and its self-heal ejected the
+        # body onto the floor. Same bedcage1 fixture + role-agnostic Test-CagePeer.
+        bed_peer_sync = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'cage_peer'
+            Gating   = @('cage_peer', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
 
         # sneak_probe: protocol-20 phase-0 spike (host-side, log-only). The host
         # forces stealthMode on its DRIVEN copy of the join's leader near the bar

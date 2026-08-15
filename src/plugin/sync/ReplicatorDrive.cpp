@@ -739,17 +739,25 @@ void Replicator::applyTargets(GameWorld* gw) {
                     out.hIndex, out.hSerial, ok ? 1 : 0);
                 bfe[sizeof(bfe) - 1] = '\0'; coop::logLine(bfe);
             } else if (localKind != 0) {
-                // Third-party placement authority (protocol 36): a HOST-sim
-                // actor (a guard jailing an arrested player) put this PEER-
-                // OWNED squad body into furniture. The occupant's owner never
-                // sees the action, so the occupant-owner ENTER can't fire -
-                // the owner's stream keeps reporting no bit and the debounced
+                // Third-party placement authority (protocol 36): an actor on
+                // THIS client (a guard jailing an arrested player, OR a player
+                // carrying a downed ally into a bed - upstream #72.1) put this
+                // PEER-OWNED squad body into furniture. The occupant's owner
+                // never sees the action, so the occupant-owner ENTER can't fire
+                // - the owner's stream keeps reporting no bit and the debounced
                 // HEAL EXIT below ejected the body every 3 s ("the host kept
-                // taking it out of the cage", 2026-07-09). The host is the
-                // world authority for NPC actions: author the ENTER for the
-                // owner (buffered; publishOwned sends), HOLD the self-heal
-                // exit while it crosses, and re-author every FURN_PEER_MS
-                // until the owner's stream carries the bit. KO'd/down bodies
+                // taking it out of the cage", 2026-07-09; and symmetrically the
+                // JOIN could never bed a host-owned downed body - #72.1). The
+                // CLIENT THAT PERFORMED THE PLACEMENT authors the ENTER for the
+                // owner (buffered; publishOwned sends - NOT host-gated), HOLDS
+                // the self-heal exit while it crosses, and re-authors every
+                // FURN_PEER_MS until the owner's stream carries the bit. This is
+                // NOT host-only: the receive path (ReplicatorSpawn EVT_ENTER_
+                // FURNITURE) keys on the occupant hand + own-body down/already/
+                // justExited guards, not on the sender, so a join-authored enter
+                // for the host's own KO'd body applies exactly as the reverse
+                // does. Restricted to player-squad bodies (isSquad) - world NPCs
+                // still author only via their streamNpcs_ owner. KO'd/down bodies
                 // only - a conscious voluntary use stays owner-authored, which
                 // (protocol 53) is why the crawlers are excluded by name: a
                 // crippled body reads Character::isDown() while conscious, so
@@ -758,7 +766,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 bool downish = coop::bodyDownNotCrawling(out.bodyState) ||
                                d.koLatched || d.deathLatched ||
                                coop::bodyDownNotCrawling(engine::readBodyState(c));
-                if (streamNpcs_ && isSquad && downish) {
+                if (isSquad && downish) {
                     if (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS) {
                         d.furnPeerTick = now;
                         PendFurnEnter pe;

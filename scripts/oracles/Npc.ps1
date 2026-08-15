@@ -1114,70 +1114,78 @@ function Test-PolePut {
 #   exit-clean - after the join's owner-side out, both sides' final series
 #                read in=0.
 function Test-CagePeer {
+    # Role-agnostic third-party furniture placement (protocol 36), either direction:
+    # cage_peer_sync (join owns, host places, kind=2) OR bed_peer_sync (host owns,
+    # join places, kind=1 - upstream #72.1). The ACTOR is whichever client logged
+    # 'FURNACT actor put'; the OWNER is the other (it logs 'owner out'). kind is read
+    # from the latch marker, so this one oracle judges both scenarios.
     param([string]$HostFile, [string]$JoinFile, [int]$MaxLatencyMs = 12000)
-    $mk = Select-String -Path $JoinFile -Pattern 'SCENARIO FURN L1 hand=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $mk = Select-String -Path $HostFile -Pattern 'SCENARIO FURN L1 hand=(\d+),(\d+) kind=(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mk) { $mk = Select-String -Path $JoinFile -Pattern 'SCENARIO FURN L1 hand=(\d+),(\d+) kind=(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1 }
     if ($null -eq $mk) {
-        Write-Host "  CAGE-PEER FAIL - L1 never latched on the join"
-        return (Add-GateResult -Name "cage_peer" -Status FAIL -Detail "no L1 latch")
+        Write-Host "  CAGE-PEER FAIL - subject never latched"
+        return (Add-GateResult -Name "cage_peer" -Status FAIL -Detail "no subject latch")
     }
     $subj = ($mk.Matches[0].Groups[1].Value + ',' + $mk.Matches[0].Groups[2].Value)
+    $kind = [int]$mk.Matches[0].Groups[3].Value
     $bad = @(); $m = @{}
 
-    # Author-side markers: the host's put landed, the join's out landed.
-    $pk = Select-String -Path $HostFile -Pattern 'SCENARIO FURNACT host put hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $pk) { $bad += "host put never landed (no ok=1 marker)" }
-    $ok2 = Select-String -Path $JoinFile -Pattern 'SCENARIO FURNACT join out hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $ok2) { $bad += "join out never landed (no ok=1 marker)" }
+    # Detect ACTOR (placed the body) vs OWNER by where 'actor put ok=1' landed.
+    $putHost = Select-String -Path $HostFile -Pattern 'SCENARIO FURNACT actor put hand=[\d,]+ kind=\d+ ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $putJoin = Select-String -Path $JoinFile -Pattern 'SCENARIO FURNACT actor put hand=[\d,]+ kind=\d+ ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if     ($null -ne $putHost) { $actorFile = $HostFile; $ownerFile = $JoinFile; $actorName = 'host'; $ownerName = 'join' }
+    elseif ($null -ne $putJoin) { $actorFile = $JoinFile; $ownerFile = $HostFile; $actorName = 'join'; $ownerName = 'host' }
+    else {
+        Write-Host "  CAGE-PEER FAIL - actor put never landed (no ok=1 marker on either client)"
+        return (Add-GateResult -Name "cage_peer" -Status FAIL -Detail "actor put never landed")
+    }
+    $ownerOut = Select-String -Path $ownerFile -Pattern 'SCENARIO FURNACT owner out hand=[\d,]+ kind=\d+ ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $ownerOut) { $bad += "owner out never landed (no ok=1 marker)" }
 
-    # 1. Third-party authorship on the host.
-    $authored = (Select-String -Path $HostFile -Pattern ('\[furn\] SEND PEER-ENTER id=\d+ occ=' + [regex]::Escape($subj)) -Quiet)
-    if (-not $authored) { $bad += "host never authored SEND PEER-ENTER for L1" }
-    # 2. Own-body apply on the join.
-    $applied = (Select-String -Path $JoinFile -Pattern ('\[furn\] RECV ENTER id=\d+ occ=' + [regex]::Escape($subj) + ' .*ok=1') -Quiet)
-    if (-not $applied) { $bad += "join never applied the enter to its own body" }
+    # 1. Third-party authorship on the ACTOR. 2. Own-body apply on the OWNER.
+    $authored = (Select-String -Path $actorFile -Pattern ('\[furn\] SEND PEER-ENTER id=\d+ occ=' + [regex]::Escape($subj)) -Quiet)
+    if (-not $authored) { $bad += "actor never authored SEND PEER-ENTER" }
+    $applied = (Select-String -Path $ownerFile -Pattern ('\[furn\] RECV ENTER id=\d+ occ=' + [regex]::Escape($subj) + ' .*ok=1') -Quiet)
+    if (-not $applied) { $bad += "owner never applied the enter to its own body" }
 
     if ($bad.Count -eq 0) {
-        $Tp = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO FURNACT host put '
-        $Td = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO FURNACT join out '
-        $J = Get-FurnSeries -File $JoinFile -HandIS $subj
-        $H = Get-FurnSeries -File $HostFile -HandIS $subj
-        # 3. Occupancy on the JOIN (its own body entered the cage).
-        $jIn = @($J | Where-Object { $_.t -ge $Tp -and $_.t -le $Td -and $_.in -eq 2 })
-        if ($jIn.Count -lt 1) {
-            $bad += "join's own body never read in=2"
+        $Tp = Get-MarkerTimeMs -File $actorFile -Pattern 'SCENARIO FURNACT actor put '
+        $Td = Get-MarkerTimeMs -File $ownerFile -Pattern 'SCENARIO FURNACT owner out '
+        $O = Get-FurnSeries -File $ownerFile -HandIS $subj
+        $A = Get-FurnSeries -File $actorFile -HandIS $subj
+        # 3. Occupancy on the OWNER (its own body entered the furniture).
+        $oIn = @($O | Where-Object { $_.t -ge $Tp -and $_.t -le $Td -and $_.in -eq $kind })
+        if ($oIn.Count -lt 1) {
+            $bad += "owner's own body never read in=$kind"
         } else {
-            $enterLat = [int]($jIn[0].t - $Tp)
-            $m["EnterLatMs"] = $enterLat
+            $enterLat = [int]($oIn[0].t - $Tp); $m["EnterLatMs"] = $enterLat
             if ($enterLat -gt $MaxLatencyMs) { $bad += "enter latency ${enterLat}ms > $MaxLatencyMs" }
-        }
-        # 4. No eject on the HOST: no self-heal exit for L1, and once its copy
-        # entered, no in=0 dwell inside the hold window (2 consecutive samples
-        # = ~1 s, well under the old 3 s eject-repark cycle's visibility).
-        $healExit = (Select-String -Path $HostFile -Pattern ('\[furn\] HEAL EXIT occ=' + [regex]::Escape($subj)) -Quiet)
-        if ($healExit) { $bad += "host self-heal EJECTED the body (HEAL EXIT fired)" }
-        $hIn = @($H | Where-Object { $_.t -ge $Tp -and $_.t -le $Td -and $_.in -eq 2 })
-        if ($hIn.Count -ge 1) {
-            $zeros = 0; $maxZeros = 0
-            foreach ($s in @($H | Where-Object { $_.t -ge $jIn[0].t -and $_.t -le ($Td - 1000) })) {
-                if ($s.in -eq 0) { $zeros++; if ($zeros -gt $maxZeros) { $maxZeros = $zeros } }
-                else { $zeros = 0 }
+            # 4. No eject on the ACTOR: no self-heal exit, no in=0 dwell mid-hold.
+            $healExit = (Select-String -Path $actorFile -Pattern ('\[furn\] HEAL EXIT occ=' + [regex]::Escape($subj)) -Quiet)
+            if ($healExit) { $bad += "actor self-heal EJECTED the body (HEAL EXIT fired)" }
+            $aIn = @($A | Where-Object { $_.t -ge $Tp -and $_.t -le $Td -and $_.in -eq $kind })
+            if ($aIn.Count -ge 1) {
+                $zeros = 0; $maxZeros = 0
+                foreach ($s in @($A | Where-Object { $_.t -ge $oIn[0].t -and $_.t -le ($Td - 1000) })) {
+                    if ($s.in -eq 0) { $zeros++; if ($zeros -gt $maxZeros) { $maxZeros = $zeros } } else { $zeros = 0 }
+                }
+                $m["ActorZeroDwell"] = $maxZeros
+                if ($maxZeros -ge 4) { $bad += "actor copy left the furniture mid-hold ($maxZeros consecutive in=0 samples)" }
+            } else {
+                $bad += "actor copy never read in=$kind (put never took?)"
             }
-            $m["HostZeroDwell"] = $maxZeros
-            if ($maxZeros -ge 4) { $bad += "host copy left the cage mid-hold ($maxZeros consecutive in=0 samples)" }
-        } else {
-            $bad += "host copy never read in=2 (put never took?)"
         }
         # 5. Exit clean: both final samples read in=0.
-        if ($J.Count -ge 1 -and $J[$J.Count-1].in -ne 0) { $bad += "join's final sample still occupied (in=$($J[$J.Count-1].in))" }
-        if ($H.Count -ge 1 -and $H[$H.Count-1].in -ne 0) { $bad += "host's final sample still occupied (in=$($H[$H.Count-1].in))" }
+        if ($O.Count -ge 1 -and $O[$O.Count-1].in -ne 0) { $bad += "owner's final sample still occupied (in=$($O[$O.Count-1].in))" }
+        if ($A.Count -ge 1 -and $A[$A.Count-1].in -ne 0) { $bad += "actor's final sample still occupied (in=$($A[$A.Count-1].in))" }
     }
 
     $v = if ($bad.Count -eq 0) { "PASS" } else { "FAIL" }
     $detail = $bad -join "; "
-    Write-Host "  CAGE-PEER $v - authored=$authored applied=$applied enterLat=$($m.EnterLatMs)ms hostZeroDwell=$($m.HostZeroDwell) $detail"
+    Write-Host "  CAGE-PEER $v - $actorName places $ownerName kind=$kind authored=$authored applied=$applied enterLat=$($m.EnterLatMs)ms actorZeroDwell=$($m.ActorZeroDwell) $detail"
     return (Add-GateResult -Name "cage_peer" -Status $v `
-                -Metrics @{ authored = $authored; applied = $applied
-                            enterLatMs = $m.EnterLatMs; hostZeroDwell = $m.HostZeroDwell } -Detail $detail)
+                -Metrics @{ authored = $authored; applied = $applied; kind = $kind; actor = $actorName
+                            enterLatMs = $m.EnterLatMs; actorZeroDwell = $m.ActorZeroDwell } -Detail $detail)
 }
 
 # sneak_probe (protocol 20 phase 0, host-side spike): the host forced
