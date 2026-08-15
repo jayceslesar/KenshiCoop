@@ -2146,7 +2146,7 @@ int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
 int fabricateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
                             const char* sid, unsigned int typeCat, int qualityBucket,
                             const char* manufacturer, const char* material,
-                            float x, float y, float z, void** outDropped) {
+                            unsigned char level, float x, float y, float z, void** outDropped) {
     if (outDropped) *outDropped = 0;
     if (!gw || !sid || !sid[0]) return 0;
     RootObject* ro = resolveObjectByHand(ownerHand);
@@ -2154,8 +2154,10 @@ int fabricateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
     // Create LOOSE (equip state is irrelevant - it is about to be dropped anyway).
+    // level (protocol 57) rebuilds the item at the author's craft grade instead of
+    // the factory default; GRADE_NA leaves createItem's levelOverride at default.
     if (!createItemAndAdd(gw, inv, sid, typeCat, 1, qualityBucket, false,
-                          manufacturer, material))
+                          manufacturer, material, level))
         return 0;
     // Now the normal conservation path has a real copy to move.
     return relocateWeaponToGround(gw, ownerHand, sid, typeCat, x, y, z, outDropped);

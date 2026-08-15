@@ -1514,7 +1514,7 @@ private:
     //   free ground weapon near the character is a drop. seeded=false on first sight (we
     //   record the baseline without emitting a spurious drop). nextDropId_ hands out per-
     //   sender monotonic ids. appliedDrops_ dedupes received intents by (ownerId,dropId).
-    struct WCensusItem { char manufacturer[48]; char material[48]; u16 quality; int count; unsigned int itemType; };
+    struct WCensusItem { char manufacturer[48]; char material[48]; u16 quality; u8 level; int count; unsigned int itemType; };
     // NOTE the constructor. weaponCensus_[key] VALUE-initializes this struct, but because
     // the std::map members make its implicit default constructor non-trivial, the C++03
     // rules this toolchain follows do NOT zero the scalars first - `seeded` came up as

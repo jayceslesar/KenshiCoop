@@ -2216,6 +2216,21 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $false
         }
+        # xbow_grade (upstream #41): a CROSSBOW keeps its craft GRADE across a drop + peer
+        # pickup. Crossbow is itemType 107 (a separate type from WEAPON=2); before the
+        # conservation-channel fix crossbows fell into the grade-less W1 stream and the peer
+        # rebuilt them at the factory-default grade. The host mints a reference crossbow at a
+        # distinctive grade, drops it, and the join picks it up into the tab it owns; the
+        # oracle gates that the join's post-transfer grade equals the host's minted grade.
+        # Same two-tab shape as inv_regear.
+        xbow_grade = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'xbow_grade'
+            Gating   = @('xbow_grade', 'clock_sync')
+            Advisory = @('smoothness', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # Same round trip with the author's FIRST re-home refused. That is the case that
         # used to strand the item in both places forever - the author tried once, off a
         # cached pointer, and never revisited it. Now it retries and, once it can READ the

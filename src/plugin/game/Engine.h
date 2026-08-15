@@ -854,16 +854,25 @@ bool installItemDropHook();
 unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut);
 
 // ---- Conservation channel item types (single source of truth) --------------
-// itemType 2 = WEAPON, 3 = ARMOUR/clothing, 46 = worn CONTAINER (backpack). All
-// are non-stackable EQUIPPABLE gear, so each unit is a distinct object the peer
-// already mirrors via the shared save - the real object can be relocated
-// bag<->ground on every client and re-homed on pickup WITHOUT fabrication. The
-// W1 template-proxy stream handles everything else (stacks, loot) and skips
-// these. Defined here, in the engine layer, because BOTH the engine capture
+// itemType 2 = WEAPON, 3 = ARMOUR/clothing, 46 = worn CONTAINER (backpack),
+// 107 = CROSSBOW. All are non-stackable EQUIPPABLE gear (Gear subclasses), so
+// each unit is a distinct object the peer already mirrors via the shared save -
+// the real object can be relocated bag<->ground on every client and re-homed on
+// pickup WITHOUT fabrication. That relocation is what preserves an item's craft
+// GRADE (Gear::level_0_100) across a transfer. The W1 template-proxy stream
+// handles everything else (stacks, loot) and skips these.
+//
+// CROSSBOW (107) is a SEPARATE itemType from WEAPON (2) - a Crossbow object is a
+// Weapon/Gear subclass but its GameData::type is CROSSBOW - so omitting it here
+// routed crossbows into the grade-less W1 stream and the peer rebuilt them at
+// factory-default grade (upstream #41). It carries no nested inventory
+// (isContainerItemType stays false, 107 != 46), so fabrication is still allowed.
+//
+// Defined here, in the engine layer, because BOTH the engine capture
 // (captureWeaponPtrs) and the Replicator census must agree; two copies of this
 // predicate drifted before and silently excluded backpacks from conservation.
 inline bool isConservedItemType(unsigned int t) {
-    return t == 2u || t == 3u || t == 46u;
+    return t == 2u || t == 3u || t == 46u || t == 107u;
 }
 
 // A worn CONTAINER (backpack) carries a NESTED inventory that no channel
@@ -967,7 +976,8 @@ int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
 int fabricateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
                             const char* sid, unsigned int typeCat, int qualityBucket,
                             const char* manufacturer, const char* material,
-                            float x, float y, float z, void** outDropped = 0);
+                            unsigned char level, float x, float y, float z,
+                            void** outDropped = 0);
 
 // SEH-guarded (Phase W3): capture the WEAPON items the object at cHand holds, with their real
 // Item* handles, so the drop detector can track the exact dropped object for a later pickup.

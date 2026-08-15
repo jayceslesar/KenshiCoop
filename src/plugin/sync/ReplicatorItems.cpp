@@ -952,6 +952,7 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 strncpy(wc.manufacturer, items[i].manufacturer, sizeof(wc.manufacturer) - 1);
                 strncpy(wc.material,     items[i].material,     sizeof(wc.material) - 1);
                 wc.quality  = items[i].quality;
+                wc.level    = items[i].level;   // craft grade (protocol 57), for heal-fabricate
                 wc.itemType = items[i].itemType;
             }
             wc.count += q;
@@ -1201,6 +1202,7 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 pkt.oIndex = it->i; pkt.oSerial = it->s;
                 strncpy(pkt.stringID, pe->first.c_str(), sizeof(pkt.stringID) - 1);
                 pkt.itemType = gtype; pkt.quality = pe->second.quality;
+                pkt.level = pe->second.level;   // craft grade (protocol 57)
                 strncpy(pkt.manufacturer, pe->second.manufacturer, sizeof(pkt.manufacturer) - 1);
                 strncpy(pkt.material,     pe->second.material,     sizeof(pkt.material) - 1);
                 pkt.x = dpos[0]; pkt.y = dpos[1]; pkt.z = dpos[2];
@@ -1256,7 +1258,7 @@ void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
             engine::resolveObjectByHand(ownerHand) != 0) {
             moved = engine::fabricateWeaponToGround(gw, ownerHand, p.stringID, p.itemType,
                                                     (int)p.quality, p.manufacturer, p.material,
-                                                    p.x, p.y, p.z, &dropped);
+                                                    p.level, p.x, p.y, p.z, &dropped);
             healed = (moved > 0);
         }
         // Track the relocated REAL object under the drop's SHARED identity so a later PICKUP

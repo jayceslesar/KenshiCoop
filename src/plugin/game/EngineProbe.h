@@ -53,6 +53,14 @@ int probeFabricateWeaponLoose(GameWorld* gw, const unsigned int cHand[5],
 int commonNovelWeaponSid(GameWorld* gw, const unsigned int cHand[5],
                          char* outSid, unsigned int outLen);
 
+// SEH-guarded (xbow_grade gate): the same deterministic novel pick for CROSSBOW
+// (itemType 107), excluding cHand's current contents. Crossbows are a separate
+// itemType from WEAPON, and were the item that fell out of the conservation
+// channel into the grade-less W1 stream (upstream #41), so the grade gate needs a
+// crossbow template no squad member already carries. Returns 1 and writes the sid.
+int commonNovelCrossbowSid(GameWorld* gw, const unsigned int cHand[5],
+                           char* outSid, unsigned int outLen);
+
 // SEH-guarded (trade_peer grade gate): the same deterministic novel pick for ARMOUR,
 // excluding BOTH containers' current contents. Two containers because the grade gate drags
 // the piece from one to the other and reads it back by (sid, itemType): a copy already

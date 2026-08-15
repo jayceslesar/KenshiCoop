@@ -338,6 +338,34 @@ int commonNovelWeaponSid(GameWorld* gw, const unsigned int cHand[5],
     return 0;
 }
 
+int commonNovelCrossbowSid(GameWorld* gw, const unsigned int cHand[5],
+                           char* outSid, unsigned int outLen) {
+    if (outSid && outLen) outSid[0] = '\0';
+    if (!gw || !g_getDataOfTypeFn || !outSid || outLen == 0) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    unsigned int nc = captureContainerContents(gw, cHand, cur, MAXC, 0);
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, CROSSBOW);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* t = g_dataScratch[i];
+            if (!t) continue;
+            const char* s = t->stringID.c_str();
+            if (!s || !s[0]) continue;
+            bool held = false;
+            for (unsigned int j = 0; j < nc && !held; ++j)
+                if (cur[j].itemType == (unsigned int)CROSSBOW &&
+                    strcmp(cur[j].stringID, s) == 0) held = true;
+            if (held) continue;
+            strncpy(outSid, s, outLen - 1); outSid[outLen - 1] = '\0';
+            return 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 0;
+}
+
 int commonNovelArmourSid(GameWorld* gw, const unsigned int cHandA[5],
                          const unsigned int cHandB[5],
                          char* outSid, unsigned int outLen) {

@@ -1611,3 +1611,52 @@ function Test-WeaponLoot {
                             sidMatch = $sidMatch; hostQual = $hostQual; joinQual = $joinQual })
 }
 
+
+# xbow_grade (upstream #41): a CROSSBOW (itemType 107) must keep its craft GRADE across a
+# drop + peer pickup. The host mints a reference crossbow at a distinctive grade and drops
+# it; the join picks it up into the tab it owns and reads the grade back. Before the fix,
+# crossbows fell into the grade-less W1 template stream and the join rebuilt them at the
+# factory default, so the join's post-transfer grade DID NOT match the host's minted grade.
+# The gate: both legs converged AND the join's grade equals the host's minted grade.
+# Neither client can see the other's reading, so this cross-client equality is the oracle's.
+function Test-CrossbowGrade {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = "xbow_grade")
+    $rxHost = 'XBOWG verdict role=host pass=(\d+) sid=''([^'']*)'' mintLevel=(-?\d+) dropped=(-?\d+) grndPeak=(-?\d+) grndFinal=(-?\d+)'
+    $rxJoin = 'XBOWG verdict role=join pass=(\d+) sid=''([^'']*)'' pickedUp=(-?\d+) aq=(-?\d+) alv=(-?\d+) tries=(\d+)'
+    $hostOk = $false; $mintLevel = -1; $dropped = 0; $peak = 0; $final = -1
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $mintLevel = [int]$g[3].Value; $dropped = [int]$g[4].Value
+            $peak = [int]$g[5].Value; $final = [int]$g[6].Value
+            $hostOk = ([int]$g[1].Value -eq 1) -and ($dropped -ge 1) -and ($mintLevel -gt 0) -and ($peak -ge 1) -and ($final -eq 0)
+            Write-Host ("  XBOW-GRADE [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - minted grade $mintLevel, dropped=$dropped groundPeak=$peak groundFinal=$final")
+        } else { Write-Host "  XBOW-GRADE [host] FAIL - no host XBOWG verdict (crossbow template unavailable, or drop never authored)" }
+    } else { Write-Host "  XBOW-GRADE [host] FAIL - no log" }
+    $joinOk = $false; $got = 0; $alv = -1; $aq = -1; $tries = 0
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $got = [int]$g[3].Value; $aq = [int]$g[4].Value; $alv = [int]$g[5].Value; $tries = [int]$g[6].Value
+            $joinOk = ($got -ge 1) -and ($alv -gt 0)
+            Write-Host ("  XBOW-GRADE [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - pickedUp=$got grade(alv)=$alv qualBucket(aq)=$aq tries=$tries")
+        } else { Write-Host "  XBOW-GRADE [join] FAIL - no join XBOWG verdict (crossbow never received/picked up)" }
+    } else { Write-Host "  XBOW-GRADE [join] FAIL - no log" }
+
+    # The point of the gate: the grade the join ended up with must equal what the host minted.
+    $gradeMatch = ($hostOk -and $joinOk -and ($alv -eq $mintLevel))
+    if ($hostOk -and $joinOk -and -not $gradeMatch) {
+        Write-Host "    NOTE: GRADE RESET - join's crossbow grade $alv != host's minted grade $mintLevel (the #41 symptom)"
+    }
+    $ok = $hostOk -and $joinOk -and $gradeMatch
+    Write-Host ("  XBOW-GRADE " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - crossbow craft grade preserved across drop+pickup (mint=$mintLevel join=$alv)")
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; mintLevel = $mintLevel;
+                            joinLevel = $alv; joinQualBucket = $aq; gradeMatch = $gradeMatch;
+                            dropped = $dropped; pickedUp = $got; tries = $tries })
+}

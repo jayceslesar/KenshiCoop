@@ -83,7 +83,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
     CHECK_EQ("sizeof(WorldItemRemoveHeader)",   sizeof(WorldItemRemoveHeader),   6);
     CHECK_EQ("sizeof(WorldItemClaimHeader)",    sizeof(WorldItemClaimHeader),    10); // v47
-    CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         191);
+    CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         192); // v57: +level (grade)
     CHECK_EQ("sizeof(WorldPickupPacket)",       sizeof(WorldPickupPacket),       91); // v40: +item identity
     CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           202); // v36; v51: +level
 
@@ -310,8 +310,16 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v56: save-native pickup notice)",
-             (int)PROTOCOL_VERSION, 56);
+    CHECK_EQ("PROTOCOL_VERSION (v57: crossbow rides the conservation channel; W2 drop carries grade)",
+             (int)PROTOCOL_VERSION, 57);
+    {
+        // v57: the W2 drop packet carries the item's craft GRADE so the heal-fabricate
+        // branch rebuilds it at the author's grade, not the factory default (#41).
+        WorldDropPacket wd; std::memset(&wd, 0, sizeof(wd));
+        wd.type = (u8)PKT_WORLD_DROP; wd.itemType = 107u /*CROSSBOW*/; wd.level = 90;
+        CHECK("WorldDropPacket carries craft grade", wd.level == 90 && wd.itemType == 107u);
+        CHECK("GRADE_NA is the not-applicable grade sentinel", (int)GRADE_NA == 0xFF);
+    }
 
     // Protocol 56: save-native pickup notice. The ownership filter (protocol 55)
     // keeps owned town/shop items out of the stream, so their pickup needs its own

@@ -2531,6 +2531,168 @@ private:
 };
 const float InvDumpAllScenario::RADIUS = 60.0f;
 
+// xbow_grade (upstream #41): a CROSSBOW keeps its craft GRADE across a drop + peer
+// pickup. Crossbows are itemType CROSSBOW (107), a SEPARATE type from WEAPON (2);
+// before the conservation-channel fix they fell into the grade-less W1 template
+// stream, so the peer rebuilt them at the factory-default grade. The HOST mints a
+// reference crossbow at a distinctive grade into its own tab (mintGradedGearForTest
+// bypasses the sync, so the reference is graded correctly even on the unfixed build),
+// then drops it; the JOIN relocates/fabricates it by conservation and picks it up
+// into the tab it OWNS. Both read the grade back by (sid, itemType). The single-log
+// legs prove the round trip converged (host ground -> 0, join picked up one); the
+// CROSS-CLIENT grade equality (join alv == host minted level) is Test-CrossbowGrade's
+// job, since neither client can see the other's reading. XBOWG log contract.
+class CrossbowGradeScenario : public Scenario {
+public:
+    CrossbowGradeScenario()
+        : passed_(false), isHost_(false), have_(false), step_(0),
+          seeded_(false), dropped_(0), pickedUp_(0), tries_(0),
+          lastTryMs_(0), lastLogMs_(0), grndPeak_(0), grndFinal_(-1),
+          mintedLevel_(-1), finalBucket_(-1), finalLevel_(-1) {
+        for (int i = 0; i < 5; ++i) { r0_[i] = 0; r1_[i] = 0; }
+        xbowSid_[0] = '\0';
+    }
+    virtual const char* name() const { return "xbow_grade"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        have_ = ovlRankContainer(ctx.gw, 0u, r0_) && ovlRankContainer(ctx.gw, 1u, r1_);
+        // Pick a crossbow template neither tab already carries (so the grade read is
+        // unambiguous). Same save -> same deterministic pick on both clients.
+        if (have_) {
+            if (!engine::commonNovelCrossbowSid(ctx.gw, r0_, xbowSid_, sizeof(xbowSid_)))
+                xbowSid_[0] = '\0';
+        }
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "XBOWG start role=%s have=%d sid='%s' r0=%u,%u,%u,%u,%u r1=%u,%u,%u,%u,%u",
+            isHost_ ? "host" : "join", have_ ? 1 : 0, xbowSid_[0] ? xbowSid_ : "(none)",
+            r0_[0], r0_[1], r0_[2], r0_[3], r0_[4], r1_[0], r1_[1], r1_[2], r1_[3], r1_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_ || !xbowSid_[0]) {
+            if (ctx.elapsedMs >= 6000) { passed_ = false; return true; }
+            return false;
+        }
+
+        // HOST mints the graded reference crossbow into the tab it owns (rank 0).
+        if (isHost_ && !seeded_ && ctx.elapsedMs >= SEED_MS) {
+            seeded_ = true;
+            int q = -1;
+            engine::mintGradedGearForTest(ctx.gw, r0_, xbowSid_, XBOW_CAT, MINT_LEVEL,
+                                          &mintedLevel_, &q);
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "XBOWG mint sid='%s' wantLevel=%d gotLevel=%d gotQual=%d",
+                xbowSid_, MINT_LEVEL, mintedLevel_, q);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // HOST drops it (through the hooked path, so the conservation channel authors it).
+        if (isHost_ && step_ == 0 && ctx.elapsedMs >= DROP_MS && mintedLevel_ > 0) {
+            step_ = 1;
+            dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, xbowSid_, XBOW_CAT, 1);
+            if (dropped_ == 0) {
+                int un = engine::unequipItemToLoose(ctx.gw, r0_, xbowSid_, XBOW_CAT, 1);
+                if (un > 0) dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, xbowSid_,
+                                                                    XBOW_CAT, 1);
+                if (dropped_ == 0)
+                    dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, xbowSid_, XBOW_CAT,
+                                                             1, 0, /*allowEquipped*/ true);
+            }
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "XBOWG host-dropped n=%d ground=%d", dropped_,
+                engine::countFreeGroundItemsNear(ctx.gw, r0_, xbowSid_, XBOW_CAT, RADIUS));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // JOIN picks the conserved crossbow up into the member it OWNS (rank 1). Retried:
+        // the peer's relocate/fabricate has to land first.
+        if (!isHost_ && pickedUp_ == 0 && ctx.elapsedMs >= PICKUP_MS &&
+            tries_ < MAX_TRIES && (ctx.elapsedMs - lastTryMs_ >= TRY_EVERY_MS)) {
+            lastTryMs_ = ctx.elapsedMs;
+            ++tries_;
+            pickedUp_ = engine::pickupWorldItemIntoInventory(ctx.gw, r1_, xbowSid_,
+                                                             XBOW_CAT, RADIUS);
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "XBOWG join-pickup try=%u got=%d ground=%d", tries_, pickedUp_,
+                engine::countFreeGroundItemsNear(ctx.gw, r1_, xbowSid_, XBOW_CAT, RADIUS));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (isHost_ && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            int grnd = engine::countFreeGroundItemsNear(ctx.gw, r0_, xbowSid_, XBOW_CAT, RADIUS);
+            if (grnd > grndPeak_) grndPeak_ = grnd;
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (isHost_) {
+                grndFinal_ = engine::countFreeGroundItemsNear(ctx.gw, r0_, xbowSid_,
+                                                              XBOW_CAT, RADIUS);
+                // Host proves it authored a graded drop and its ground copy is gone. The
+                // grade the host MINTED is logged so the oracle can compare it to the
+                // join's post-transfer reading (grade preservation is the point).
+                passed_ = (dropped_ > 0) && (mintedLevel_ > 0) && (grndPeak_ >= 1) &&
+                          (grndFinal_ == 0);
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "XBOWG verdict role=host pass=%d sid='%s' mintLevel=%d dropped=%d "
+                    "grndPeak=%d grndFinal=%d",
+                    passed_ ? 1 : 0, xbowSid_, mintedLevel_, dropped_, grndPeak_, grndFinal_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                engine::readGearGradeBySid(ctx.gw, r1_, xbowSid_, XBOW_CAT,
+                                           &finalBucket_, &finalLevel_);
+                // Join proves it received the crossbow (picked it up) AND that its craft
+                // grade survived the transfer (finalLevel > 0, i.e. not GRADE_NA/default).
+                // The exact cross-client equality is the oracle's gate.
+                passed_ = (pickedUp_ > 0) && (finalLevel_ > 0);
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "XBOWG verdict role=join pass=%d sid='%s' pickedUp=%d aq=%d alv=%d tries=%u",
+                    passed_ ? 1 : 0, xbowSid_, pickedUp_, finalBucket_, finalLevel_, tries_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned int  XBOW_CAT   = 107;   // itemType CROSSBOW
+    static const int           MINT_LEVEL = 90;    // distinctive craft grade
+    static const unsigned long SEED_MS    = 5000;
+    static const unsigned long DROP_MS    = 12000;
+    static const unsigned long PICKUP_MS  = 20000;
+    static const unsigned long TRY_EVERY_MS = 1500;
+    static const unsigned int  MAX_TRIES  = 6;
+    static const unsigned long JOIN_DURATION_MS = 34000;
+    static const unsigned long HOST_DURATION_MS = 40000;
+    static const float         RADIUS;
+
+    bool          passed_;
+    bool          isHost_;
+    bool          have_;
+    int           step_;
+    bool          seeded_;
+    int           dropped_;
+    int           pickedUp_;
+    unsigned int  tries_;
+    unsigned long lastTryMs_;
+    unsigned long lastLogMs_;
+    int           grndPeak_;
+    int           grndFinal_;
+    int           mintedLevel_;
+    int           finalBucket_;
+    int           finalLevel_;
+    unsigned int  r0_[5];
+    unsigned int  r1_[5];
+    char          xbowSid_[48];
+};
+const float CrossbowGradeScenario::RADIUS = 60.0f;
+
 Scenario* makeInventoryScenario(const std::string& name) {
     // Same scenario twice: the plain run proves the round trip converges, and the
     // _refuse run drives it with the first re-home refused (KENSHICOOP_WD_REFUSE_REHOME),
@@ -2574,6 +2736,7 @@ Scenario* makeInventoryScenario(const std::string& name) {
     if (name == "inv_wpnseq")   return new WeaponSeqScenario();
     if (name == "inv_addequip") return new InventoryAddEquipScenario();
     if (name == "wpn_relocate") return new WeaponRelocateScenario();
+    if (name == "xbow_grade")   return new CrossbowGradeScenario();
     return 0;
 }
 
