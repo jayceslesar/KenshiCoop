@@ -229,6 +229,7 @@ function Invoke-OneOracle {
         "backpack_drop" { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "backpack_drop") }
         "pickup_mirror" { return (Test-WorldPickupMirror -HostFile $HostLog -JoinFile $JoinLog) }
         "corpse_loot"   { return (Test-CorpseLoot     -HostFile $HostLog -JoinFile $JoinLog) }
+        "shop_shelf"    { return (Test-ShopShelf      -HostFile $HostLog -JoinFile $JoinLog) }
         "xbow_grade"    { return (Test-CrossbowGrade   -HostFile $HostLog -JoinFile $JoinLog) }
         "gear_repickup" { return (Test-GearRepickup    -HostFile $HostLog -JoinFile $JoinLog) }
         "gear_repickup_retry" { return (Test-GearRepickup -HostFile $HostLog -JoinFile $JoinLog `
@@ -498,7 +499,7 @@ Export-ModuleMember -Function @(
     "Test-InventoryOverflow", "Test-InventoryDropFull",
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
-    "Test-WorldPickupMirror", "Test-GearRepickup", "Test-CrossbowGrade", "Test-CorpseLoot", "Test-NoPhantomPickups", "Test-WorldItemBurst",
+    "Test-WorldPickupMirror", "Test-GearRepickup", "Test-CrossbowGrade", "Test-CorpseLoot", "Test-ShopShelf", "Test-NoPhantomPickups", "Test-WorldItemBurst",
     "Test-NestedBag", "Test-DumpAll",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",

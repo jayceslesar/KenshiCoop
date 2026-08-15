@@ -1572,9 +1572,23 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                 RootObject* o = g_npcQuery[i];
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
-                if (!isContainerClassType((int)b->classType)) continue;
                 // Incomplete sites ride protocol 27 until finished.
                 if (!b->_buildState.isComplete) continue;
+                // #72.4: a shop SHELF/TABLE is a furniture-class building whose
+                // wares sit in its OWN Building inventory - not STORAGE/machine,
+                // so the class filter used to drop it and shelf pickups never
+                // censused (mirror of #40, one row narrower: here the object IS
+                // enumerated, the class check just rejected it). Admit any
+                // complete building that actually CARRIES items; decorative
+                // furniture (null/empty inventory) still falls through, so the
+                // census set doesn't balloon. Keying on inventory-presence, not a
+                // guessed furniture class enum, stays robust to FCS variety.
+                if (!isContainerClassType((int)b->classType)) {
+                    Inventory* pinv = o->getInventory();
+                    if (!pinv) continue;
+                    InvItemEntry probe[1];
+                    if (readInvItems(pinv, probe, 0, 1) == 0) continue;
+                }
                 unsigned int h[5];
                 if (!readObjectHand(o, h)) continue;
                 bool dup = false; // the two interest spheres can overlap

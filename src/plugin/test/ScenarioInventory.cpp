@@ -2855,6 +2855,229 @@ private:
     char          seedSid_[48];
 };
 
+// ---- #72.4: shop SHELF / TABLE item pickup sync -----------------------------
+// A shop's wares sit in a furniture-class building's OWN inventory, not on the
+// ground and not in a STORAGE chest - so the container census used to drop the
+// shelf entirely (enumContainersNear admitted only STORAGE/machine), and a shelf
+// pickup never synced. This is #40's shape one row narrower: the object IS
+// enumerated, the class filter just rejected it (now widened to admit any
+// complete building that CARRIES items).
+//
+// Both clients pin the SAME baked shelf: among enumContainersNear rows, take the
+// smallest-hand NON-storage row that already holds wares (nEntries>0). A baked
+// building hand is save-stable (identical on both sides, ENGINE_FACTS #1), so the
+// smallest-hand pick is globally deterministic - no leader-relative drift. The
+// NON-storage requirement is what makes the test discriminate the fix: a STORAGE
+// chest was always censused, so pinning one would pass even pre-fix. And because
+// the widened census only admits a non-storage building that ALREADY carries
+// items, a pre-fix build doesn't return the shelf at all -> the pin fails -> a
+// built-in negative control (no separate revert needed to prove discrimination).
+//
+// HOST seeds a known count into the shelf then loots one; item TOTALS (qtyTotal)
+// are used, so no cross-client sid agreement is needed. Verdict carries the
+// subject hand + class so a determinism miss (two sides pinned different shelves)
+// is told apart from the real bug. XSHELF log contract; judged by Test-ShopShelf.
+class ShopShelfScenario : public Scenario {
+public:
+    ShopShelfScenario()
+        : passed_(false), isHost_(false), have_(false),
+          seeded_(0), looted_(0), seedTried_(false), lootTried_(false),
+          subjClass_(-1), subjEntries_(0), seedType_(0),
+          base_(-1), peak_(-1), final_(-1), lastLogMs_(0) {
+        for (int i = 0; i < 5; ++i) subjHand_[i] = 0;
+        seedSid_[0] = '\0';
+    }
+    virtual const char* name() const { return "shop_shelf"; }
+
+    // Pin EARLY on BOTH clients: the smallest-hand non-storage, item-bearing
+    // container row. Deterministic across clients because a baked shelf hand is
+    // save-stable.
+    void pinShelf(const ScenarioContext& ctx) {
+        if (have_) return;
+        const unsigned int MAXC = 48;
+        engine::ContRead rows[MAXC];
+        unsigned int n = engine::enumContainersNear(ctx.gw, 100.0f, rows, MAXC);
+        int best = -1;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (!rows[i].hasInv) continue;
+            if (rows[i].nEntries <= 0) continue;        // must already hold wares
+            if (rows[i].classType == 3 /*BCTYPE_STORAGE*/) continue; // discriminate: shelf, not chest
+            if (best < 0 ||
+                rows[i].hand[4] < rows[best].hand[4] ||
+                (rows[i].hand[4] == rows[best].hand[4] && rows[i].hand[3] < rows[best].hand[3]))
+                best = (int)i;
+        }
+        if (best >= 0) {
+            for (int k = 0; k < 5; ++k) subjHand_[k] = rows[best].hand[k];
+            subjClass_   = rows[best].classType;
+            subjEntries_ = rows[best].nEntries;
+            have_ = true;
+            // Capture the shelf's OWN first ware (sid+type): it is accepted by the
+            // shelf's type filter by definition, so it is what we seed MORE of and
+            // what we loot one of - sidestepping the common-sentinel refusal that
+            // addTestItemsToContainer trips on (a shop shelf is item-type-limited).
+            captureFirstWare(ctx.gw);
+        }
+    }
+
+    // Read the shelf's first held item into seedSid_/seedType_ (once).
+    void captureFirstWare(GameWorld* gw) {
+        if (seedSid_[0]) return;
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, subjHand_, it, INV_ITEMS_MAX, 0);
+        if (n == 0) return;
+        strncpy(seedSid_, it[0].stringID, sizeof(seedSid_) - 1);
+        seedSid_[sizeof(seedSid_) - 1] = '\0';
+        seedType_ = it[0].itemType;
+    }
+
+    // Resolve THIS client's leader personal-inventory container hand (the loot
+    // destination - "pick the item off the shelf into my pack").
+    bool myLeaderHand(GameWorld* gw, unsigned int out[5]) {
+        EntityState sq[4];
+        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ true, sq, 4);
+        if (n == 0) return false;
+        out[0] = sq[0].hType; out[1] = sq[0].hContainer;
+        out[2] = sq[0].hContainerSerial; out[3] = sq[0].hIndex; out[4] = sq[0].hSerial;
+        return true;
+    }
+
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        pinShelf(ctx);
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        pinShelf(ctx);
+        char b[200]; _snprintf(b, sizeof(b) - 1,
+            "XSHELF start role=%s have=%d subj=%u,%u,%u,%u,%u class=%d entries=%d",
+            isHost_ ? "host" : "join", have_ ? 1 : 0,
+            subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3], subjHand_[4],
+            subjClass_, subjEntries_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Keep trying to pin until the seed window. If no stocked non-storage shelf
+        // is ever in range, FAIL with a distinct marker so the oracle can call it a
+        // fixture miss (no shelf), not the sync bug.
+        if (!have_ && ctx.elapsedMs < SEED_MS) { pinShelf(ctx); }
+        if (!have_ && ctx.elapsedMs >= SEED_MS) {
+            coop::logLine("XSHELF nopin (no stocked non-storage shelf in range)");
+            passed_ = false; return true;
+        }
+        if (!have_) return false;
+        if (!seedSid_[0]) captureFirstWare(ctx.gw);
+        if (base_ < 0) base_ = shelfQty(ctx.gw);
+
+        // HOST seeds a known count of the shelf's OWN ware sid (accepted for sure),
+        // then loots one by MOVING it into its leader's pack - exactly the "pick an
+        // item off the shelf" mutation. Both attempted once (a type-limited shelf or
+        // a fabricate-refusing weapon must not spin every tick).
+        if (isHost_ && !seedTried_ && seedSid_[0] && ctx.elapsedMs >= SEED_MS) {
+            seedTried_ = true;
+            seeded_ = engine::addItemsToContainerBySid(ctx.gw, subjHand_, seedSid_,
+                          seedType_, SEED_N, /*qualityBucket*/0, /*manuf*/"", /*material*/"");
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "XSHELF seed n=%d sid='%s' type=%u shelfQty=%d",
+                seeded_, seedSid_, seedType_, shelfQty(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (isHost_ && !lootTried_ && seedSid_[0] && ctx.elapsedMs >= LOOT_MS) {
+            lootTried_ = true;
+            unsigned int lh[5];
+            if (myLeaderHand(ctx.gw, lh)) {
+                looted_ = engine::moveItemBetweenContainers(ctx.gw, subjHand_, lh,
+                              seedSid_, seedType_, 1);
+            }
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "XSHELF loot n=%d shelfQty=%d", looted_, shelfQty(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            int q = shelfQty(ctx.gw);
+            if (q > peak_) peak_ = q;
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            final_ = shelfQty(ctx.gw);
+            if (isHost_) {
+                // The host must have actually MUTATED the shelf. A display shelf is
+                // usually FULL (capacity-limited), so the best-effort seed often adds
+                // nothing (seeded=0); the loot MOVE off the shelf is the reliable half
+                // and models the real pickup. Net absolute change is NOT asserted: a
+                // shop restocks asynchronously, so base->restock->loot can land back on
+                // base. The cross-client mirror (join final == host final) is the
+                // oracle's job.
+                bool did = (seeded_ > 0) || (looted_ > 0);
+                passed_ = (base_ >= 0) && did;
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "XSHELF verdict role=host pass=%d subj=%u,%u,%u,%u,%u class=%d base=%d "
+                    "seeded=%d looted=%d peak=%d final=%d",
+                    passed_ ? 1 : 0, subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3],
+                    subjHand_[4], subjClass_, base_, seeded_, looted_, peak_, final_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                // The join must have RECEIVED a census update that moved the shelf off
+                // its native baseline (the loot's loss and/or a restock's gain crossed
+                // via the host-authoritative container census). Before the fix the shelf
+                // was never censused, so the join's copy stayed pinned at base for the
+                // whole run -> peak==base && final==base -> FAIL. "Moved off baseline"
+                // (peak or final differs) is the discriminating signal; the oracle adds
+                // the mirror check (join final == host final).
+                bool observed = (peak_ != base_) || (final_ != base_);
+                passed_ = (base_ >= 0) && observed;
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "XSHELF verdict role=join pass=%d subj=%u,%u,%u,%u,%u class=%d base=%d "
+                    "peak=%d final=%d",
+                    passed_ ? 1 : 0, subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3],
+                    subjHand_[4], subjClass_, base_, peak_, final_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long SEED_MS = 9000;
+    static const unsigned long LOOT_MS = 20000;
+    static const int           SEED_N  = 3;
+    static const unsigned long JOIN_DURATION_MS = 34000;
+    static const unsigned long HOST_DURATION_MS = 40000;
+
+    int shelfQty(GameWorld* gw) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, subjHand_, it, INV_ITEMS_MAX, 0);
+        int q = 0;
+        for (unsigned int i = 0; i < n; ++i) q += (int)it[i].quantity;
+        return q;
+    }
+
+    bool          passed_;
+    bool          isHost_;
+    bool          have_;
+    int           seeded_;
+    int           looted_;
+    bool          seedTried_;
+    bool          lootTried_;
+    int           subjClass_;
+    int           subjEntries_;
+    unsigned int  seedType_;
+    int           base_;
+    int           peak_;
+    int           final_;
+    unsigned long lastLogMs_;
+    unsigned int  subjHand_[5];
+    char          seedSid_[48];
+};
+
 Scenario* makeInventoryScenario(const std::string& name) {
     // Same scenario twice: the plain run proves the round trip converges, and the
     // _refuse run drives it with the first re-home refused (KENSHICOOP_WD_REFUSE_REHOME),
@@ -2900,6 +3123,7 @@ Scenario* makeInventoryScenario(const std::string& name) {
     if (name == "wpn_relocate") return new WeaponRelocateScenario();
     if (name == "xbow_grade")   return new CrossbowGradeScenario();
     if (name == "corpse_loot")  return new CorpseLootScenario();
+    if (name == "shop_shelf")   return new ShopShelfScenario();
     return 0;
 }
 

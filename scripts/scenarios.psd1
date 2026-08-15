@@ -2256,6 +2256,22 @@
             Advisory = @('smoothness', 'march')
             Tier = 'full'; WanVariant = $false
         }
+        # shop_shelf (upstream #72.4): a shop SHELF/TABLE holds its wares in a
+        # furniture-class building's own inventory, not on the ground and not in a
+        # STORAGE chest - so the container census used to drop it and a shelf pickup
+        # never crossed. Both clients pin the smallest-hand NON-storage stocked shelf
+        # in range (baked hand = save-stable, so deterministic); the host seeds a
+        # known count and loots one, and the widened host-authoritative census must
+        # carry the gain and the loss to the join. Needs storeSync ON. The 'sync' bar
+        # town is documented to put real shops in range.
+        shop_shelf = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_STORE_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'shop_shelf'
+            Gating   = @('shop_shelf', 'clock_sync')
+            Advisory = @('smoothness', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # Same round trip with the author's FIRST re-home refused. That is the case that
         # used to strand the item in both places forever - the author tried once, off a
         # cached pointer, and never revisited it. Now it retries and, once it can READ the

@@ -1714,3 +1714,70 @@ function Test-CorpseLoot {
                             hostLooted = $hLoot; hostFinal = $hFinal; joinBase = $jBase;
                             joinPeak = $jPeak; joinFinal = $jFinal })
 }
+
+function Test-ShopShelf {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = "shop_shelf")
+    # #72.4: a shop shelf/table is a furniture-class building whose wares sit in
+    # its own inventory. Pre-fix the container census dropped it (non-storage),
+    # so a shelf pickup never crossed. The host seeds a known count into the
+    # shelf then loots one; the join must SEE the gain (peak) and the loss (final).
+    $rxHost = 'XSHELF verdict role=host pass=(\d+) subj=([\d,]+) class=(-?\d+) base=(-?\d+) seeded=(-?\d+) looted=(-?\d+) peak=(-?\d+) final=(-?\d+)'
+    $rxJoin = 'XSHELF verdict role=join pass=(\d+) subj=([\d,]+) class=(-?\d+) base=(-?\d+) peak=(-?\d+) final=(-?\d+)'
+    $noPinHost = $false; $noPinJoin = $false
+    if (Test-Path $HostFile) { $noPinHost = [bool](Select-String -Path $HostFile -Pattern 'XSHELF nopin' -ErrorAction SilentlyContinue) }
+    if (Test-Path $JoinFile) { $noPinJoin = [bool](Select-String -Path $JoinFile -Pattern 'XSHELF nopin' -ErrorAction SilentlyContinue) }
+
+    $hostOk = $false; $hSubj = ""; $hClass = -1; $hBase = -1; $hSeed = 0; $hLoot = 0; $hFinal = -1
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $hSubj = $g[2].Value; $hClass = [int]$g[3].Value; $hBase = [int]$g[4].Value
+            $hSeed = [int]$g[5].Value; $hLoot = [int]$g[6].Value; $hFinal = [int]$g[8].Value
+            $hostOk = ([int]$g[1].Value -eq 1)
+            Write-Host ("  SHOP-SHELF [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - class=$hClass base=$hBase seeded=$hSeed looted=$hLoot final=$hFinal")
+        } elseif ($noPinHost) { Write-Host "  SHOP-SHELF [host] FAIL - no stocked non-storage shelf in range (fixture miss, not the bug)" }
+        else { Write-Host "  SHOP-SHELF [host] FAIL - no host XSHELF verdict (seed/loot failed)" }
+    } else { Write-Host "  SHOP-SHELF [host] FAIL - no log" }
+
+    $joinOk = $false; $jSubj = ""; $jClass = -1; $jBase = -1; $jPeak = -1; $jFinal = -1
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $jSubj = $g[2].Value; $jClass = [int]$g[3].Value; $jBase = [int]$g[4].Value
+            $jPeak = [int]$g[5].Value; $jFinal = [int]$g[6].Value
+            $joinOk = ([int]$g[1].Value -eq 1)
+            Write-Host ("  SHOP-SHELF [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - class=$jClass base=$jBase peak=$jPeak final=$jFinal")
+        } elseif ($noPinJoin) { Write-Host "  SHOP-SHELF [join] FAIL - no stocked non-storage shelf in range (fixture miss, not the bug)" }
+        else { Write-Host "  SHOP-SHELF [join] FAIL - no join XSHELF verdict" }
+    } else { Write-Host "  SHOP-SHELF [join] FAIL - no log" }
+
+    if ($noPinHost -or $noPinJoin) {
+        Write-Host "    NOTE: FIXTURE MISS - the save had no stocked non-storage shelf near spawn; pick a save/spot with a shop shelf in range"
+    }
+    $sameSubject = ($hSubj -ne "" -and $hSubj -eq $jSubj)
+    if (($hSubj -ne "") -and ($jSubj -ne "") -and -not $sameSubject) {
+        Write-Host "    NOTE: SUBJECT MISMATCH - host pinned $hSubj, join pinned $jSubj (deterministic pick disagreed; test artifact, not the bug)"
+    }
+    # Mirror check with +/-1 tolerance: the host and join sample their final ~6s
+    # apart, and a shop can restock one item in that gap. A real desync (the shelf
+    # never censused) leaves the join pinned at its whole base while the host moved -
+    # a gap far larger than 1, and the join-side "moved off baseline" gate already
+    # fails that case outright.
+    $finalMatch = ($hostOk -and $joinOk -and ([math]::Abs($jFinal - $hFinal) -le 1))
+    if ($hostOk -and $joinOk -and $sameSubject -and -not $finalMatch) {
+        Write-Host "    NOTE: DESYNC - join shelf total $jFinal != host $hFinal after loot (the #72.4 symptom)"
+    }
+    $ok = $hostOk -and $joinOk -and $sameSubject -and $finalMatch
+    Write-Host ("  SHOP-SHELF " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - shelf pickup synced to the peer (host final=$hFinal join final=$jFinal)")
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; sameSubject = $sameSubject;
+                            finalMatch = $finalMatch; hostClass = $hClass; hostBase = $hBase;
+                            hostSeeded = $hSeed; hostLooted = $hLoot; hostFinal = $hFinal;
+                            joinBase = $jBase; joinPeak = $jPeak; joinFinal = $jFinal;
+                            fixtureMiss = ($noPinHost -or $noPinJoin) })
+}
