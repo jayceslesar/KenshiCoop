@@ -224,6 +224,13 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // it actually owns or the two of us drive the same bodies.
     if (streamNpcs_ && n < MAX_PUBLISH) {
         unsigned int got = engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
+        // Corpse census feed (upstream #40): captureNpcs is the one capture that
+        // RETAINS a body across its death, so record every dead world-NPC hand here
+        // for publishInventories to fold into the container census. Rebuilt each tick.
+        deadNpcHands_.clear();
+        for (unsigned int i = 0; i < got; ++i)
+            if (buf[n + i].bodyState & coop::BODY_DEAD)
+                deadNpcHands_.insert(keyOf(buf[n + i]));
         // The attention gate lives HERE, not on the census. Streaming is the
         // expensive half - a transform per body per tick - and it is the half
         // that is genuinely pointless when the peer has no camera or squad near

@@ -2231,6 +2231,19 @@
             Advisory = @('smoothness', 'march')
             Tier = 'full'; WanVariant = $false
         }
+        # corpse_loot (upstream #40): looting a corpse syncs the corpse's LOSS to the peer,
+        # not just the looter's gain. Both clients kill the same save-native NPC; the host
+        # seeds a known count into the corpse and loots one, and the host-authoritative
+        # corpse census must carry the seed and the loot to the join. Needs storeSync (the
+        # container/corpse census) ON. down1 has a killable NPC by both leaders.
+        corpse_loot = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_STORE_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'corpse_loot'
+            Gating   = @('corpse_loot', 'clock_sync')
+            Advisory = @('smoothness', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # Same round trip with the author's FIRST re-home refused. That is the case that
         # used to strand the item in both places forever - the author tried once, off a
         # cached pointer, and never revisited it. Now it retries and, once it can READ the

@@ -2693,6 +2693,168 @@ private:
 };
 const float CrossbowGradeScenario::RADIUS = 60.0f;
 
+// corpse_loot (upstream #40): looting a CORPSE syncs to the peer. A corpse is a
+// dead Character whose inventory was in no published set (the container census only
+// scanned BUILDING-typed storage), so a looter's gain synced but the corpse's loss
+// never did - the peer kept seeing the pre-loot corpse. Both clients kill the same
+// save-native world NPC (deterministic pick; a save-native hand resolves on both) so
+// each holds a corpse at the same hand; the HOST seeds a known count into the corpse
+// and then loots one. The corpse census (host-authoritative) must carry both the
+// seed and the loot to the join. Item TOTALS (qtyTotal) are used, so no cross-client
+// sid agreement is needed. Both verdicts carry the subject hand so a determinism
+// failure (the two sides pinned different NPCs) is told apart from the real bug.
+// XCORPSE log contract; judged by Test-CorpseLoot.
+class CorpseLootScenario : public Scenario {
+public:
+    CorpseLootScenario()
+        : passed_(false), isHost_(false), have_(false), killed_(false),
+          seeded_(0), looted_(0), base_(-1), peak_(-1), final_(-1), lastLogMs_(0) {
+        for (int i = 0; i < 5; ++i) subjHand_[i] = 0;
+        seedSid_[0] = '\0';
+    }
+    virtual const char* name() const { return "corpse_loot"; }
+
+    // Pin EARLY (at gameplay start) on BOTH clients: by the time the scenario clock arms
+    // (~40 s later, on peer-ready) the pick could drift. The subject must be the SAME
+    // save-native NPC on each side, so the pick is GLOBALLY deterministic rather than
+    // leader-relative: among the world (non-squad) NPCs captureNpcs sees, take the one
+    // with the smallest hand (serial, then index). Both co-located clients capture the
+    // same set and pick the same NPC - no dependence on which leader is nearer. (A
+    // leader-relative picker like pickDuelSubjects lands on different NPCs per client.)
+    void pinSubj(const ScenarioContext& ctx) {
+        if (have_) return;
+        EntityState npcs[64];
+        unsigned int n = engine::captureNpcs(ctx.gw, npcs, 64);
+        int best = -1;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (best < 0 ||
+                npcs[i].hSerial < npcs[best].hSerial ||
+                (npcs[i].hSerial == npcs[best].hSerial && npcs[i].hIndex < npcs[best].hIndex))
+                best = (int)i;
+        }
+        if (best >= 0) {
+            subjHand_[0] = npcs[best].hType; subjHand_[1] = npcs[best].hContainer;
+            subjHand_[2] = npcs[best].hContainerSerial; subjHand_[3] = npcs[best].hIndex;
+            subjHand_[4] = npcs[best].hSerial;
+            have_ = true;
+        }
+    }
+
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        pinSubj(ctx);
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        pinSubj(ctx);
+        char b[180]; _snprintf(b, sizeof(b) - 1,
+            "XCORPSE start role=%s have=%d subj=%u,%u,%u,%u,%u",
+            isHost_ ? "host" : "join", have_ ? 1 : 0,
+            subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3], subjHand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Keep trying to pin until the kill window: the pair has to be resolvable at least
+        // once before we can make a corpse of it.
+        if (!have_ && ctx.elapsedMs < KILL_MS) { pinSubj(ctx); }
+        if (!have_) { if (ctx.elapsedMs >= 6000) { passed_ = false; return true; } return false; }
+
+        // BOTH kill their local copy of the same save-native NPC, so each holds a
+        // corpse at the shared hand independent of the death-event channel's timing.
+        if (!killed_ && ctx.elapsedMs >= KILL_MS) {
+            killed_ = true;
+            engine::killSubject(ctx.gw, subjHand_);
+            base_ = corpseQty(ctx.gw);
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "XCORPSE killed role=%s base=%d", isHost_ ? "host" : "join", base_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // HOST seeds a known count into the corpse, then loots one of them.
+        if (isHost_ && killed_ && seeded_ == 0 && ctx.elapsedMs >= SEED_MS) {
+            seeded_ = engine::addTestItemsToContainer(ctx.gw, subjHand_, SEED_N,
+                                                      seedSid_, sizeof(seedSid_));
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "XCORPSE seed n=%d sid='%s' corpseQty=%d",
+                seeded_, seedSid_[0] ? seedSid_ : "(none)", corpseQty(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (isHost_ && seeded_ > 0 && looted_ == 0 && ctx.elapsedMs >= LOOT_MS) {
+            looted_ = engine::removeTestItemsFromContainer(ctx.gw, subjHand_, 1);
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "XCORPSE loot n=%d corpseQty=%d", looted_, corpseQty(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            int q = corpseQty(ctx.gw);
+            if (q > peak_) peak_ = q;
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            final_ = corpseQty(ctx.gw);
+            if (isHost_) {
+                passed_ = killed_ && (seeded_ >= SEED_N) && (looted_ >= 1) &&
+                          (base_ >= 0) && (final_ == base_ + SEED_N - 1);
+                char b[220]; _snprintf(b, sizeof(b) - 1,
+                    "XCORPSE verdict role=host pass=%d subj=%u,%u,%u,%u,%u base=%d seeded=%d "
+                    "looted=%d peak=%d final=%d",
+                    passed_ ? 1 : 0, subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3],
+                    subjHand_[4], base_, seeded_, looted_, peak_, final_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                // The join must have SEEN the corpse gain the seed (peak >= base+SEED_N)
+                // and then lose the looted one (final == base+SEED_N-1). Before the fix the
+                // corpse was never censused, so the join's corpse stayed at its native base.
+                passed_ = killed_ && (base_ >= 0) && (peak_ >= base_ + SEED_N) &&
+                          (final_ == base_ + SEED_N - 1);
+                char b[220]; _snprintf(b, sizeof(b) - 1,
+                    "XCORPSE verdict role=join pass=%d subj=%u,%u,%u,%u,%u base=%d peak=%d final=%d",
+                    passed_ ? 1 : 0, subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3],
+                    subjHand_[4], base_, peak_, final_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long KILL_MS = 4000;
+    static const unsigned long SEED_MS = 9000;
+    static const unsigned long LOOT_MS = 20000;
+    static const int           SEED_N  = 3;
+    static const unsigned long JOIN_DURATION_MS = 34000;
+    static const unsigned long HOST_DURATION_MS = 40000;
+
+    int corpseQty(GameWorld* gw) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, subjHand_, it, INV_ITEMS_MAX, 0);
+        int q = 0;
+        for (unsigned int i = 0; i < n; ++i) q += (int)it[i].quantity;
+        return q;
+    }
+
+    bool          passed_;
+    bool          isHost_;
+    bool          have_;
+    bool          killed_;
+    int           seeded_;
+    int           looted_;
+    int           base_;
+    int           peak_;
+    int           final_;
+    unsigned long lastLogMs_;
+    unsigned int  subjHand_[5];
+    char          seedSid_[48];
+};
+
 Scenario* makeInventoryScenario(const std::string& name) {
     // Same scenario twice: the plain run proves the round trip converges, and the
     // _refuse run drives it with the first re-home refused (KENSHICOOP_WD_REFUSE_REHOME),
@@ -2737,6 +2899,7 @@ Scenario* makeInventoryScenario(const std::string& name) {
     if (name == "inv_addequip") return new InventoryAddEquipScenario();
     if (name == "wpn_relocate") return new WeaponRelocateScenario();
     if (name == "xbow_grade")   return new CrossbowGradeScenario();
+    if (name == "corpse_loot")  return new CorpseLootScenario();
     return 0;
 }
 

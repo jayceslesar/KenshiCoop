@@ -1660,3 +1660,57 @@ function Test-CrossbowGrade {
                             joinLevel = $alv; joinQualBucket = $aq; gradeMatch = $gradeMatch;
                             dropped = $dropped; pickedUp = $got; tries = $tries })
 }
+
+# corpse_loot (upstream #40): looting a corpse must sync the corpse's LOSS to the peer.
+# Both clients kill the same save-native NPC (so each holds a corpse at the shared hand);
+# the host seeds SEED_N items into the corpse and loots one. The host-authoritative corpse
+# census must carry both to the join. The gate: both legs converged AND the two sides
+# pinned the SAME subject (a hand mismatch means the deterministic pick disagreed - a test
+# artifact, reported distinctly from the real bug) AND the join's final corpse total equals
+# the host's. Before the fix the corpse was never censused, so the join's corpse stayed at
+# its native base (peak == base) and this FAILs.
+function Test-CorpseLoot {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = "corpse_loot")
+    $rxHost = 'XCORPSE verdict role=host pass=(\d+) subj=([\d,]+) base=(-?\d+) seeded=(-?\d+) looted=(-?\d+) peak=(-?\d+) final=(-?\d+)'
+    $rxJoin = 'XCORPSE verdict role=join pass=(\d+) subj=([\d,]+) base=(-?\d+) peak=(-?\d+) final=(-?\d+)'
+    $hostOk = $false; $hSubj = ""; $hBase = -1; $hSeed = 0; $hLoot = 0; $hFinal = -1
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $hSubj = $g[2].Value; $hBase = [int]$g[3].Value; $hSeed = [int]$g[4].Value
+            $hLoot = [int]$g[5].Value; $hFinal = [int]$g[7].Value
+            $hostOk = ([int]$g[1].Value -eq 1)
+            Write-Host ("  CORPSE-LOOT [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - base=$hBase seeded=$hSeed looted=$hLoot final=$hFinal")
+        } else { Write-Host "  CORPSE-LOOT [host] FAIL - no host XCORPSE verdict (no killable NPC, or kill/seed failed)" }
+    } else { Write-Host "  CORPSE-LOOT [host] FAIL - no log" }
+    $joinOk = $false; $jSubj = ""; $jBase = -1; $jPeak = -1; $jFinal = -1
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $jSubj = $g[2].Value; $jBase = [int]$g[3].Value; $jPeak = [int]$g[4].Value; $jFinal = [int]$g[5].Value
+            $joinOk = ([int]$g[1].Value -eq 1)
+            Write-Host ("  CORPSE-LOOT [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - base=$jBase peak=$jPeak final=$jFinal")
+        } else { Write-Host "  CORPSE-LOOT [join] FAIL - no join XCORPSE verdict" }
+    } else { Write-Host "  CORPSE-LOOT [join] FAIL - no log" }
+
+    $sameSubject = ($hSubj -ne "" -and $hSubj -eq $jSubj)
+    if (($hSubj -ne "") -and ($jSubj -ne "") -and -not $sameSubject) {
+        Write-Host "    NOTE: SUBJECT MISMATCH - host pinned $hSubj, join pinned $jSubj (deterministic pick disagreed; test artifact, not the bug)"
+    }
+    $finalMatch = ($hostOk -and $joinOk -and ($jFinal -eq $hFinal))
+    if ($hostOk -and $joinOk -and $sameSubject -and -not $finalMatch) {
+        Write-Host "    NOTE: DESYNC - join corpse total $jFinal != host $hFinal after loot (the #40 symptom)"
+    }
+    $ok = $hostOk -and $joinOk -and $sameSubject -and $finalMatch
+    Write-Host ("  CORPSE-LOOT " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - corpse loot synced to the peer (host final=$hFinal join final=$jFinal)")
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; sameSubject = $sameSubject;
+                            finalMatch = $finalMatch; hostBase = $hBase; hostSeeded = $hSeed;
+                            hostLooted = $hLoot; hostFinal = $hFinal; joinBase = $jBase;
+                            joinPeak = $jPeak; joinFinal = $jFinal })
+}

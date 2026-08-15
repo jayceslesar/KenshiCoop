@@ -37,6 +37,7 @@
 #include "game/Engine.h"
 #include "game/EngineUi.h"       // Phase 5a: F2 co-op panel + status overlay
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
+#include "game/EngineProbe.h"    // buffpc arming: commonNovelWeaponSid + mintGradedGearForTest
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
 #ifdef KENSHICOOP_HARNESS
@@ -935,9 +936,31 @@ void tickSetupScene(GameWorld* gw) {
             // all stats, then leave the game running so the user can SAVE manually
             // (or auto-bake if KENSHICOOP_BAKESAVE is set). No coop peer required.
             unsigned int nb = coop::engine::buffAllPlayerStats(gw, 120.0f);
-            char b[128];
+            // ...and mint a Masterwork (grade 100) CROSSBOW into each PC (the generic
+            // factory path mints crossbows reliably; the WEAPON path needs the
+            // manufacturer recipe and mis-mints here). A grade-100 crossbow plus 120
+            // stats is a strong start; for melee, loot a blade off the first corpse -
+            // corpse loot now syncs (upstream #40). Loose: equip it in-game.
+            unsigned int narmed = 0;
+            {
+                coop::EntityState sq[64];
+                unsigned int ns = coop::engine::captureSquad(gw, false, sq, 64);
+                for (unsigned int i = 0; i < ns; ++i) {
+                    unsigned int h[5] = { sq[i].hType, sq[i].hContainer, sq[i].hContainerSerial,
+                                          sq[i].hIndex, sq[i].hSerial };
+                    char wsid[48]; wsid[0] = '\0';
+                    if (coop::engine::commonNovelCrossbowSid(gw, h, wsid, sizeof(wsid)) && wsid[0]) {
+                        int lvl = -1, q = -1;
+                        if (coop::engine::mintGradedGearForTest(gw, h, wsid, 107 /*CROSSBOW*/, 100,
+                                                                &lvl, &q) > 0)
+                            ++narmed;
+                    }
+                }
+            }
+            char b[160];
             _snprintf(b, sizeof(b) - 1,
-                      "SETUP(buffpc): buffed %u PC(s) to 120 in every stat - SAVE now", nb);
+                      "SETUP(buffpc): buffed %u PC(s) to 120 in every stat, armed %u with a "
+                      "grade-100 crossbow - equip it and SAVE", nb, narmed);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
             if (nb > 0 && !g_cfg.bakeSave.empty())
                 g_bakeSaveTick = GetTickCount() + 4000; // let the recalc settle

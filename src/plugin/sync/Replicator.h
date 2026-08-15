@@ -1109,6 +1109,12 @@ private:
     float                     peerCam_[3];    // host: latest peer camera center
     unsigned long             peerCamMs_;     // host: its arrival time (0 = none)
     std::set<Key>             censusHands_;   // join: latest existence set
+    // Corpse census feed (upstream #40): dead world-NPC hands the entity-publish pass
+    // saw this tick. captureNpcs RETAINS bodies across death (a fresh
+    // getCharactersWithinSphere drops dead ones), so publishOwned is the only place the
+    // host reliably sees a corpse; publishInventories folds these into the container
+    // census so a looted corpse's loss syncs to the peer. Rebuilt every publishOwned.
+    std::set<Key>             deadNpcHands_;
     // Whose claim censusHands_ is. Under presence authority a census only
     // speaks for the cells its sender owns, so enforcement has to know who
     // sent it. Defaults to the host, which is who it always was.

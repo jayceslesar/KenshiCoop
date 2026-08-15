@@ -53,6 +53,33 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                 k.s = rows[i].hand[4];
                 censusContainers_.insert(k);
             }
+            // Upstream #40: CORPSES (dead characters) hold lootable inventories the
+            // BUILDING census above never sees, and a fresh getCharactersWithinSphere
+            // drops dead bodies - so the corpse hands come from deadNpcHands_, which
+            // publishOwned filled from the RETAINED entity capture this tick. Fold the
+            // non-empty ones into the SAME host-authoritative census so a looted corpse
+            // syncs its loss to the peer, not just the looter's gain. A corpse is not an
+            // ownHand and not touched by the W2 weapon census, so nothing double-authors
+            // it. Cap so a battlefield of bodies can't crowd out the storage rows.
+            unsigned int corpsesAdded = 0;
+            for (std::set<Key>::const_iterator ci = deadNpcHands_.begin();
+                 ci != deadNpcHands_.end() && corpsesAdded < 32; ++ci) {
+                unsigned int ch[5] = { ci->t, ci->c, ci->cs, ci->i, ci->s };
+                InvItemEntry tmp[INV_ITEMS_MAX];
+                unsigned int cn = engine::captureContainerContents(gw, ch, tmp, INV_ITEMS_MAX, 0);
+                if (cn == 0) continue;   // empty corpse: nothing to sync
+                censusContainers_.insert(*ci);
+                ++corpsesAdded;
+            }
+            {
+                static int cd = -1;
+                if (cd < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); cd = (e && e[0] == '1') ? 1 : 0; }
+                if (cd && (!deadNpcHands_.empty() || corpsesAdded > 0)) {
+                    char b[96]; _snprintf(b, sizeof(b) - 1,
+                        "[corpse] census deadHands=%u added=%u", (unsigned)deadNpcHands_.size(), corpsesAdded);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
         }
         owned.insert(censusContainers_.begin(), censusContainers_.end());
     }
