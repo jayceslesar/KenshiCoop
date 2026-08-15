@@ -8,6 +8,10 @@
 >
 > Most entries generalise past items: they are really about drawing conclusions
 > from engine reads, and about writing gates that can fail.
+>
+> Companion doc: [`ENGINE_FACTS.md`](ENGINE_FACTS.md) is the empirical ledger —
+> the *measured* engine behaviours (with the log line that proves each) that these
+> rules are derived from.
 
 ---
 
