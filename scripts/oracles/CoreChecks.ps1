@@ -37,6 +37,28 @@ function Test-LogHealth {
                 -Metrics @{ errors = $errs.Count } -Detail ($why -join "; "))
 }
 
+# Both processes must have loaded the SAME plugin build ("KenshiCoop: build
+# <date> <time>" is __DATE__/__TIME__ of the DLL each process actually mapped).
+# A stale DLL on one install invalidates every cross-client conclusion, and a
+# protocol bump is the only thing that ever made it visible before this gate.
+function Test-BuildMatch {
+    param([string]$HostFile, [string]$JoinFile)
+    $gate = "build_match"
+    $rx = "KenshiCoop: build (\w{3} +\d+ \d{4} \d\d:\d\d:\d\d)"
+    $h = $null; $j = $null
+    if (Test-Path $HostFile) { $m = Select-String -Path $HostFile -Pattern $rx -ErrorAction SilentlyContinue | Select-Object -First 1; if ($m) { $h = $m.Matches[0].Groups[1].Value } }
+    if (Test-Path $JoinFile) { $m = Select-String -Path $JoinFile -Pattern $rx -ErrorAction SilentlyContinue | Select-Object -First 1; if ($m) { $j = $m.Matches[0].Groups[1].Value } }
+    if ($null -eq $h -or $null -eq $j) {
+        Write-Host "  BUILD-MATCH SKIP - build stamp missing (host='$h' join='$j')"
+        return (Add-GateResult -Name $gate -Status SKIP -Detail "build stamp missing")
+    }
+    $ok = ($h -eq $j)
+    Write-Host ("  BUILD-MATCH " + $(if ($ok) { "PASS" } else { "FAIL" }) + " - host build '$h' join build '$j'")
+    if (-not $ok) { Write-Host "    NOTE: one install ran a STALE DLL - the run is invalid; redeploy (scripts\deploy.cmd) and rerun" }
+    return (Add-GateResult -Name $gate -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostBuild = $h; joinBuild = $j } -Detail $(if ($ok) { "" } else { "host '$h' != join '$j' (stale DLL)" }))
+}
+
 # Engine-side bookkeeping integrity, read from the archived kenshi_info.log
 # (run_test.ps1 copies it as <label>_engine.log; absent for older runs -> SKIP).
 #

@@ -35,13 +35,26 @@ if not exist "%KENSHI%\kenshi_x64.exe" (
 
 if not exist "%DST%" mkdir "%DST%"
 
-copy /Y "%DLL%"  "%DST%\KenshiCoop.dll"   >nul
-if errorlevel 1 (
-    echo ERROR: could not copy KenshiCoop.dll to "%DST%".
+REM A game that just exited (the harness kills it; teardown lags a few seconds)
+REM still holds its DLL - retry for up to ~30 s before calling it locked, so a
+REM deploy right after a run cannot leave that install one build behind (seen
+REM 2026-08-16: three runs judged with a stale JOIN DLL because the join was
+REM still unmapping the previous build when deploy ran).
+set /a TRIES=0
+:copy_host_dll
+copy /Y "%DLL%"  "%DST%\KenshiCoop.dll"   >nul 2>nul
+if not errorlevel 1 goto :host_dll_ok
+set /a TRIES+=1
+if !TRIES! geq 15 (
+    echo ERROR: could not copy KenshiCoop.dll to "%DST%" after !TRIES! tries.
     echo        The file is locked - a Kenshi instance is probably still running.
     echo        Close all Kenshi processes and retry.
     exit /b 1
 )
+echo   host DLL locked, retrying ^(!TRIES!^) ...
+timeout /t 2 /nobreak >nul
+goto :copy_host_dll
+:host_dll_ok
 echo Copied KenshiCoop.dll
 copy /Y "%JSON%" "%DST%\RE_Kenshi.json"   >nul
 if errorlevel 1 (
@@ -72,19 +85,28 @@ dir /b "%DST%"
 REM Also deploy into the separate JOIN install if it exists, so both clients run
 REM the same freshly-built plugin. (Created by scripts\setup_join_install.cmd.)
 set "JOINDIR=%USERPROFILE%\Kenshi-Join"
-if not "%KENSHI%"=="%JOINDIR%" if exist "%JOINDIR%\kenshi_x64.exe" (
-    set "JDST=%JOINDIR%\mods\KenshiCoop"
-    if not exist "!JDST!" mkdir "!JDST!"
-    copy /Y "%DLL%"  "!JDST!\KenshiCoop.dll" >nul
-    if errorlevel 1 (
-        echo ERROR: could not copy KenshiCoop.dll to join install "!JDST!".
-        echo        The file is locked - a Kenshi-Join instance is probably still running.
-        exit /b 1
-    )
-    echo Copied KenshiCoop.dll  -^> join install
-    copy /Y "%JSON%" "!JDST!\RE_Kenshi.json" >nul && echo Copied RE_Kenshi.json  -^> join install
-    copy /Y "%MOD%"  "!JDST!\KenshiCoop.mod" >nul && echo Copied KenshiCoop.mod   -^> join install
+if "%KENSHI%"=="%JOINDIR%" goto :join_done
+if not exist "%JOINDIR%\kenshi_x64.exe" goto :join_done
+set "JDST=%JOINDIR%\mods\KenshiCoop"
+if not exist "%JDST%" mkdir "%JDST%"
+set /a JTRIES=0
+:copy_join_dll
+copy /Y "%DLL%"  "%JDST%\KenshiCoop.dll" >nul 2>nul
+if not errorlevel 1 goto :join_dll_ok
+set /a JTRIES+=1
+if !JTRIES! geq 15 (
+    echo ERROR: could not copy KenshiCoop.dll to join install "%JDST%" after !JTRIES! tries.
+    echo        The file is locked - a Kenshi-Join instance is probably still running.
+    exit /b 1
 )
+echo   join DLL locked, retrying ^(!JTRIES!^) ...
+timeout /t 2 /nobreak >nul
+goto :copy_join_dll
+:join_dll_ok
+echo Copied KenshiCoop.dll  -^> join install
+copy /Y "%JSON%" "%JDST%\RE_Kenshi.json" >nul && echo Copied RE_Kenshi.json  -^> join install
+copy /Y "%MOD%"  "%JDST%\KenshiCoop.mod" >nul && echo Copied KenshiCoop.mod   -^> join install
+:join_done
 
 echo.
 echo Next: launch Kenshi, enable "KenshiCoop" in the Mods tab, then check

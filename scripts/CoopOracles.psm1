@@ -155,6 +155,7 @@ function Invoke-OneOracle {
         "save_probe"     { return (Test-SaveProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "load_probe"     { return (Test-LoadProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "save_sync"      { return (Test-SaveSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "save_fence"     { return (Test-SaveFence      -HostFile $HostLog -JoinFile $JoinLog) }
         "save_resume"    { return (Test-SaveResume     -HostFile $HostLog -JoinFile $JoinLog) }
         "load_sync"      { return (Test-LoadSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "money_persist"  { return (Test-MoneyPersist   -HostFile $HostLog -JoinFile $JoinLog) }
@@ -319,6 +320,11 @@ function Invoke-RunAnalysis {
     $cleanPattern = if ($Scenario -ne "") { "SCENARIO RESULT" } else { "test duration elapsed; exiting" }
     [void](Test-LogHealth -File $HostLog -Label "host" -Required $true -CleanPattern $cleanPattern)
     [void](Test-LogHealth -File $JoinLog -Label "join" -Required $JoinExpected -CleanPattern $cleanPattern)
+    # 1b. Both clients ran the SAME plugin build (always). A deploy issued while
+    # the previous join was still unmapping its DLL left the join one build
+    # behind for three runs on 2026-08-16 - and only a protocol bump made it
+    # visible. The build stamp is the ground truth of what each process loaded.
+    if ($JoinExpected) { [void](Test-BuildMatch -HostFile $HostLog -JoinFile $JoinLog) }
 
     # 1a. Engine bookkeeping integrity (always). Reads the archived kenshi_info.log,
     # so it SKIPs on runs predating the archiving and on log-only re-judges - but it
@@ -411,7 +417,7 @@ function Invoke-RunAnalysis {
     $byName = @{}
     foreach ($g in $gates) { $byName[$g.gate] = $g }
     $reasons = @()
-    $alwaysOn = @("health_host", "health_join", "check_fail", "result_host", "result_join")
+    $alwaysOn = @("health_host", "health_join", "build_match", "check_fail", "result_host", "result_join")
     foreach ($n in $alwaysOn) {
         if ($byName.ContainsKey($n) -and $byName[$n].status -eq "FAIL") { $reasons += "$n FAIL" }
     }
@@ -465,7 +471,7 @@ Export-ModuleMember -Function @(
     "Get-PreRunGates",
     "Get-LogClockOffsetMs", "Get-ClockSyncStats", "Convert-StampToMs",
     "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs",
-    "Test-LogHealth", "Test-EngineIntegrity", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
+    "Test-LogHealth", "Test-BuildMatch", "Test-EngineIntegrity", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
     "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence",
     "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose", "Test-BedWake", "Test-BedLay",
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",
