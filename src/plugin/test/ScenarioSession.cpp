@@ -1051,6 +1051,108 @@ private:
 };
 const char* const SaveSyncScenario::SAVE_NAME = "coopresume";
 
+// save_fence (protocol 58): the host's save must bake the JOIN's newest
+// inventory edit, not the state from before it. Kenshi's SaveManager::save
+// starts writing at once, while an owner-authored inventory snapshot needs its
+// settle window (350 ms; 1800 ms for a removal) plus the wire plus the host's
+// post-engine apply (which can defer ~3 s under the protocol-37 guard) - so a
+// save issued right after the join's edit used to bake the OLD bag (upstream
+// #77: "host reloads, my backpack is empty again"). The fence: the host's save
+// edge sends REQ, the join force-publishes every owned inventory once settled
+// and ACKs on the same ordered channel, the host applies and re-saves.
+//
+// Script: JOIN adds SENTINEL_N of a template the fixture does not carry
+// (SENTINEL_SID) into its OWN tab leader at ADD_AT_MS; HOST issues
+// saveGameAs('coopresume') at SAVE_AT_MS, i.e. INSIDE the settle window. The
+// verdict here is only "the script ran" (join add ok / host save issued); the
+// oracle judges the fence hand-shake in the logs AND greps the saved folder on
+// disk for the sentinel sid against the pristine fixture's baseline count.
+class SaveFenceScenario : public TimedScenario {
+public:
+    SaveFenceScenario()
+        : TimedScenario("save_fence", 0), added_(0), addTried_(false),
+          issued_(false), issueOk_(false), lastStatusMs_(0) {
+        memset(leaderHand_, 0, sizeof(leaderHand_));
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SAVEFENCE start host=%d", ctx.isHost ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // JOIN: the newest edit - into the tab THIS side owns (rank 1; rank 0
+        // when the save has a single tab).
+        if (!ctx.isHost && !addTried_ && ctx.elapsedMs >= ADD_AT_MS) {
+            addTried_ = true;
+            EntityState sq[32];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+            int li = tabLeaderIdx(sq, n, 1u);
+            if (li < 0) li = tabLeaderIdx(sq, n, 0u);
+            if (li >= 0) {
+                handFromEntity(sq[li], leaderHand_);
+                added_ = engine::addItemsToContainerBySid(ctx.gw, leaderHand_, SENTINEL_SID,
+                             SENTINEL_TYPE, SENTINEL_N, /*qualityBucket*/0, "", "");
+            }
+            char b[200];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO SAVEFENCE-ADD n=%d sid='%s' hand=%u,%u,%u,%u,%u t=%lu",
+                      added_, SENTINEL_SID, leaderHand_[0], leaderHand_[1], leaderHand_[2],
+                      leaderHand_[3], leaderHand_[4], ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // HOST: the save, inside the join's settle window.
+        if (ctx.isHost && !issued_ && ctx.elapsedMs >= SAVE_AT_MS) {
+            issued_ = true;
+            issueOk_ = engine::saveGameAs(SAVE_NAME);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO SAVEISSUE name='%s' ok=%d t=%lu",
+                      SAVE_NAME, issueOk_ ? 1 : 0, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ctx.elapsedMs - lastStatusMs_ >= 5000) {
+            lastStatusMs_ = ctx.elapsedMs;
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO SAVESTATE issued=%d sent=%u commit=%d t=%lu",
+                      issued_ ? 1 : 0, savexfer::lastSentXferId(),
+                      savexfer::lastCommitResult(), ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ctx.elapsedMs >= DURATION_MS) {
+            passed_ = ctx.isHost ? issueOk_ : (added_ > 0);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO SAVEFENCE verdict role=%s pass=%d added=%d issued=%d",
+                      ctx.isHost ? "host" : "join", passed_ ? 1 : 0, added_, issueOk_ ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static const unsigned long ADD_AT_MS   = 7900;
+    static const unsigned long SAVE_AT_MS  = 8000;
+    static const unsigned long DURATION_MS = 45000;
+    static const unsigned int  SENTINEL_TYPE = 4;  // ITEM
+    static const int           SENTINEL_N    = 3;
+
+    int           added_;
+    bool          addTried_;
+    bool          issued_, issueOk_;
+    unsigned long lastStatusMs_;
+    unsigned int  leaderHand_[5];
+
+    static const char* const SAVE_NAME;
+    static const char* const SENTINEL_SID;
+};
+const char* const SaveFenceScenario::SAVE_NAME    = "coopresume";
+// "AI Core" - vanilla, and absent from every fixture's platoon files (baseline
+// occurrences in the folder are counted by the oracle, not assumed zero).
+const char* const SaveFenceScenario::SENTINEL_SID = "43392-changes_otto.mod";
+
 // resume_check (protocol 31 phase 12c, stage 2 of resume_test.ps1). Both
 // clients relaunched with KENSHICOOP_SAVE=coopresume - the save the stage-1
 // coordinated transfer delivered to the join. The stage-1 building is BAKED
@@ -1345,6 +1447,7 @@ Scenario* makeSessionScenario(const std::string& name) {
     if (name == "latejoin_sync")  return new LatejoinProbeScenario(false);
     if (name == "save_probe")     return new SaveProbeScenario();
     if (name == "save_sync")      return new SaveSyncScenario(/*stage1=*/false);
+    if (name == "save_fence")     return new SaveFenceScenario();
     if (name == "save_stage1")    return new SaveSyncScenario(/*stage1=*/true);
     if (name == "resume_check")   return new ResumeCheckScenario();
     if (name == "load_probe")     return new LoadProbeScenario();

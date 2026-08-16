@@ -438,6 +438,96 @@ function Test-SaveSync {
                 -Metrics @{ sentFiles = $sFiles; sentBytes = $sBytes; commitFiles = $cFiles; commitBytes = $cBytes; xferMs = $xferMs } -Detail $detail)
 }
 
+# save_fence (protocol 58): the host's save must bake the JOIN's newest
+# inventory edit. Gates (1) the script ran (join added the sentinel, host
+# issued the save), (2) the fence hand-shake in the logs (REQ -> ACK -> RESAVE
+# reason=ack-applied, and the host applied the join's leader snapshot BEFORE
+# the fenced re-save), (3) the DISK: the saved folder carries MORE occurrences
+# of the sentinel sid than the pristine fixture (baseline counted live from
+# fixtures\saves\<save>, never assumed zero - the main .save references items
+# for reasons other than inventory).
+function Test-SaveFence {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $sid = '43392-changes_otto.mod'
+
+    # 1. script ran.
+    $add = Select-String -Path $JoinFile -Pattern "SCENARIO SAVEFENCE-ADD n=(\d+) sid='([^']*)' hand=([\d,]+) t=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $addN = 0; $addHand = ""; $addT = -1
+    if ($null -eq $add) { $why += "join never logged SAVEFENCE-ADD" }
+    else {
+        $g = $add.Matches[0].Groups
+        $addN = [int]$g[1].Value; $sid = $g[2].Value; $addHand = $g[3].Value; $addT = [int]$g[4].Value
+        if ($addN -le 0) { $why += "join could not add the sentinel (n=$addN)" }
+    }
+    $issue = Select-String -Path $HostFile -Pattern "SCENARIO SAVEISSUE name='coopresume' ok=(\d) t=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $issueT = -1
+    if ($null -eq $issue) { $why += "host never issued the save" }
+    elseif ($issue.Matches[0].Groups[1].Value -ne '1') { $why += "host saveGameAs failed" }
+    else { $issueT = [int]$issue.Matches[0].Groups[2].Value }
+    if ($addT -ge 0 -and $issueT -ge 0) {
+        Write-Host "    FINDING: join edit at t=${addT}ms, host save issued at t=${issueT}ms (scenario clocks; window $($issueT - $addT)ms)"
+    }
+
+    # 2. the hand-shake.
+    $req = Select-String -Path $HostFile -Pattern "\[invsave\] REQ->join fence=(\d+) name='coopresume'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $ack = Select-String -Path $HostFile -Pattern "\[invsave\] ACK<-join fence=(\d+) containers=(\d+) truncated=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $resave = Select-String -Path $HostFile -Pattern "\[invsave\] RESAVE fence=(\d+) name='coopresume' reason=(\S+) containers=(\d+) truncated=(\d+) issued=(\d)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $fenced = Select-String -Path $HostFile -Pattern "\[save\] FENCED-RESAVE name='coopresume'" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $reason = ""; $ackContainers = -1
+    if ($null -eq $req) { $why += "host never sent the fence REQ (fence not armed)" }
+    if ($null -eq $ack) { $why += "host never received the join's fence ACK" } else { $ackContainers = [int]$ack.Matches[0].Groups[2].Value }
+    if ($null -eq $resave) { $why += "host never re-saved after the fence" }
+    else {
+        $g = $resave.Matches[0].Groups; $reason = $g[2].Value
+        if ($reason -ne 'ack-applied') { $why += "re-save reason was '$reason', not ack-applied" }
+        if ($g[5].Value -ne '1') { $why += "fenced re-save was not issued" }
+    }
+    if ($null -eq $fenced) { $why += "save detour never saw the FENCED-RESAVE (bypass path broken)" }
+    Write-Host "    FINDING: fence REQ=$([bool]$req) ACK=$([bool]$ack) (containers=$ackContainers) RESAVE=$([bool]$resave) reason='$reason'"
+
+    # 2b. the host APPLIED the join leader's snapshot before the fenced re-save.
+    if ($addHand -ne "" -and $null -ne $fenced) {
+        $applied = Select-String -Path $HostFile -Pattern "\[inv\] APPLY hand=$([regex]::Escape($addHand)) items=(\d+)" -ErrorAction SilentlyContinue
+        $applyBefore = $false
+        foreach ($m in @($applied)) { if ($m.LineNumber -lt $fenced.LineNumber) { $applyBefore = $true } }
+        if (-not $applyBefore) { $why += "host never applied the join leader's snapshot before the fenced re-save" }
+        Write-Host ("    FINDING: host applied join leader $addHand before FENCED-RESAVE: " + $applyBefore)
+    }
+
+    # 3. the disk.
+    $saveRoot = Join-Path $env:LOCALAPPDATA 'kenshi\save\coopresume'
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $fixSave = ""
+    $mf = Select-String -Path $HostFile -Pattern "save='([^']*)'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $mf) { $fixSave = $mf.Matches[0].Groups[1].Value }
+    if ($fixSave -eq "") { $fixSave = "squad1" }
+    $fixRoot = Join-Path $repoRoot "fixtures\saves\$fixSave"
+    function Count-Sid([string]$root, [string]$s) {
+        if (-not (Test-Path $root)) { return -1 }
+        $n = 0
+        foreach ($f in @(Get-ChildItem -Path $root -Recurse -File -Include *.save,*.platoon -ErrorAction SilentlyContinue)) {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $txt = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+            $idx = 0
+            while (($idx = $txt.IndexOf($s, $idx, [System.StringComparison]::Ordinal)) -ge 0) { $n++; $idx += $s.Length }
+        }
+        return $n
+    }
+    $base = Count-Sid $fixRoot $sid
+    $after = Count-Sid $saveRoot $sid
+    Write-Host "    FINDING: sentinel '$sid' occurrences - fixture '$fixSave' baseline=$base, saved 'coopresume'=$after"
+    if ($base -lt 0) { $why += "fixture folder not found for baseline ($fixRoot)" }
+    elseif ($after -lt 0) { $why += "saved folder not found ($saveRoot)" }
+    elseif ($after -le $base) { $why += "the saved folder does NOT carry the join's sentinel (after=$after <= baseline=$base): the host baked the pre-edit bag" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  SAVE-FENCE $v - added=$addN reason='$reason' disk=$after/$base $detail"
+    return (Add-GateResult -Name "save_fence" -Status $v `
+                -Metrics @{ added = $addN; reason = $reason; ackContainers = $ackContainers; diskAfter = $after; diskBase = $base } -Detail $detail)
+}
+
 # connect_bootstrap (push-save-on-connect): the seamless-join proof. The HOST
 # is in a game; a JOIN with no matching save goes ONLINE. On the connect edge
 # (or the host's gameplay-start edge if the join beat it) the host BAKES its

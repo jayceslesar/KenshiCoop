@@ -1412,6 +1412,24 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # save_fence (protocol 58): the host's save must bake the JOIN's newest
+        # inventory edit. Kenshi starts writing the save at once while an
+        # owner-authored snapshot needs its settle window + the wire + the host's
+        # post-engine apply, so a save right after the join's edit used to bake
+        # the old bag (upstream #77). The join adds a sentinel item to its own
+        # tab leader 100 ms before the host saves; the fence (REQ -> forced
+        # snapshots -> ACK -> host applies -> re-save) must land it. Gate: the
+        # hand-shake in the logs AND the saved folder on disk carries MORE
+        # occurrences of the sentinel sid than the pristine fixture. Save
+        # 'squad1' (two tabs, join owns rank 1).
+        save_fence = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'save_fence'
+            Gating   = @('save_fence', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # save_stage1: resume_test.ps1 stage 1 (not a tier member - the
         # two-stage wrapper drives it). Same coordinated-save gates as
         # save_sync, but the host FIRST places a construction site and ramps
