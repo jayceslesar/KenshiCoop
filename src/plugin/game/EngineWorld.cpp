@@ -116,6 +116,74 @@ unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut
     return n;
 }
 
+namespace {
+// Is this live world Character a shopkeeper? Character::isATrader first, then
+// the platoon's own flag (a shop squad is a trader platoon). Caller holds SEH.
+int traderHow(Character* c) {
+    if (!c) return 0;
+    if (g_charIsTraderFn && g_charIsTraderFn(c)) return 1;
+    if (g_getPlatoonFn && g_apIsTraderFn) {
+        ActivePlatoon* ap = g_getPlatoonFn(c);
+        if (ap && g_apIsTraderFn(ap)) return 2;
+    }
+    return 0;
+}
+} // namespace
+
+unsigned int enumTradersNear(GameWorld* gw, float radius, TraderRead* out,
+                             unsigned int maxOut) {
+    if (!gw || !gw->player || !out || maxOut == 0 || !g_getCharsFn) return 0;
+    if (!g_charIsTraderFn && !g_apIsTraderFn) return 0;
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 centers[4];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], radius, radius, 30.0f, 64, 64, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o || isPlayerSquad(gw, o)) continue;
+                Character* c = static_cast<Character*>(o);
+                // A dead shopkeeper is a CORPSE (the #40 census row), not a vendor.
+                if (g_isDeadCharFn && g_isDeadCharFn(c)) continue;
+                int how = traderHow(c);
+                if (!how) continue;
+                unsigned int h[5];
+                if (!readObjectHand(o, h)) continue;
+                bool dup = false; // the interest spheres can overlap
+                for (unsigned int k = 0; k < n; ++k)
+                    if (out[k].hand[3] == h[3] && out[k].hand[4] == h[4] &&
+                        out[k].hand[1] == h[1]) { dup = true; break; }
+                if (dup) continue;
+                TraderRead& r = out[n];
+                memset(&r, 0, sizeof(r));
+                memcpy(r.hand, h, sizeof(h));
+                r.how = how;
+                __try {
+                    Ogre::Vector3 p = o->getPosition();
+                    r.x = p.x; r.y = p.y; r.z = p.z;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                Inventory* inv = invOf(o);
+                if (inv) {
+                    InvItemEntry ent[64];
+                    unsigned int ne = readInvItems(inv, ent, 0, 64);
+                    r.nEntries = (int)ne;
+                    int q = 0;
+                    for (unsigned int e = 0; e < ne; ++e)
+                        q += (ent[e].quantity < 1) ? 1 : (int)ent[e].quantity;
+                    r.qtyTotal = q;
+                }
+                charName(c, r.name, sizeof(r.name));
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
 bool readPlayerWallet(GameWorld* gw, int* outMoney) {
     if (outMoney) *outMoney = -1;
     if (!gw || !outMoney || !g_ownGetMoneyFn) return false;
@@ -1726,6 +1794,82 @@ int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]) {
         if (!inv) coop::logLine("[shop] ensure-stock refresh-ran inv-still-null");
         return inv ? 1 : 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int forceTraderRefresh(GameWorld* gw, const unsigned int cHand[5], bool firstTime) {
+    (void)gw;
+    if (!cHand) return -1;
+    if (!g_getPlatoonFn || !g_platoonRefreshInvFn) return 0;
+    Character* c = resolveCharByHand(cHand[3], cHand[4], cHand[0], cHand[1], cHand[2]);
+    if (!c) return 0;
+    __try {
+        ActivePlatoon* ap = g_getPlatoonFn(c);
+        if (!ap) return 0;
+        g_platoonRefreshInvFn(ap, firstTime);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int probeVendorViewOverlap(GameWorld* gw, const unsigned int cHand[5], float radius) {
+    if (!gw || !gw->player || !cHand || !g_getObjsFn) return 0;
+    RootObject* keeper = resolveObjectByHand(cHand);
+    int examined = 0;
+    __try {
+        // The shopkeeper's own Item* set.
+        Item* kItems[96]; InvItemEntry kEnt[96];
+        unsigned int kn = 0;
+        Inventory* kinv = keeper ? invOf(keeper) : 0;
+        if (kinv) kn = readInvItems(kinv, kEnt, kItems, 96);
+        // The censused shelf buildings' Item* sets (union).
+        Item* sItems[256]; unsigned int sn = 0;
+        {
+            ContRead rows[48];
+            unsigned int nr = enumContainersNear(gw, radius, rows, 48);
+            for (unsigned int i = 0; i < nr && sn < 256; ++i) {
+                RootObject* ro = resolveObjectByHand(rows[i].hand);
+                Inventory* inv = ro ? invOf(ro) : 0;
+                if (!inv) continue;
+                Item* tmp[64]; InvItemEntry te[64];
+                unsigned int tn = readInvItems(inv, te, tmp, 64);
+                for (unsigned int j = 0; j < tn && sn < 256; ++j) sItems[sn++] = tmp[j];
+            }
+        }
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return 0;
+        Ogre::Vector3 center = ld->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, SHOP_TRADER_CLASS, 64, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* o = g_npcQuery[i]; if (!o) continue;
+            Inventory* vinv = invOf(o);
+            if (!vinv) continue; // lazy view not built for this vendor
+            ++examined;
+            Item* vItems[128]; InvItemEntry vEnt[128];
+            unsigned int vn = readInvItems(vinv, vEnt, vItems, 128);
+            unsigned int inKeeper = 0, inShelf = 0;
+            for (unsigned int a = 0; a < vn; ++a) {
+                if (!vItems[a]) continue;
+                for (unsigned int b = 0; b < kn; ++b) if (kItems[b] == vItems[a]) { ++inKeeper; break; }
+                for (unsigned int b = 0; b < sn; ++b) if (sItems[b] == vItems[a]) { ++inShelf; break; }
+            }
+            unsigned int vh[5] = { 0, 0, 0, 0, 0 };
+            readObjectHand(o, vh);
+            Character* tr = traderOf(static_cast<ShopTrader*>(o));
+            unsigned int th[5] = { 0, 0, 0, 0, 0 };
+            if (tr) readObjectHand(static_cast<RootObject*>(tr), th);
+            char b[240];
+            _snprintf(b, sizeof(b) - 1,
+                      "[shop] VIEW-OVERLAP vendor=%u,%u thand=%u,%u,%u,%u,%u viewN=%u keeperN=%u "
+                      "shelfN=%u inKeeper=%u inShelf=%u sameKeeper=%d",
+                      vh[3], vh[4], th[0], th[1], th[2], th[3], th[4], vn, kn, sn,
+                      inKeeper, inShelf,
+                      (tr && keeper && static_cast<RootObject*>(tr) == keeper) ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return examined; }
+    return examined;
 }
 
 int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],

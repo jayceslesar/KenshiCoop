@@ -1444,6 +1444,13 @@ private:
     bool           storeSync_;
     unsigned long  contCensusMs_;
     std::set<Key>  censusContainers_;
+    // Rows that just LEFT the census while still resolving here, kept authored
+    // for a grace window (value = ms they dropped out). The census admits a
+    // non-storage shelf / a corpse only while it CARRIES items, so the state that
+    // matters most - "the last item was taken, it is EMPTY now" - would otherwise
+    // never publish and the peer would keep the phantom. Bounded by the census
+    // size; a row that stops resolving (zone unload) is dropped at once.
+    std::map<Key, unsigned long> censusSticky_;
 
     // Phase W1 world-item state.
     // HOST: worldTrack_ maps a ground item's LOCAL engine hand (Key) to its assigned

@@ -271,6 +271,10 @@ typedef bool  (__fastcall* TownIsPlayerBldgsFn)(const Town* self);
 typedef Character* (__fastcall* BldResidentLeaderFn)(const Building* self);
 typedef int  (__fastcall* BldNumInternalFn)(const Building* self);
 typedef Character* (__fastcall* ShopGetTraderFn)(const ShopTrader* self);
+// vendor-stock mirror: shopkeeper identification + the platoon's leader
+typedef bool (__fastcall* CharIsTraderFn)(const Character* self);
+typedef bool (__fastcall* ApIsTraderFn)(const ActivePlatoon* self);
+typedef Character* (__fastcall* ApSquadLeaderFn)(ActivePlatoon* self);
 
 // recruitment (protocol 23) + squad moves (protocol 35)
 typedef bool (__fastcall* RecruitFn)(PlayerInterface* self, Character* c, bool editor);
@@ -493,6 +497,9 @@ extern OwnSetMoneyFn g_ownSetMoneyFn;
 extern BuyItemFn     g_buyItemFn;
 extern PlatoonRefreshInvFn g_platoonRefreshInvFn;
 extern ShopGetTraderFn     g_shopGetTraderFn;
+extern CharIsTraderFn      g_charIsTraderFn;
+extern ApIsTraderFn        g_apIsTraderFn;
+extern ApSquadLeaderFn     g_apSquadLeaderFn;
 
 // property deeds (protocol 54)
 extern OwnAddObjFn   g_ownAddObjFn;

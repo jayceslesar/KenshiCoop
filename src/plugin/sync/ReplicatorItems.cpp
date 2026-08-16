@@ -45,6 +45,8 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
             const unsigned int MAX_CONT = 48;
             static engine::ContRead rows[MAX_CONT]; // main-thread only
             unsigned int n = engine::enumContainersNear(gw, 100.0f, rows, MAX_CONT);
+            std::set<Key> prevCensus;
+            prevCensus.swap(censusContainers_);
             censusContainers_.clear();
             for (unsigned int i = 0; i < n; ++i) {
                 if (!rows[i].hasInv) continue; // no Inventory = nothing to author
@@ -71,6 +73,44 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                 censusContainers_.insert(*ci);
                 ++corpsesAdded;
             }
+            // Vendor-stock mirror: SHOPKEEPERS. A vendor's trade window is an
+            // aggregated view over the shop's shelves (censused above since #72.4)
+            // and the trader Character's OWN inventory - the half no census saw.
+            // Fold the live shopkeepers near the interest centers in as ordinary
+            // host-authoritative rows (a baked town NPC's hand is save-stable, so
+            // the join resolves the same body). Admitted regardless of emptiness: a
+            // shopkeeper always wears something, and an emptied stock is exactly the
+            // state that must cross. Not an ownHand, not W2-censused (that diff only
+            // walks OWNED characters), so nothing double-authors it. Capped so a
+            // market street cannot crowd out the storage rows.
+            const unsigned int MAX_TRADERS = 12;
+            static engine::TraderRead trows[MAX_TRADERS]; // main-thread only
+            unsigned int nt = engine::enumTradersNear(gw, 100.0f, trows, MAX_TRADERS);
+            for (unsigned int i = 0; i < nt; ++i) {
+                Key k; k.t = trows[i].hand[0]; k.c = trows[i].hand[1];
+                k.cs = trows[i].hand[2]; k.i = trows[i].hand[3]; k.s = trows[i].hand[4];
+                censusContainers_.insert(k);
+            }
+            // Sticky exit: a row that just left the census but still resolves stays
+            // authored for a grace window, so the transition INTO "empty" (last shelf
+            // item taken, last corpse item looted) publishes at least once instead of
+            // freezing the peer on the pre-take snapshot. Rows that resolve no more
+            // (zone unload / body gone) drop immediately; the window bounds the rest.
+            const unsigned long CENSUS_STICKY_MS = 60000;
+            for (std::set<Key>::const_iterator pi = prevCensus.begin(); pi != prevCensus.end(); ++pi)
+                if (censusContainers_.count(*pi) == 0 && censusSticky_.count(*pi) == 0)
+                    censusSticky_[*pi] = cnow;
+            for (std::map<Key, unsigned long>::iterator si = censusSticky_.begin();
+                 si != censusSticky_.end(); ) {
+                const Key& k = si->first;
+                unsigned int sh[5] = { k.t, k.c, k.cs, k.i, k.s };
+                bool keep = (censusContainers_.count(k) == 0) &&
+                            (cnow - si->second) < CENSUS_STICKY_MS &&
+                            engine::resolveObjectByHand(sh) != 0;
+                if (!keep) { censusSticky_.erase(si++); continue; }
+                censusContainers_.insert(k);
+                ++si;
+            }
             {
                 static int cd = -1;
                 if (cd < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); cd = (e && e[0] == '1') ? 1 : 0; }
@@ -78,6 +118,20 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                     char b[96]; _snprintf(b, sizeof(b) - 1,
                         "[corpse] census deadHands=%u added=%u", (unsigned)deadNpcHands_.size(), corpsesAdded);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                if (cd && (nt > 0 || !censusSticky_.empty())) {
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[shop] census traders=%u sticky=%u rows=%u",
+                        nt, (unsigned)censusSticky_.size(), (unsigned)censusContainers_.size());
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    for (unsigned int i = 0; i < nt; ++i) {
+                        char t[200]; _snprintf(t, sizeof(t) - 1,
+                            "[shop] trader hand=%u,%u,%u,%u,%u how=%d entries=%d qty=%d name='%s'",
+                            trows[i].hand[0], trows[i].hand[1], trows[i].hand[2], trows[i].hand[3],
+                            trows[i].hand[4], trows[i].how, trows[i].nEntries, trows[i].qtyTotal,
+                            trows[i].name);
+                        t[sizeof(t) - 1] = '\0'; coop::logLine(t);
+                    }
                 }
             }
         }
@@ -210,6 +264,37 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
 }
 
 void Replicator::applyInventories(GameWorld* gw) {
+    // Vendor-stock mirror: the engine just REGENERATED a trader platoon's stock on
+    // this client (shop-open initial fill or the periodic restock, detoured at
+    // ActivePlatoon::refreshInventory). On the census author that is simply new
+    // truth and publishes through the change gate. Everywhere else it is a local
+    // random roll over host-authoritative containers, so re-assert every snapshot
+    // we hold NOW rather than waiting for the author's next safety resend (5-30 s
+    // of divergent stock the player could buy from). Drained on both sides so the
+    // queue never grows; only the non-author acts on it.
+    {
+        engine::TraderRefreshEdge re[8];
+        unsigned int nr = engine::drainTraderRefreshes(re, 8);
+        if (nr > 0 && !storeSync_ && !invRecv_.empty()) {
+            unsigned int marked = 0;
+            for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin(); ri != invRecv_.end(); ++ri) {
+                // The regen is ENGINE noise, not a drag: rebase the protocol-37
+                // transfer detector on the post-regen contents first, or (a) the
+                // detector pairs the shuffled shelves into cross-container intents
+                // and forwards the join's random roll to the host (seen: 3 of 5
+                // ACCEPTED, run 094536), and (b) the reconcile below defers up to 3 s
+                // on the "unadjudicated local diff" while it does. Rebased again on
+                // the host's truth by the apply itself.
+                xferRebase(gw, ri->first);
+                if (!ri->second.dirty) { ri->second.dirty = true; ++marked; }
+            }
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[shop] REFRESH-INV re-assert edges=%u first=%d leader=%u,%u,%u,%u,%u snapshots=%u",
+                nr, re[0].firstTime, re[0].leaderHand[0], re[0].leaderHand[1],
+                re[0].leaderHand[2], re[0].leaderHand[3], re[0].leaderHand[4], marked);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
     if (invRecv_.empty()) return;
     for (std::map<Key, InvRecv>::iterator it = invRecv_.begin(); it != invRecv_.end(); ++it) {
         if (!it->second.dirty) continue;

@@ -2176,6 +2176,16 @@ void installEngineDetours() {
         else
             coopLog("[shop] FAILED to install buyItem detour; purchase logging off");
     }
+    // Vendor-stock mirror: shopkeeper inventories ride the host-authoritative
+    // container census (storeSync); the refreshInventory detour lets the join
+    // re-assert the host's snapshots the moment its own engine regenerates a
+    // trader's stock. Both sides install it (the host only logs the edge).
+    if (g_cfg.storeSync) {
+        if (coop::engine::installTraderRefreshHook())
+            coopLog("[shop] refreshInventory detour installed; vendor-stock mirror ON");
+        else
+            coopLog("[shop] FAILED to install refreshInventory detour; vendor stock re-asserts only on the periodic resend");
+    }
 
     // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER, default ON in real sessions):
     // refuse a UI inventory drag whose source + destination squad characters are

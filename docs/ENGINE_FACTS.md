@@ -120,6 +120,43 @@ fixture silently rots across runs unless it is restored first.
   them is a Kenshi developer data file, none are third-party mods — so the mod
   list can be trimmed to `KenshiCoop.mod` for faster, cleaner test runs.
 
+## 7. Vendor stock is regenerated INTO the shop's shelf/container buildings, per client; the trade window is a view
+
+`ActivePlatoon::refreshInventory(firstTime)` — the engine's trader-stock builder,
+scheduled off `Platoon::traderInventoryRefreshTime` and run on the shop-open path
+— rewrites the contents of the shop's **container-bearing buildings** (shelves,
+tables, counters), not the shopkeeper's own inventory and not a `ShopTrader`
+store. `ShopTraderInventory` (the trade window) is an aggregated view over those
+backing stores (`inventories: hand -> InventorySection`, `_addItemToInventories`),
+which is why buying visibly removes the item from the shelf. Every client rolls
+its own stock, so without a mirror the two players shop from different wares.
+
+- **Evidence.** vendor_stock run 095133 (bar-town `sync` save, 1.0.65): a forced
+  `refreshInventory(firstTime=true)` on the bar platoon changed the content hash
+  of **13 censused building rows within 400 ms** (`[inv] SEND hand=0,2069,...`
+  items 7→6, 3→8, …) while the shopkeeper Character rows (`Barman`, entries=2)
+  and the pinned keeper's count stayed put (`XVENDOR overlap ... hostRegen=1
+  before=9 after=9`). `refreshInventory(firstTime=false)` off-schedule was a
+  no-op (`XVENDOR regen ran=1 before=9 after=9`, run 094025) — the periodic path
+  is timer-gated. Every `SHOP_TRADER_CLASS` wrapper in that save is unbound
+  (`[shop] ensure-stock trader-null` ×8) and `refreshInventory` did NOT build a
+  view (`views=0`), so the wrapper's lazy `Inventory` belongs to the trade UI.
+- **Confidence: high** for "regen writes the shelves"; **medium** for the exact
+  membership of the aggregated view (inferred from the header + the shelf
+  behaviour, not dumped).
+- **Also measured:** `Character::isATrader()` is a PLATOON-level flag — it is
+  true for the bar's guards as well as the Barman (`[shop] trader ... name='Ninja
+  Guard' how=1`), so "trader Character" enumerations pick up the whole shop
+  squad.
+- **Consequence.** The mirror is the host-authoritative container census: the
+  shelves ride it since #72.4, the shopkeeper Characters since the vendor-stock
+  work, and a row that goes EMPTY must stay authored long enough to publish the
+  empty state (the sticky-exit rows — `shelf_empty` fails without them). On the
+  join, a local regen is engine noise: rebase the protocol-37 transfer detector
+  and re-assert the held snapshots (`[shop] REFRESH-INV re-assert`); without the
+  rebase the detector forwarded the join's random roll to the host as transfer
+  intents (run 094536: 3 of 5 accepted).
+
 ---
 
 ### How to add a fact here

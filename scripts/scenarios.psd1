@@ -1072,9 +1072,10 @@
         # tab leader's personal inventory, same tick); gates that BOTH effects
         # land - the item converges on the peer over the inventory snapshot
         # channel, and BOTH purchases are paid for out of the one pool (seed
-        # 5000 -> 4500). The vendor-side mutation stays local by design (the
-        # engine regenerates vendor stock per client; the [shop] BUY-LOCAL detour
-        # is collecting field evidence for that mirror).
+        # 5000 -> 4500). The vendor-side mutation is now covered separately: the
+        # stock lives in the shop's shelf/container buildings + the shopkeeper's
+        # inventory, which ride the host-authoritative container census
+        # (shop_shelf / shelf_empty / vendor_stock; ENGINE_FACTS #7).
         vendor_trade = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
@@ -2269,6 +2270,38 @@
             Save = 'sync'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'shop_shelf'
             Gating   = @('shop_shelf', 'clock_sync')
+            Advisory = @('smoothness', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # shelf_empty: the LAST-item case of shop_shelf. The census admits a
+        # non-storage shelf only while it carries items, so once the host took the
+        # last one the row left the census and "empty now" never published - the
+        # peer kept a phantom of exactly the lone rare piece. The sticky-exit rows
+        # keep a departed row authored for a grace window. Both clients pin the
+        # smallest-stock non-storage shelf; the host loots EVERYTHING; the join must
+        # end at exactly 0 (Test-ShopShelf with zero tolerance).
+        shelf_empty = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_STORE_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'shelf_empty'
+            Gating   = @('shelf_empty', 'clock_sync')
+            Advisory = @('smoothness', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # vendor_stock: a vendor's trade window is a VIEW over the shop's shelves
+        # (#72.4) and the shopkeeper Character's own inventory, and the engine
+        # regenerates that stock randomly per client - so the two players used to
+        # shop from different stock. The shopkeepers now ride the host-authoritative
+        # container census and the join re-asserts the host's snapshots whenever its
+        # own engine regenerates a trader's stock (refreshInventory detour). Both
+        # clients pin the smallest-hand stocked shopkeeper in range; the host seeds
+        # and loots one ware; the join must mirror it - and still mirror after it
+        # forces its own local regen. Needs storeSync ON. Save 'sync' (bar town).
+        vendor_stock = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_STORE_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'vendor_stock'
+            Gating   = @('vendor_stock', 'clock_sync')
             Advisory = @('smoothness', 'march')
             Tier = 'full'; WanVariant = $false
         }

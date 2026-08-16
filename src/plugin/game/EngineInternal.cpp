@@ -667,6 +667,42 @@ OwnSetMoneyFn g_ownSetMoneyFn = 0;
 BuyItemFn     g_buyItemFn     = 0;
 PlatoonRefreshInvFn g_platoonRefreshInvFn = 0;
 ShopGetTraderFn     g_shopGetTraderFn     = 0;
+CharIsTraderFn      g_charIsTraderFn      = 0;
+ApIsTraderFn        g_apIsTraderFn        = 0;
+ApSquadLeaderFn     g_apSquadLeaderFn     = 0;
+
+// Vendor-stock mirror: detour ActivePlatoon::refreshInventory. The engine's own
+// trader-stock builder (initial fill on the shop-open path, periodic restock off
+// Platoon::traderInventoryRefreshTime) rolls RANDOM wares per client, so after it
+// runs the join's shopkeeper/shelf contents differ from the host's until the
+// host-authoritative census re-asserts them. The original always runs; the detour
+// records the edge (trader platoons only) for the Replicator to drain once per
+// tick. Engine tick and plugin tick share the main thread - no lock.
+PlatoonRefreshInvFn g_refreshInvOrig = 0;
+std::vector<TraderRefreshEdge> g_traderRefreshes;
+void __fastcall refreshInventory_hook(ActivePlatoon* self, bool firstTime) {
+    g_refreshInvOrig(self, firstTime);
+    __try {
+        bool trader = false;
+        if (self && g_apIsTraderFn) trader = g_apIsTraderFn(self);
+        static int dumpRi = -1;
+        if (dumpRi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpRi = (e && e[0] == '1') ? 1 : 0; }
+        if (!trader && !dumpRi) return;
+        TraderRefreshEdge e;
+        memset(&e, 0, sizeof(e));
+        e.firstTime = firstTime ? 1 : 0;
+        Character* ld = 0;
+        if (self && g_apSquadLeaderFn) ld = g_apSquadLeaderFn(self);
+        if (ld) readObjectHand(static_cast<RootObject*>(ld), e.leaderHand);
+        if (trader && g_traderRefreshes.size() < 32) g_traderRefreshes.push_back(e);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[shop] REFRESH-INV trader=%d first=%d leader=%u,%u,%u,%u,%u",
+                  trader ? 1 : 0, e.firstTime,
+                  e.leaderHand[0], e.leaderHand[1], e.leaderHand[2], e.leaderHand[3], e.leaderHand[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 
 // Property deeds (protocol 54). Buying a house/shop adds the building's hand to
 // the PLAYER FACTION's owned-object set (Faction::factionOwnerships) and moves
@@ -691,10 +727,11 @@ TownIsPlayerBldgsFn  g_townIsPlayerBldgsFn  = 0;
 // and the enumerated SHOP_TRADER_CLASS objects carry no bound trader - shop_
 // probe runs 103018-104036). The detour makes every REAL purchase in a manual
 // field session log a "[shop] BUY-LOCAL" line (seller identity + money, item
-// sid, buyer) - the evidence that gates the eventual vendor-stock mirror. The
-// buyer-side effects (wallet debit, item into the buyer's inventory) already
-// ride the money + inventory channels; only the VENDOR-side mutation stays
-// local, which this line makes measurable.
+// sid, buyer). The buyer-side effects (wallet debit, item into the buyer's
+// inventory) ride the money + inventory channels; the VENDOR-side mutation
+// lands in the shop's shelf/container buildings (ENGINE_FACTS #7), which ride
+// the host-authoritative container census (shop_shelf / vendor_stock), so this
+// line is now plain purchase observability.
 BuyItemFn g_buyItemOrig = 0;
 Item* __fastcall buyItem_hook(Inventory* self, Item* itemToBuy, RootObject* sendingTo) {
     Item* got = g_buyItemOrig(self, itemToBuy, sendingTo);
@@ -1689,6 +1726,11 @@ void resolve() {
     g_platoonRefreshInvFn =
         (PlatoonRefreshInvFn)KenshiLib::GetRealAddress(&ActivePlatoon::refreshInventory);
     g_shopGetTraderFn = (ShopGetTraderFn)KenshiLib::GetRealAddress(&ShopTrader::getTrader);
+    // Vendor-stock mirror (shopkeeper census + restock edge; non-fatal: unresolved
+    // -> no trader rows / no refresh edges, and the vendor_stock scenario logs it).
+    g_charIsTraderFn  = (CharIsTraderFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    g_apIsTraderFn    = (ApIsTraderFn)KenshiLib::GetRealAddress(&ActivePlatoon::getIsTrader);
+    g_apSquadLeaderFn = (ApSquadLeaderFn)KenshiLib::GetRealAddress(&ActivePlatoon::getSquadLeader);
     // Property deeds (protocol 54; non-fatal: unresolved -> CAP_DEED off and the
     // deed channel refuses to write, which the deed_probe reports).
     g_ownAddObjFn  = (OwnAddObjFn)KenshiLib::GetRealAddress(&Ownerships::addOwnedObject);
@@ -2205,6 +2247,21 @@ unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut) {
     for (unsigned int i = 0; i < g_dropEdges.size() && n < maxOut; ++i, ++n)
         out[n] = g_dropEdges[i];
     g_dropEdges.clear();
+    return n;
+}
+
+bool installTraderRefreshHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(&ActivePlatoon::refreshInventory);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&refreshInventory_hook,
+                              (void**)&g_refreshInvOrig) == KenshiLib::SUCCESS;
+}
+
+unsigned int drainTraderRefreshes(TraderRefreshEdge* out, unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < g_traderRefreshes.size() && n < maxOut; ++i, ++n)
+        out[n] = g_traderRefreshes[i];
+    g_traderRefreshes.clear();
     return n;
 }
 

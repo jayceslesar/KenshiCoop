@@ -2877,21 +2877,31 @@ private:
 // are used, so no cross-client sid agreement is needed. Verdict carries the
 // subject hand + class so a determinism miss (two sides pinned different shelves)
 // is told apart from the real bug. XSHELF log contract; judged by Test-ShopShelf.
+//
+// emptyMode ("shelf_empty"): the LAST-ITEM case. The census admits a non-storage
+// shelf only while it CARRIES items, so once the host takes the last one the row
+// used to fall out of the census and the "empty now" state never published - the
+// peer kept a phantom of exactly the item that mattered (a lone rare piece). The
+// sticky-exit rows in publishInventories keep a departed row authored for a grace
+// window so the empty snapshot crosses. In this mode both clients pin the
+// smallest-STOCK non-storage shelf (ties by hand), the host skips the seed and
+// loots EVERYTHING off it, and the gate is exact: host final 0, join final 0.
 class ShopShelfScenario : public Scenario {
 public:
-    ShopShelfScenario()
-        : passed_(false), isHost_(false), have_(false),
+    explicit ShopShelfScenario(bool emptyMode = false)
+        : emptyMode_(emptyMode), passed_(false), isHost_(false), have_(false),
           seeded_(0), looted_(0), seedTried_(false), lootTried_(false),
           subjClass_(-1), subjEntries_(0), seedType_(0),
           base_(-1), peak_(-1), final_(-1), lastLogMs_(0) {
         for (int i = 0; i < 5; ++i) subjHand_[i] = 0;
         seedSid_[0] = '\0';
     }
-    virtual const char* name() const { return "shop_shelf"; }
+    virtual const char* name() const { return emptyMode_ ? "shelf_empty" : "shop_shelf"; }
 
     // Pin EARLY on BOTH clients: the smallest-hand non-storage, item-bearing
     // container row. Deterministic across clients because a baked shelf hand is
-    // save-stable.
+    // save-stable. (emptyMode: smallest STOCK first, then hand - the cheapest
+    // shelf to empty; still deterministic, both sides read the same baked stock.)
     void pinShelf(const ScenarioContext& ctx) {
         if (have_) return;
         const unsigned int MAXC = 48;
@@ -2902,10 +2912,15 @@ public:
             if (!rows[i].hasInv) continue;
             if (rows[i].nEntries <= 0) continue;        // must already hold wares
             if (rows[i].classType == 3 /*BCTYPE_STORAGE*/) continue; // discriminate: shelf, not chest
-            if (best < 0 ||
-                rows[i].hand[4] < rows[best].hand[4] ||
-                (rows[i].hand[4] == rows[best].hand[4] && rows[i].hand[3] < rows[best].hand[3]))
-                best = (int)i;
+            if (emptyMode_ && rows[i].qtyTotal > 12) continue; // keep the empty-out short
+            bool better;
+            if (best < 0) better = true;
+            else if (emptyMode_ && rows[i].qtyTotal != rows[best].qtyTotal)
+                better = rows[i].qtyTotal < rows[best].qtyTotal;
+            else
+                better = rows[i].hand[4] < rows[best].hand[4] ||
+                         (rows[i].hand[4] == rows[best].hand[4] && rows[i].hand[3] < rows[best].hand[3]);
+            if (better) best = (int)i;
         }
         if (best >= 0) {
             for (int k = 0; k < 5; ++k) subjHand_[k] = rows[best].hand[k];
@@ -2977,19 +2992,34 @@ public:
         // a fabricate-refusing weapon must not spin every tick).
         if (isHost_ && !seedTried_ && seedSid_[0] && ctx.elapsedMs >= SEED_MS) {
             seedTried_ = true;
-            seeded_ = engine::addItemsToContainerBySid(ctx.gw, subjHand_, seedSid_,
-                          seedType_, SEED_N, /*qualityBucket*/0, /*manuf*/"", /*material*/"");
-            char b[200]; _snprintf(b, sizeof(b) - 1,
-                "XSHELF seed n=%d sid='%s' type=%u shelfQty=%d",
-                seeded_, seedSid_, seedType_, shelfQty(ctx.gw));
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            if (!emptyMode_) {
+                seeded_ = engine::addItemsToContainerBySid(ctx.gw, subjHand_, seedSid_,
+                              seedType_, SEED_N, /*qualityBucket*/0, /*manuf*/"", /*material*/"");
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "XSHELF seed n=%d sid='%s' type=%u shelfQty=%d",
+                    seeded_, seedSid_, seedType_, shelfQty(ctx.gw));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
         }
         if (isHost_ && !lootTried_ && seedSid_[0] && ctx.elapsedMs >= LOOT_MS) {
             lootTried_ = true;
             unsigned int lh[5];
             if (myLeaderHand(ctx.gw, lh)) {
-                looted_ = engine::moveItemBetweenContainers(ctx.gw, subjHand_, lh,
-                              seedSid_, seedType_, 1);
+                if (!emptyMode_) {
+                    looted_ = engine::moveItemBetweenContainers(ctx.gw, subjHand_, lh,
+                                  seedSid_, seedType_, 1);
+                } else {
+                    // Empty the shelf: move EVERY captured entry (its whole stack) into
+                    // the leader's pack. A leftover means the pack refused it (weight /
+                    // type) - reported via shelfQty in the verdict, not silently passed.
+                    InvItemEntry it[INV_ITEMS_MAX];
+                    unsigned int n = engine::captureContainerContents(ctx.gw, subjHand_, it, INV_ITEMS_MAX, 0);
+                    for (unsigned int i = 0; i < n; ++i) {
+                        int q = (it[i].quantity < 1) ? 1 : (int)it[i].quantity;
+                        looted_ += engine::moveItemBetweenContainers(ctx.gw, subjHand_, lh,
+                                       it[i].stringID, it[i].itemType, q);
+                    }
+                }
             }
             char b[180]; _snprintf(b, sizeof(b) - 1,
                 "XSHELF loot n=%d shelfQty=%d", looted_, shelfQty(ctx.gw));
@@ -3015,6 +3045,9 @@ public:
                 // oracle's job.
                 bool did = (seeded_ > 0) || (looted_ > 0);
                 passed_ = (base_ >= 0) && did;
+                // emptyMode: the host must have actually EMPTIED it (the state under
+                // test is the transition to zero, not just any change).
+                if (emptyMode_) passed_ = passed_ && (final_ == 0);
                 char b[240]; _snprintf(b, sizeof(b) - 1,
                     "XSHELF verdict role=host pass=%d subj=%u,%u,%u,%u,%u class=%d base=%d "
                     "seeded=%d looted=%d peak=%d final=%d",
@@ -3031,6 +3064,9 @@ public:
                 // the mirror check (join final == host final).
                 bool observed = (peak_ != base_) || (final_ != base_);
                 passed_ = (base_ >= 0) && observed;
+                // emptyMode: the join must have SEEN the shelf go empty - pre-fix the
+                // emptied row left the census and the join stayed at base forever.
+                if (emptyMode_) passed_ = passed_ && (final_ == 0);
                 char b[240]; _snprintf(b, sizeof(b) - 1,
                     "XSHELF verdict role=join pass=%d subj=%u,%u,%u,%u,%u class=%d base=%d "
                     "peak=%d final=%d",
@@ -3060,6 +3096,7 @@ private:
         return q;
     }
 
+    bool          emptyMode_;
     bool          passed_;
     bool          isHost_;
     bool          have_;
@@ -3076,6 +3113,257 @@ private:
     unsigned long lastLogMs_;
     unsigned int  subjHand_[5];
     char          seedSid_[48];
+};
+
+// ---- vendor_stock: shopkeeper (trader Character) inventory sync ------------
+// A vendor's trade window is an aggregated VIEW over the shop's real containers:
+// the shelves (censused since #72.4) and the shopkeeper Character's OWN
+// inventory. The engine regenerates that stock randomly PER CLIENT
+// (ActivePlatoon::refreshInventory - initial fill on the shop-open path, periodic
+// restock) and a purchase mutates it locally, so without a mirror the two players
+// shop from different stock and a rare item bought on one side is a phantom on
+// the other. The mirror folds the shopkeepers into the host-authoritative
+// container census and re-asserts the host's snapshots on the join whenever the
+// join's own engine regenerates a trader's stock (refreshInventory detour).
+//
+// Both clients pin the SAME shopkeeper: the smallest-hand stocked trader
+// Character in range (a baked town NPC's hand is save-stable, so the pick is
+// deterministic). HOST seeds a known count of the keeper's own first ware then
+// LOOTS one into its leader's pack (the "buy" mutation minus the money). JOIN, once
+// it has mirrored, FORCES its own engine to regenerate the trader's stock
+// (forceTraderRefresh -> refreshInventory, the shop-open/restock path) - the
+// divergence the mirror must heal - and both report base/peak/final totals. Judged
+// by Test-VendorStock: host mutated, join moved off its baseline (impossible when
+// the keeper is not censused), join final == host final (+/-1 restock tolerance)
+// even after the forced regen. Evidence lines: XVENDOR regen (what refreshInventory
+// did to the keeper's count) and [shop] VIEW-OVERLAP (view Item* identity vs the
+// keeper/shelf backing stores) - the ENGINE_FACTS material for the vendor model.
+class VendorStockScenario : public Scenario {
+public:
+    VendorStockScenario()
+        : passed_(false), isHost_(false), have_(false),
+          seeded_(0), looted_(0), seedTried_(false), lootTried_(false),
+          regenTried_(false), overlapTried_(false), regenRan_(0),
+          regenBefore_(-1), regenAfter_(-1),
+          subjHow_(0), subjEntries_(0), seedType_(0),
+          base_(-1), peak_(-1), final_(-1), lastLogMs_(0) {
+        for (int i = 0; i < 5; ++i) subjHand_[i] = 0;
+        seedSid_[0] = '\0'; subjName_[0] = '\0';
+    }
+    virtual const char* name() const { return "vendor_stock"; }
+
+    void pinTrader(const ScenarioContext& ctx) {
+        if (have_) return;
+        const unsigned int MAXT = 12;
+        engine::TraderRead rows[MAXT];
+        unsigned int n = engine::enumTradersNear(ctx.gw, 100.0f, rows, MAXT);
+        int best = -1;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (rows[i].nEntries <= 0) continue;   // must already hold something
+            if (best < 0 ||
+                rows[i].hand[4] < rows[best].hand[4] ||
+                (rows[i].hand[4] == rows[best].hand[4] && rows[i].hand[3] < rows[best].hand[3]))
+                best = (int)i;
+        }
+        if (best >= 0) {
+            for (int k = 0; k < 5; ++k) subjHand_[k] = rows[best].hand[k];
+            subjHow_     = rows[best].how;
+            subjEntries_ = rows[best].nEntries;
+            strncpy(subjName_, rows[best].name, sizeof(subjName_) - 1);
+            subjName_[sizeof(subjName_) - 1] = '\0';
+            have_ = true;
+            captureFirstWare(ctx.gw);
+        }
+    }
+
+    // The keeper's first LOOSE ware (sid+type) - what we seed more of and loot one
+    // of; falls back to the first entry of any kind (worn) so a keeper carrying only
+    // clothes still yields a template the inventory accepts.
+    void captureFirstWare(GameWorld* gw) {
+        if (seedSid_[0]) return;
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, subjHand_, it, INV_ITEMS_MAX, 0);
+        if (n == 0) return;
+        int pick = -1;
+        for (unsigned int i = 0; i < n; ++i) if (!it[i].equipped) { pick = (int)i; break; }
+        if (pick < 0) pick = 0;
+        strncpy(seedSid_, it[pick].stringID, sizeof(seedSid_) - 1);
+        seedSid_[sizeof(seedSid_) - 1] = '\0';
+        seedType_ = it[pick].itemType;
+    }
+
+    bool myLeaderHand(GameWorld* gw, unsigned int out[5]) {
+        EntityState sq[4];
+        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ true, sq, 4);
+        if (n == 0) return false;
+        out[0] = sq[0].hType; out[1] = sq[0].hContainer;
+        out[2] = sq[0].hContainerSerial; out[3] = sq[0].hIndex; out[4] = sq[0].hSerial;
+        return true;
+    }
+
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        pinTrader(ctx);
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        pinTrader(ctx);
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "XVENDOR start role=%s have=%d subj=%u,%u,%u,%u,%u how=%d entries=%d name='%s'",
+            isHost_ ? "host" : "join", have_ ? 1 : 0,
+            subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3], subjHand_[4],
+            subjHow_, subjEntries_, subjName_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_ && ctx.elapsedMs < SEED_MS) { pinTrader(ctx); }
+        if (!have_ && ctx.elapsedMs >= SEED_MS) {
+            coop::logLine("XVENDOR nopin (no stocked shopkeeper in range)");
+            passed_ = false; return true;
+        }
+        if (!have_) return false;
+        if (!seedSid_[0]) captureFirstWare(ctx.gw);
+        if (base_ < 0) base_ = keeperQty(ctx.gw);
+
+        if (isHost_ && !seedTried_ && seedSid_[0] && ctx.elapsedMs >= SEED_MS) {
+            seedTried_ = true;
+            seeded_ = engine::addItemsToContainerBySid(ctx.gw, subjHand_, seedSid_,
+                          seedType_, SEED_N, /*qualityBucket*/0, /*manuf*/"", /*material*/"");
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "XVENDOR seed n=%d sid='%s' type=%u keeperQty=%d",
+                seeded_, seedSid_, seedType_, keeperQty(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (isHost_ && !lootTried_ && seedSid_[0] && ctx.elapsedMs >= LOOT_MS) {
+            lootTried_ = true;
+            unsigned int lh[5];
+            if (myLeaderHand(ctx.gw, lh)) {
+                looted_ = engine::moveItemBetweenContainers(ctx.gw, subjHand_, lh,
+                              seedSid_, seedType_, 1);
+            }
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "XVENDOR loot n=%d keeperQty=%d", looted_, keeperQty(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // Evidence leg (host, after the loot has been published): build the lazy
+        // ShopTrader views in range and measure Item* identity against the keeper
+        // and the shelves - is the trade window a view over those backing stores?
+        if (isHost_ && !overlapTried_ && ctx.elapsedMs >= OVERLAP_MS) {
+            overlapTried_ = true;
+            engine::VendorRead v[8];
+            unsigned int nv = engine::listVendorsNear(ctx.gw, v, 8, 100.0f);
+            int built = 0;
+            for (unsigned int i = 0; i < nv; ++i)
+                if (v[i].src != 1 && engine::ensureVendorStock(ctx.gw, v[i].hand) == 1) ++built;
+            // The wrappers in the fixture carry no bound trader (ensure-stock
+            // trader-null), so drive the keeper's OWN platoon through the initial-fill
+            // path instead - a REAL regen on the census author, which the join must
+            // then mirror - and re-count the views it may have built.
+            int rb = keeperQty(ctx.gw);
+            int rr = engine::forceTraderRefresh(ctx.gw, subjHand_, /*firstTime*/ true);
+            int ra = keeperQty(ctx.gw);
+            nv = engine::listVendorsNear(ctx.gw, v, 8, 100.0f);
+            int views = 0;
+            for (unsigned int i = 0; i < nv; ++i) if (v[i].src == 1) ++views;
+            int ex = engine::probeVendorViewOverlap(ctx.gw, subjHand_, 100.0f);
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "XVENDOR overlap vendors=%u built=%d views=%d examined=%d hostRegen=%d before=%d after=%d",
+                nv, built, views, ex, rr, rb, ra);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // JOIN: force the engine's own INITIAL-FILL regen of the pinned keeper's
+        // platoon stock (firstTime=true - the shop-open path; the periodic restock
+        // is timer-gated and no-ops off-schedule) and log what it changed. The
+        // detour must make the mirror re-assert the host's snapshot over it.
+        if (!isHost_ && !regenTried_ && ctx.elapsedMs >= REGEN_MS) {
+            regenTried_ = true;
+            regenBefore_ = keeperQty(ctx.gw);
+            regenRan_ = engine::forceTraderRefresh(ctx.gw, subjHand_, /*firstTime*/ true);
+            regenAfter_ = keeperQty(ctx.gw);
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "XVENDOR regen ran=%d before=%d after=%d", regenRan_, regenBefore_, regenAfter_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            int q = keeperQty(ctx.gw);
+            if (q > peak_) peak_ = q;
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            final_ = keeperQty(ctx.gw);
+            if (isHost_) {
+                bool did = (seeded_ > 0) || (looted_ > 0);
+                passed_ = (base_ >= 0) && did;
+                char b[260]; _snprintf(b, sizeof(b) - 1,
+                    "XVENDOR verdict role=host pass=%d subj=%u,%u,%u,%u,%u how=%d base=%d "
+                    "seeded=%d looted=%d peak=%d final=%d",
+                    passed_ ? 1 : 0, subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3],
+                    subjHand_[4], subjHow_, base_, seeded_, looted_, peak_, final_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                // Moved off the native baseline = the keeper's census rows crossed
+                // (pre-mirror the keeper was never censused, so base==peak==final).
+                bool observed = (peak_ != base_) || (final_ != base_);
+                passed_ = (base_ >= 0) && observed;
+                char b[260]; _snprintf(b, sizeof(b) - 1,
+                    "XVENDOR verdict role=join pass=%d subj=%u,%u,%u,%u,%u how=%d base=%d "
+                    "peak=%d final=%d regen=%d regenBefore=%d regenAfter=%d",
+                    passed_ ? 1 : 0, subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3],
+                    subjHand_[4], subjHow_, base_, peak_, final_, regenRan_, regenBefore_,
+                    regenAfter_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long SEED_MS    = 9000;
+    static const unsigned long LOOT_MS    = 20000;
+    static const unsigned long OVERLAP_MS = 28000;
+    static const unsigned long REGEN_MS   = 27000;
+    static const int           SEED_N     = 3;
+    static const unsigned long JOIN_DURATION_MS = 40000;
+    static const unsigned long HOST_DURATION_MS = 46000;
+
+    int keeperQty(GameWorld* gw) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, subjHand_, it, INV_ITEMS_MAX, 0);
+        int q = 0;
+        for (unsigned int i = 0; i < n; ++i) q += (it[i].quantity < 1) ? 1 : (int)it[i].quantity;
+        return q;
+    }
+
+    bool          passed_;
+    bool          isHost_;
+    bool          have_;
+    int           seeded_;
+    int           looted_;
+    bool          seedTried_;
+    bool          lootTried_;
+    bool          regenTried_;
+    bool          overlapTried_;
+    int           regenRan_;
+    int           regenBefore_;
+    int           regenAfter_;
+    int           subjHow_;
+    int           subjEntries_;
+    unsigned int  seedType_;
+    int           base_;
+    int           peak_;
+    int           final_;
+    unsigned long lastLogMs_;
+    unsigned int  subjHand_[5];
+    char          seedSid_[48];
+    char          subjName_[40];
 };
 
 Scenario* makeInventoryScenario(const std::string& name) {
@@ -3124,6 +3412,8 @@ Scenario* makeInventoryScenario(const std::string& name) {
     if (name == "xbow_grade")   return new CrossbowGradeScenario();
     if (name == "corpse_loot")  return new CorpseLootScenario();
     if (name == "shop_shelf")   return new ShopShelfScenario();
+    if (name == "shelf_empty")  return new ShopShelfScenario(/*emptyMode=*/true);
+    if (name == "vendor_stock") return new VendorStockScenario();
     return 0;
 }
 

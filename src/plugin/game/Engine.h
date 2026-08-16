@@ -2175,6 +2175,63 @@ int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
                    const unsigned int buyerHand[5],
                    char* outSid, unsigned int sidLen);
 
+// ---- Vendor-stock mirror: shopkeeper inventories in the container census ----
+// A vendor's wares are not a store of their own: ShopTraderInventory is an
+// AGGREGATED VIEW (a map of hand -> InventorySection) over the shop's real
+// containers - the SHELVES/TABLES (buildings, censused since #72.4) and the
+// SHOPKEEPER CHARACTER's own inventory. Restock (ActivePlatoon::refreshInventory,
+// scheduled off Platoon::traderInventoryRefreshTime) regenerates those backing
+// stores randomly PER CLIENT, and a purchase mutates them locally - so without a
+// mirror the two players shop from different stock (a rare item on one side is
+// a phantom on the other). The mirror is the existing host-authoritative container
+// census: fold the trader Characters in too, and re-assert the host's snapshots
+// on the join whenever the join's own engine regenerates a trader's stock.
+//
+// One shopkeeper row: a live, non-player Character within radius of an interest
+// center that the engine calls a trader (Character::isATrader, or its platoon's
+// ActivePlatoon::getIsTrader). Its hand is save-stable (a baked town NPC), so it
+// is the same key on both clients.
+struct TraderRead {
+    unsigned int hand[5]; // Character hand [type, container, containerSerial, index, serial]
+    float x, y, z;
+    int   nEntries;       // distinct (sid,type,equipped) entries captured (<=64)
+    int   qtyTotal;       // sum of entry quantities
+    int   how;            // 1 Character::isATrader, 2 platoon getIsTrader (diagnostic)
+    char  name[40];       // character name (diagnostics)
+};
+// SEH-guarded: enumerate shopkeeper Characters within radius of the interest
+// centers (dual-interest, deduped). Returns the count written.
+unsigned int enumTradersNear(GameWorld* gw, float radius, TraderRead* out,
+                             unsigned int maxOut);
+
+// Detour ActivePlatoon::refreshInventory - the engine's trader-stock (re)builder.
+// The original ALWAYS runs (the engine keeps ownership of restock timing and of
+// the lazy ShopTrader view it may build); the detour only RECORDS that a trader
+// platoon's stock was just regenerated locally so the Replicator can re-assert
+// the host's authoritative snapshots over it on the join (and log the edge on
+// both sides). Non-trader platoons are ignored.
+struct TraderRefreshEdge {
+    unsigned int leaderHand[5]; // the platoon's squad leader (zeros if unread)
+    int          firstTime;     // the engine's firstTime flag
+};
+bool installTraderRefreshHook();
+unsigned int drainTraderRefreshes(TraderRefreshEdge* out, unsigned int maxOut);
+
+// SEH-guarded TEST LEVER (vendor_stock): run the engine's own stock builder for
+// the platoon of the shopkeeper at cHand - ActivePlatoon::refreshInventory
+// (firstTime as given) - i.e. force locally exactly what a shop-open / restock
+// timer does, so the scenario can measure what it regenerates and whether the
+// mirror re-asserts over it. Returns 1 ran, 0 no platoon/fn, -1 fault.
+int forceTraderRefresh(GameWorld* gw, const unsigned int cHand[5], bool firstTime);
+
+// SEH-guarded EVIDENCE probe (vendor_stock): for the ShopTrader wrappers within
+// radius whose aggregated view exists (built by ensureVendorStock / the trade UI),
+// count how many of the view's Item* are the SAME objects as the ones in the
+// shopkeeper Character's inventory at cHand and in the censused shelf buildings -
+// the direct test of "the trade window is a view over those backing stores".
+// Logs "[shop] VIEW-OVERLAP ..." per vendor. Returns vendors examined.
+int probeVendorViewOverlap(GameWorld* gw, const unsigned int cHand[5], float radius);
+
 // ---- Consensus game-speed sync ----------------------------------------------
 
 // SEH-guarded read of the world's speed state: *mult = frameSpeedMult,

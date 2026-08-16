@@ -1767,7 +1767,10 @@ function Test-ShopShelf {
     # never censused) leaves the join pinned at its whole base while the host moved -
     # a gap far larger than 1, and the join-side "moved off baseline" gate already
     # fails that case outright.
-    $finalMatch = ($hostOk -and $joinOk -and ([math]::Abs($jFinal - $hFinal) -le 1))
+    # shelf_empty is EXACT: the state under test is the transition to zero, and a
+    # +/-1 tolerance would let the pre-fix phantom (join 1, host 0) pass.
+    $tol = if ($GateName -eq "shelf_empty") { 0 } else { 1 }
+    $finalMatch = ($hostOk -and $joinOk -and ([math]::Abs($jFinal - $hFinal) -le $tol))
     if ($hostOk -and $joinOk -and $sameSubject -and -not $finalMatch) {
         Write-Host "    NOTE: DESYNC - join shelf total $jFinal != host $hFinal after loot (the #72.4 symptom)"
     }
@@ -1779,5 +1782,92 @@ function Test-ShopShelf {
                             finalMatch = $finalMatch; hostClass = $hClass; hostBase = $hBase;
                             hostSeeded = $hSeed; hostLooted = $hLoot; hostFinal = $hFinal;
                             joinBase = $jBase; joinPeak = $jPeak; joinFinal = $jFinal;
+                            fixtureMiss = ($noPinHost -or $noPinJoin) })
+}
+
+function Test-VendorStock {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = "vendor_stock")
+    # Vendor-stock mirror: the shopkeeper Character's inventory (one of the trade
+    # window's backing stores) rides the host-authoritative container census, and
+    # the join re-asserts the host's snapshots after its own engine regenerates a
+    # trader's stock. The host seeds + loots one ware; the join must move off its
+    # baseline (impossible when the keeper is not censused) and end mirroring the
+    # host's total (+/-1 for an async restock) - including after the forced regen.
+    $rxHost = 'XVENDOR verdict role=host pass=(\d+) subj=([\d,]+) how=(-?\d+) base=(-?\d+) seeded=(-?\d+) looted=(-?\d+) peak=(-?\d+) final=(-?\d+)'
+    $rxJoin = 'XVENDOR verdict role=join pass=(\d+) subj=([\d,]+) how=(-?\d+) base=(-?\d+) peak=(-?\d+) final=(-?\d+) regen=(-?\d+) regenBefore=(-?\d+) regenAfter=(-?\d+)'
+    $noPinHost = $false; $noPinJoin = $false
+    if (Test-Path $HostFile) { $noPinHost = [bool](Select-String -Path $HostFile -Pattern 'XVENDOR nopin' -ErrorAction SilentlyContinue) }
+    if (Test-Path $JoinFile) { $noPinJoin = [bool](Select-String -Path $JoinFile -Pattern 'XVENDOR nopin' -ErrorAction SilentlyContinue) }
+
+    $hostOk = $false; $hSubj = ""; $hHow = 0; $hBase = -1; $hSeed = 0; $hLoot = 0; $hFinal = -1
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $hSubj = $g[2].Value; $hHow = [int]$g[3].Value; $hBase = [int]$g[4].Value
+            $hSeed = [int]$g[5].Value; $hLoot = [int]$g[6].Value; $hFinal = [int]$g[8].Value
+            $hostOk = ([int]$g[1].Value -eq 1)
+            Write-Host ("  VENDOR-STOCK [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - how=$hHow base=$hBase seeded=$hSeed looted=$hLoot final=$hFinal")
+        } elseif ($noPinHost) { Write-Host "  VENDOR-STOCK [host] FAIL - no stocked shopkeeper in range (fixture miss, not the bug)" }
+        else { Write-Host "  VENDOR-STOCK [host] FAIL - no host XVENDOR verdict (seed/loot failed)" }
+    } else { Write-Host "  VENDOR-STOCK [host] FAIL - no log" }
+
+    $joinOk = $false; $jSubj = ""; $jBase = -1; $jPeak = -1; $jFinal = -1
+    $jRegen = -9; $jRegenBefore = -1; $jRegenAfter = -1
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $jSubj = $g[2].Value; $jBase = [int]$g[4].Value
+            $jPeak = [int]$g[5].Value; $jFinal = [int]$g[6].Value
+            $jRegen = [int]$g[7].Value; $jRegenBefore = [int]$g[8].Value; $jRegenAfter = [int]$g[9].Value
+            $joinOk = ([int]$g[1].Value -eq 1)
+            Write-Host ("  VENDOR-STOCK [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - base=$jBase peak=$jPeak final=$jFinal regen=$jRegen ($jRegenBefore -> $jRegenAfter)")
+        } elseif ($noPinJoin) { Write-Host "  VENDOR-STOCK [join] FAIL - no stocked shopkeeper in range (fixture miss, not the bug)" }
+        else { Write-Host "  VENDOR-STOCK [join] FAIL - no join XVENDOR verdict" }
+    } else { Write-Host "  VENDOR-STOCK [join] FAIL - no log" }
+
+    if ($noPinHost -or $noPinJoin) {
+        Write-Host "    NOTE: FIXTURE MISS - the save had no stocked shopkeeper near spawn; pick a save/spot with a shop in range"
+    }
+    $sameSubject = ($hSubj -ne "" -and $hSubj -eq $jSubj)
+    if (($hSubj -ne "") -and ($jSubj -ne "") -and -not $sameSubject) {
+        Write-Host "    NOTE: SUBJECT MISMATCH - host pinned $hSubj, join pinned $jSubj (deterministic pick disagreed; test artifact, not the bug)"
+    }
+    # FINDINGS (evidence, not gates): what the join's forced regen did, and whether
+    # the mirror re-asserted over it; the VIEW-OVERLAP identity of the trade window.
+    if ($jRegen -eq 1) {
+        $tag = if ($jRegenAfter -ne $jRegenBefore) { "CHANGED the keeper's total $jRegenBefore -> $jRegenAfter (refreshInventory regenerates the keeper's own inventory)" } else { "left the keeper's total at $jRegenBefore (no local regen at this clock; the restock path was not exercised)" }
+        Write-Host "    FINDING: join forced refreshInventory $tag"
+        $reassert = $false
+        if (Test-Path $JoinFile) { $reassert = [bool](Select-String -Path $JoinFile -Pattern '\[shop\] REFRESH-INV re-assert' -ErrorAction SilentlyContinue) }
+        Write-Host ("    FINDING: join re-assert after regen " + $(if ($reassert) { "FIRED (detour -> snapshots re-applied)" } else { "did NOT fire (detour not installed / not a trader platoon)" }))
+    } elseif ($jRegen -ne -9) { Write-Host "    FINDING: join forced regen did not run (r=${jRegen}; platoon/fn unresolved)" }
+    if (Test-Path $HostFile) {
+        $ho = Select-String -Path $HostFile -Pattern 'XVENDOR overlap vendors=(\d+) built=(-?\d+) views=(-?\d+) examined=(-?\d+) hostRegen=(-?\d+) before=(-?\d+) after=(-?\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $ho) {
+            $g = $ho.Matches[0].Groups
+            $tag = if ([int]$g[5].Value -eq 1) { if ($g[6].Value -ne $g[7].Value) { "CHANGED the keeper's total $($g[6].Value) -> $($g[7].Value) (initial-fill path regenerates the keeper's own inventory)" } else { "left the keeper's total at $($g[6].Value)" } } else { "did not run (r=$($g[5].Value))" }
+            Write-Host "    FINDING: host forced refreshInventory(firstTime) $tag; ShopTrader wrappers=$($g[1].Value) views built=$($g[3].Value)"
+        }
+        foreach ($m in @(Select-String -Path $HostFile -Pattern '\[shop\] VIEW-OVERLAP (.+)$' -ErrorAction SilentlyContinue | Select-Object -First 4)) {
+            Write-Host "    FINDING: view identity $($m.Matches[0].Groups[1].Value)"
+        }
+    }
+    $finalMatch = ($hostOk -and $joinOk -and ([math]::Abs($jFinal - $hFinal) -le 1))
+    if ($hostOk -and $joinOk -and $sameSubject -and -not $finalMatch) {
+        Write-Host "    NOTE: DESYNC - join keeper total $jFinal != host $hFinal (the vendor-stock symptom)"
+    }
+    $ok = $hostOk -and $joinOk -and $sameSubject -and $finalMatch
+    Write-Host ("  VENDOR-STOCK " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - shopkeeper stock mirrored to the peer (host final=$hFinal join final=$jFinal)")
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; sameSubject = $sameSubject;
+                            finalMatch = $finalMatch; hostHow = $hHow; hostBase = $hBase;
+                            hostSeeded = $hSeed; hostLooted = $hLoot; hostFinal = $hFinal;
+                            joinBase = $jBase; joinPeak = $jPeak; joinFinal = $jFinal;
+                            joinRegen = $jRegen; joinRegenBefore = $jRegenBefore; joinRegenAfter = $jRegenAfter;
                             fixtureMiss = ($noPinHost -or $noPinJoin) })
 }

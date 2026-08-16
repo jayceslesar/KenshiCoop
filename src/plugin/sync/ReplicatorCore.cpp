@@ -253,6 +253,7 @@ void Replicator::resetSession() {
     invRecv_.clear();
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
+    censusSticky_.clear();
     worldTrack_.clear();
     worldProxies_.clear();
     worldSeeded_ = false; // re-census the reloaded world's save-native items
