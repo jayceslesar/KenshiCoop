@@ -55,5 +55,10 @@ where cl.exe
 REM UseEnv=true: use the INCLUDE/LIB/PATH above instead of registry-derived paths.
 REM TrackFileAccess=false: avoid Tracker.exe TRK0002 under redirected shells.
 "%MSBUILD%" "%REPO%\src\plugin\KenshiCoop.vcxproj" /p:Configuration=%CONFIG% /p:Platform=x64 /p:UseEnv=true /p:TrackFileAccess=false /nologo /v:minimal
+set "RC=%ERRORLEVEL%"
 
-endlocal
+REM Propagate MSBuild's exit code. Without this a failed link left the PREVIOUS
+REM DLL in place and every caller (make_mod_kit.ps1, regress.ps1) read success -
+REM the release kit once packaged a stale Release DLL over two unresolved externals.
+if not "%RC%"=="0" echo === BUILD FAILED (%CONFIG%) rc=%RC% ===
+endlocal & exit /b %RC%

@@ -41,8 +41,17 @@ if (-not $SkipBuild) {
     # scenario harness (~12k lines) and does not define KENSHICOOP_HARNESS
     # (Phase 1 build separation). The test pipeline uses Harness instead.
     Write-Host "=== build plugin (Release / shipped, no scenario harness) ==="
+    $buildStart = Get-Date
     & cmd.exe /c "`"$scriptDir\build_plugin.cmd`" Release"
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+    # Belt and braces: never package a DLL the build we just ran did not write.
+    # (A failed link leaves the previous DLL on disk; the exit code above is the
+    # first line of defence, this is the second.)
+    $built = Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"
+    if (-not (Test-Path $built)) { throw "Release DLL missing after build: $built" }
+    if ((Get-Item $built).LastWriteTime -lt $buildStart) {
+        throw "Release DLL is STALE (written $((Get-Item $built).LastWriteTime), build started $buildStart) - refusing to package"
+    }
 }
 
 # Resolve the four mod files from the first place each exists.

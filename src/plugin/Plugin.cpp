@@ -942,6 +942,10 @@ void tickSetupScene(GameWorld* gw) {
             // stats is a strong start; for melee, loot a blade off the first corpse -
             // corpse loot now syncs (upstream #40). Loose: equip it in-game.
             unsigned int narmed = 0;
+#ifdef KENSHICOOP_HARNESS
+            // The minting primitives live in EngineProbe.cpp, which the shipped
+            // Release build excludes (probe-only); a bake is a harness activity, so
+            // the Release DLL simply buffs without arming.
             {
                 coop::EntityState sq[64];
                 unsigned int ns = coop::engine::captureSquad(gw, false, sq, 64);
@@ -957,6 +961,7 @@ void tickSetupScene(GameWorld* gw) {
                     }
                 }
             }
+#endif
             char b[160];
             _snprintf(b, sizeof(b) - 1,
                       "SETUP(buffpc): buffed %u PC(s) to 120 in every stat, armed %u with a "
