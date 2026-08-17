@@ -2016,6 +2016,9 @@ void startNetworking() {
 // "rare items spawned at the bar" / "vendors dropped their stock"), and corpse
 // loot fighting. Called from installEngineDetours (launch) and coopUiConnect.
 bool g_dmgGuardInstalled = false;
+// The role the process LAUNCHED with (config/env) - the log file name and its
+// [HOST]/[JOIN] tag are fixed from it; the panel may pick the other role later.
+bool g_launchIsHost = true;
 
 // Vendor-stock mirror, synchronous half (engine::setTraderRefreshCallback): the
 // refreshInventory detour just saw a REAL regen; let the non-author re-assert the
@@ -2086,6 +2089,17 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // Every role-derived Replicator flag (streamNpcs, the host-only container
     // census, gate authority, combat-hit report) follows the panel's role.
     applyRoleFlags(isHost);
+    // The log file + its [HOST]/[JOIN] tag were fixed at launch from the config
+    // role; say so loudly when the panel picks the other role, so a support
+    // read of "KenshiCoop_host.log" from a JOIN client is not a mystery.
+    if (g_launchIsHost != isHost) {
+        char n[200]; _snprintf(n, sizeof(n) - 1,
+            "[coop-ui] NOTE: launched as %s (config/env role) but connecting as %s - "
+            "this log file and its [%s] tag keep the LAUNCH role; every sync flag now follows %s",
+            g_launchIsHost ? "HOST" : "JOIN", isHost ? "HOST" : "JOIN",
+            g_launchIsHost ? "HOST" : "JOIN", isHost ? "HOST" : "JOIN");
+        n[sizeof(n) - 1] = '\0'; coopLog(n);
+    }
     // Ownership ranks must follow the role chosen in the panel. Only an explicit
     // KENSHICOOP_OWN_SQUAD override is preserved; otherwise recompute the default
     // (host owns {0}, join owns {1}). Without this, a session launched as HOST
@@ -2584,6 +2598,7 @@ void installTitleHook() {
 
 __declspec(dllexport) void startPlugin() {
     coop::loadConfig(g_cfg);
+    g_launchIsHost = g_cfg.isHost;
     // The fake clock skew must be armed BEFORE the first log line so every
     // timestamp in this run (and every time-sync packet) shares the skewed clock.
     coop::logSetFakeSkewMs(g_cfg.fakeClockSkewMs);
