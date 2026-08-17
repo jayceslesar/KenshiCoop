@@ -3170,12 +3170,19 @@ public:
         engine::TraderRead rows[MAXT];
         unsigned int n = engine::enumTradersNear(ctx.gw, 100.0f, rows, MAXT);
         int best = -1;
-        for (unsigned int i = 0; i < n; ++i) {
-            if (rows[i].nEntries <= 0) continue;   // must already hold something
-            if (best < 0 ||
-                rows[i].hand[4] < rows[best].hand[4] ||
-                (rows[i].hand[4] == rows[best].hand[4] && rows[i].hand[3] < rows[best].hand[3]))
-                best = (int)i;
+        // sellMode wants a REAL shopkeeper (a bar's Barman), not a bar guard that
+        // merely belongs to the trader platoon: the shop UI for a guard has no
+        // shop behind it. Prefer non-"Guard" names when any exist; the two-pass
+        // pick stays deterministic on both clients.
+        for (int pass = (sellMode_ ? 0 : 1); pass < 2 && best < 0; ++pass) {
+            for (unsigned int i = 0; i < n; ++i) {
+                if (rows[i].nEntries <= 0) continue;   // must already hold something
+                if (pass == 0 && strstr(rows[i].name, "Guard") != 0) continue;
+                if (best < 0 ||
+                    rows[i].hand[4] < rows[best].hand[4] ||
+                    (rows[i].hand[4] == rows[best].hand[4] && rows[i].hand[3] < rows[best].hand[3]))
+                    best = (int)i;
+            }
         }
         if (best >= 0) {
             for (int k = 0; k < 5; ++k) subjHand_[k] = rows[best].hand[k];

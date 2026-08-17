@@ -2340,10 +2340,45 @@ InventoryGUI* __fastcall showTraderInventory_hook(ForgottenGUI* self, const hand
         unsigned int h[5] = { 0, 0, 0, 0, 0 };
         h[0] = (unsigned int)owner.type; h[1] = owner.container; h[2] = owner.containerSerial;
         h[3] = owner.index; h[4] = owner.serial;
-        char b[160];
-        _snprintf(b, sizeof(b) - 1, "[shop] TRADER-WINDOW open owner=%u,%u,%u,%u,%u gui=%d",
-                  h[0], h[1], h[2], h[3], h[4], w ? 1 : 0);
+        // Diagnostics for the guard's signal semantics: is the returned window
+        // visible, how many inventory windows does the GUI count open, does the
+        // engine's own getNPCTrader see a trade, and is the owner keyed.
+        int vis = -1, nOpen = -1, npcT = -1, keyed = -1;
+        if (w) vis = w->isVisible() ? 1 : 0;
+        if (self) { nOpen = self->getNumOpenInventoryWindows(); keyed = self->hasInventoryWindowOpen(owner) ? 1 : 0; }
+        npcT = (InventoryGUI::getNPCTrader() != 0) ? 1 : 0;
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+                  "[shop] TRADER-WINDOW open owner=%u,%u,%u,%u,%u gui=%d vis=%d nOpen=%d npcTrader=%d keyed=%d",
+                  h[0], h[1], h[2], h[3], h[4], w ? 1 : 0, vis, nOpen, npcT, keyed);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // Which slot / key did the GUI file this window under? Dump the four hand
+        // slots and every key of inventoryWindowsOpen (boost-1.60 unordered_map,
+        // same in-tree boost the game shipped with - the whoSeesMeSneaking idiom;
+        // iterators are raw node pointers, SEH-legal).
+        if (self) {
+            const hand* slots[4] = { &self->inventoryWindowBuilding, &self->inventoryWindowCharacter,
+                                     &self->inventoryWindowTrader,  &self->inventoryWindowNPC };
+            const char* names[4] = { "building", "character", "trader", "npc" };
+            for (int s = 0; s < 4; ++s) {
+                char t[160]; _snprintf(t, sizeof(t) - 1,
+                    "[shop] TRADER-WINDOW slot %s=%u,%u,%u,%u,%u", names[s],
+                    (unsigned)slots[s]->type, slots[s]->container, slots[s]->containerSerial,
+                    slots[s]->index, slots[s]->serial);
+                t[sizeof(t) - 1] = '\0'; coop::logLine(t);
+            }
+            ogre_unordered_map<hand, InventoryGUI*>::type::iterator it  = self->inventoryWindowsOpen.begin();
+            ogre_unordered_map<hand, InventoryGUI*>::type::iterator end = self->inventoryWindowsOpen.end();
+            int n = 0;
+            for (; it != end && n < 8; ++it, ++n) {
+                const hand& k = it->first;
+                char t[160]; _snprintf(t, sizeof(t) - 1,
+                    "[shop] TRADER-WINDOW key[%d]=%u,%u,%u,%u,%u win=%p ours=%d", n,
+                    (unsigned)k.type, k.container, k.containerSerial, k.index, k.serial,
+                    (void*)it->second, (it->second == w) ? 1 : 0);
+                t[sizeof(t) - 1] = '\0'; coop::logLine(t);
+            }
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_traderWinValid = false; }
     return w;
 }
@@ -2383,23 +2418,68 @@ int closeTraderWindow(GameWorld* gw, const unsigned int cHand[5]) {
         memset(buf, 0, sizeof(buf));
         hand* h = reinterpret_cast<hand*>(buf);
         g_handCtorFn(h, cHand[3], cHand[4], (itemType)cHand[0], cHand[1], cHand[2]);
-        bool was = g->hasInventoryWindowOpen(*h);
-        g->closeInventory(*h);
+        // The trade window is keyed by the GUI's trader slot (a blank
+        // SHOP_TRADER_CLASS hand in this save - run 182941), NOT by the shopkeeper's
+        // hand; close through the slot when it is set, else fall back to the owner.
+        const hand& slot = g->inventoryWindowTrader;
+        const hand& key  = (slot.type != NULL_ITEM) ? slot : *h;
+        bool was = g->hasInventoryWindowOpen(key);
+        g->closeInventory(key);
         return was ? 1 : 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
+// Three signals, any of which means "a trade window is up on this client":
+//  (a) InventoryGUI::getNPCTrader()          - the engine's own "which NPC am I
+//      trading with" (static, key-free; the trade UI's price/stealing logic reads it),
+//  (b) InventoryGUI::isTradingForMoney_static() - the vendor object of a for-money
+//      trade (static, key-free),
+//  (c) ForgottenGUI::hasInventoryWindowOpen(owner) for the hand showTraderInventory
+//      was called with. vendor_sell run 180145 measured (c) FALSE 10 ms after a
+//      gui=1 open (the window is not keyed by that hand), so (a)/(b) carry the guard;
+//      (c) stays as evidence + fallback. Edge-logged with all three so a run shows
+//      which one saw the window.
+//  (d) ForgottenGUI::inventoryWindowTrader - the GUI's own slot for "the trader
+//      whose window is up" (set by showTraderInventory; a null hand otherwise),
+//      cross-checked with hasInventoryWindowOpen on THAT hand (the map key the
+//      owner hand turned out not to be: run 181817 measured gui=1 vis=1 nOpen=1
+//      keyed=0 for the Barman).
 bool traderWindowOpen() {
-    if (!g_traderWinValid) return false;
-    bool open = false;
+    static bool lastOpen = false;
+    bool a = false, b = false, c = false, d = false, dk = false;
+    unsigned int th[5] = { 0, 0, 0, 0, 0 };
     __try {
+        a = (InventoryGUI::getNPCTrader() != 0);
+        b = (InventoryGUI::isTradingForMoney_static() != 0);
         ForgottenGUI* g = ::gui;
-        if (g) open = g->hasInventoryWindowOpen(*reinterpret_cast<const hand*>(g_traderWinHandBuf));
-        if (!open) {
-            g_traderWinValid = false; // closed: forget it until the next open
-            coop::logLine("[shop] TRADER-WINDOW closed");
+        if (g && g_traderWinValid)
+            c = g->hasInventoryWindowOpen(*reinterpret_cast<const hand*>(g_traderWinHandBuf));
+        if (g) {
+            // Run 182941 measured: the trade window is keyed by a BLANK
+            // SHOP_TRADER_CLASS hand (91,0,0,0,0 - the shop wrapper's own hand, which
+            // is trader-null in this save) and inventoryWindowTrader holds that same
+            // hand; an UNSET slot reads NULL_ITEM (11,0,0,0,0). So "set" is the type,
+            // never index/serial.
+            const hand& t = g->inventoryWindowTrader;
+            th[0] = (unsigned int)t.type; th[1] = t.container; th[2] = t.containerSerial;
+            th[3] = t.index; th[4] = t.serial;
+            d  = (t.type != NULL_ITEM);
+            if (d) dk = g->hasInventoryWindowOpen(t);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { open = false; g_traderWinValid = false; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { a = b = c = d = dk = false; }
+    // The GUI's own trader slot decides, cross-checked against the open-window map
+    // (a stale slot after a close must not pin the guard on); the others are
+    // evidence (and (c) a fallback).
+    bool open = (d && dk) || a || b || c;
+    if (open != lastOpen) {
+        char m[200]; _snprintf(m, sizeof(m) - 1,
+            "[shop] TRADER-WINDOW %s (traderSlot=%d slotKeyed=%d slot=%u,%u,%u,%u,%u npcTrader=%d forMoney=%d ownerWindow=%d)",
+            open ? "up" : "closed", d ? 1 : 0, dk ? 1 : 0, th[0], th[1], th[2], th[3], th[4],
+            a ? 1 : 0, b ? 1 : 0, c ? 1 : 0);
+        m[sizeof(m) - 1] = '\0'; coop::logLine(m);
+        lastOpen = open;
+    }
+    if (!open) g_traderWinValid = false; // forget the hand until the next open
     return open;
 }
 

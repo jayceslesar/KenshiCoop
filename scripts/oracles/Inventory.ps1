@@ -1891,6 +1891,13 @@ function Test-VendorSell {
     $guardOn = [bool](Select-String -Path $JoinFile -Pattern '\[shop\] TRADER-WINDOW guard ON'  -ErrorAction SilentlyContinue)
     $guardOff= [bool](Select-String -Path $JoinFile -Pattern '\[shop\] TRADER-WINDOW guard OFF' -ErrorAction SilentlyContinue)
     $syncRe  = [bool](Select-String -Path $JoinFile -Pattern '\[shop\] REFRESH-INV sync re-assert' -ErrorAction SilentlyContinue)
+    # Did the engine actually regen stock on open? A bar guard's "shop" has no
+    # shelves to fill (vendor_sell run 180145: gui=1, no REFRESH-INV at all), so a
+    # real-regen edge is fixture-dependent and the sync re-assert is only OWED when
+    # one fired. Which of the three window signals saw the window is evidence.
+    $edge    = [bool](Select-String -Path $JoinFile -Pattern '\[shop\] REFRESH-INV trader=1 .* edge=1' -ErrorAction SilentlyContinue)
+    $sig     = Select-String -Path $JoinFile -Pattern '\[shop\] TRADER-WINDOW up \([^)]*\)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $sigTxt  = if ($null -ne $sig) { $sig.Matches[0].Value } else { "(no 'TRADER-WINDOW up' line)" }
     $fault   = [bool](Select-String -Path $JoinFile -Pattern '\[crash\] VEH ' -ErrorAction SilentlyContinue)
     $v = Select-String -Path $JoinFile -Pattern 'XVENDOR sell-verdict pass=(\d) guiOpen=(-?\d+) bought=(\d+) sold=(\d+) guiClosed=(-?\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
     $vPass = $false; $guiOpen = -9; $bought = 0; $sold = 0; $guiClosed = -9
@@ -1900,18 +1907,21 @@ function Test-VendorSell {
         $bought = [int]$g[3].Value; $sold = [int]$g[4].Value; $guiClosed = [int]$g[5].Value
     }
     $noPin = [bool](Select-String -Path $JoinFile -Pattern 'XVENDOR nopin' -ErrorAction SilentlyContinue)
-    Write-Host ("  VENDOR-SELL [join] window opened=$opened guardOn=$guardOn guardOff=$guardOff syncReassert=$syncRe " +
+    Write-Host ("  VENDOR-SELL [join] window opened=$opened guardOn=$guardOn guardOff=$guardOff regenEdge=$edge syncReassert=$syncRe " +
                 "bought=$bought sold=$sold guiClosed=$guiClosed fault=$fault verdict=$vPass")
+    Write-Host "    FINDING: window signal $sigTxt"
     if ($noPin) { Write-Host "    NOTE: FIXTURE MISS - no stocked shopkeeper near spawn (pick a save/spot with a shop in range)" }
     if ($guiOpen -eq 0) { Write-Host "    NOTE: the engine DECLINED to open the trade window for the pinned keeper (lever limitation, not the bug)" }
     if ($guiOpen -eq -1) { Write-Host "    NOTE: showTraderInventory FAULTED (SEH) - the lever hit engine state it cannot drive; investigate before trusting the gate" }
-    if ($opened -and -not $guardOn) { Write-Host "    NOTE: window opened but the guard never engaged - hasInventoryWindowOpen(owner) did not see it (guard keyed wrong)" }
+    if ($opened -and -not $guardOn) { Write-Host "    NOTE: window opened but the guard never engaged - none of inventoryWindowTrader / getNPCTrader / isTradingForMoney / hasInventoryWindowOpen(owner) saw it" }
     if ($guardOn -and -not $guardOff) { Write-Host "    NOTE: guard engaged but never released - reconciles stayed deferred after the close" }
-    if (-not $syncRe) { Write-Host "    NOTE: no synchronous shop-open re-assert on the join (detour edge missing / callback unset)" }
-    $ok = $opened -and $guardOn -and $guardOff -and $syncRe -and $vPass -and -not $fault
+    if ($edge -and -not $syncRe) { Write-Host "    NOTE: the engine regenerated stock on open but no synchronous re-assert followed (callback unset / author side)" }
+    if (-not $edge) { Write-Host "    FINDING: no stock regen on open for this keeper (fixture: no shelves to fill) - the sync re-assert path was not exercised here" }
+    $syncOk = (-not $edge) -or $syncRe
+    $ok = $opened -and $guardOn -and $guardOff -and $syncOk -and $vPass -and -not $fault
     Write-Host ("  VENDOR-SELL " + $(if ($ok) { "PASS" } else { "FAIL" }) + " - trade window open/buy/sell/close on the join with no reconcile underneath it and no fault")
     return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
-                -Metrics @{ opened = $opened; guardOn = $guardOn; guardOff = $guardOff; syncReassert = $syncRe;
+                -Metrics @{ opened = $opened; guardOn = $guardOn; guardOff = $guardOff; regenEdge = $edge; syncReassert = $syncRe;
                             guiOpen = $guiOpen; bought = $bought; sold = $sold; guiClosed = $guiClosed;
-                            fault = $fault; verdict = $vPass; fixtureMiss = $noPin })
+                            fault = $fault; verdict = $vPass; fixtureMiss = $noPin; signal = $sigTxt })
 }

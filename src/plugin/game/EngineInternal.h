@@ -77,6 +77,7 @@
 #include <kenshi/ShopTrader.h>      // ShopTrader (vendor stock, protocol 22)
 #include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
 #include <kenshi/gui/ForgottenGUI.h> // ForgottenGUI::mainbar
+#include <kenshi/gui/InventoryGUI.h> // InventoryGUI::getNPCTrader / isTradingForMoney_static (trader-window guard)
 #include <kenshi/gui/MainBarGUI.h>  // MainBarGUI::speedButtons (vote-button probe)
 // NOTE: kenshi/ZoneManager.h cannot be included here - it redefines ParticlePool
 // (also defined by CombatClass.h above). The zone-loaded query lives in its own
