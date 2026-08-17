@@ -691,7 +691,27 @@ ApSquadLeaderFn     g_apSquadLeaderFn     = 0;
 // tick. Engine tick and plugin tick share the main thread - no lock.
 PlatoonRefreshInvFn g_refreshInvOrig = 0;
 std::vector<TraderRefreshEdge> g_traderRefreshes;
+// Synchronous re-assert callback: fired from the detour right after a REAL regen,
+// still inside the engine call (for the shop-open initial fill that means before
+// the trade view exists), so the non-author can put the host's stock back BEFORE
+// anything looks at the freshly rolled shelves. Set by the plugin at install.
+static TraderRefreshCb g_traderRefreshCb  = 0;
+static void*           g_traderRefreshCtx = 0;
+void setTraderRefreshCallback(TraderRefreshCb cb, void* ctx) {
+    g_traderRefreshCb = cb; g_traderRefreshCtx = ctx;
+}
+// The persistent Platoon's restock clock (Platoon::traderInventoryRefreshTime, a
+// TimeOfDay = one double). The engine calls refreshInventory(false) EVERY TICK for
+// a loaded trader platoon and gates the actual regen on this clock, advancing it
+// when it regenerates - so "the clock moved" is the only reliable sign that stock
+// was rebuilt. Read SEH-guarded (the caller holds the __try); -1 when unreadable.
+static double traderRefreshClock(ActivePlatoon* self) {
+    if (!self || !self->me) return -1.0;
+    return self->me->traderInventoryRefreshTime.time;
+}
 void __fastcall refreshInventory_hook(ActivePlatoon* self, bool firstTime) {
+    double before = -1.0;
+    __try { before = traderRefreshClock(self); } __except (EXCEPTION_EXECUTE_HANDLER) { before = -1.0; }
     g_refreshInvOrig(self, firstTime);
     __try {
         bool trader = false;
@@ -699,19 +719,35 @@ void __fastcall refreshInventory_hook(ActivePlatoon* self, bool firstTime) {
         static int dumpRi = -1;
         if (dumpRi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpRi = (e && e[0] == '1') ? 1 : 0; }
         if (!trader && !dumpRi) return;
+        // Field 2026-08-16 (v0.54 host log): one trader platoon had this called ~90x/s
+        // for 38 minutes (195k lines, 127 MB log) with the clock never moving - a
+        // per-tick no-op the engine's own timer gate refuses. Recording it as an
+        // edge would have the join rebase its transfer detector and re-apply EVERY
+        // held snapshot every tick. An edge is a REAL regen: the shop-open initial
+        // fill (firstTime) or a clock that advanced across the call. Everything
+        // else is dropped silently (KENSHICOOP_INV_DUMP=1 still logs each call).
+        double after = traderRefreshClock(self);
+        bool clockMoved = (before >= 0.0 && after >= 0.0 && after != before) ||
+                          (before < 0.0) != (after < 0.0);
+        bool real = firstTime || clockMoved;
+        if (!real && !dumpRi) return;
         TraderRefreshEdge e;
         memset(&e, 0, sizeof(e));
         e.firstTime = firstTime ? 1 : 0;
         Character* ld = 0;
         if (self && g_apSquadLeaderFn) ld = g_apSquadLeaderFn(self);
         if (ld) readObjectHand(static_cast<RootObject*>(ld), e.leaderHand);
-        if (trader && g_traderRefreshes.size() < 32) g_traderRefreshes.push_back(e);
-        char b[160];
+        if (trader && real && g_traderRefreshes.size() < 32) g_traderRefreshes.push_back(e);
+        char b[200];
         _snprintf(b, sizeof(b) - 1,
-                  "[shop] REFRESH-INV trader=%d first=%d leader=%u,%u,%u,%u,%u",
+                  "[shop] REFRESH-INV trader=%d first=%d leader=%u,%u,%u,%u,%u clock=%.4f->%.4f edge=%d",
                   trader ? 1 : 0, e.firstTime,
-                  e.leaderHand[0], e.leaderHand[1], e.leaderHand[2], e.leaderHand[3], e.leaderHand[4]);
+                  e.leaderHand[0], e.leaderHand[1], e.leaderHand[2], e.leaderHand[3], e.leaderHand[4],
+                  before, after, (trader && real) ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // Re-assert NOW (see setTraderRefreshCallback): the callback drains the edge
+        // just queued and re-applies the held snapshots before the caller continues.
+        if (trader && real && g_traderRefreshCb) g_traderRefreshCb(g_traderRefreshCtx);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -2277,6 +2313,118 @@ unsigned int drainTraderRefreshes(TraderRefreshEdge* out, unsigned int maxOut) {
         out[n] = g_traderRefreshes[i];
     g_traderRefreshes.clear();
     return n;
+}
+
+// Trader-window guard: which shopkeeper's trade window this client opened last.
+// ForgottenGUI::showTraderInventory(owner) is the ONE entry to the shop UI (an
+// InventoryTraderGUI over the lazily-built ShopTraderInventory - an aggregated
+// VIEW holding Item*s that live in the shop's shelves and the keeper's own bag).
+// The detour copies the owner hand (a `hand` carries a vtable + 5 ids; a byte
+// copy of a live one is what the plugin already does for blank handles); the
+// query then asks ForgottenGUI whether that owner's window is STILL open, so a
+// close by any route (X button, ESC, walking away, closeAllInventories) needs no
+// second detour. Read on the main thread only.
+typedef InventoryGUI* (__fastcall* ShowTraderInvFn)(ForgottenGUI* self, const hand& owner);
+ShowTraderInvFn g_showTraderInvOrig = 0;
+static char g_traderWinHandBuf[sizeof(hand) + 16];
+static bool g_traderWinValid = false;
+InventoryGUI* __fastcall showTraderInventory_hook(ForgottenGUI* self, const hand& owner) {
+    // Original FIRST: it runs the shop-open stock fill (refreshInventory -> our
+    // synchronous re-assert, which must see NO trader window yet so it is not
+    // deferred by the guard) and registers the window. Only then remember the
+    // owner, so the very next poll finds the window open.
+    InventoryGUI* w = g_showTraderInvOrig(self, owner);
+    __try {
+        memcpy(g_traderWinHandBuf, &owner, sizeof(hand));
+        g_traderWinValid = true;
+        unsigned int h[5] = { 0, 0, 0, 0, 0 };
+        h[0] = (unsigned int)owner.type; h[1] = owner.container; h[2] = owner.containerSerial;
+        h[3] = owner.index; h[4] = owner.serial;
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "[shop] TRADER-WINDOW open owner=%u,%u,%u,%u,%u gui=%d",
+                  h[0], h[1], h[2], h[3], h[4], w ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_traderWinValid = false; }
+    return w;
+}
+
+bool installTraderWindowHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(&ForgottenGUI::showTraderInventory);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&showTraderInventory_hook,
+                              (void**)&g_showTraderInvOrig) == KenshiLib::SUCCESS;
+}
+
+// TEST LEVERS (vendor_sell): open / close the shop UI for the shopkeeper at cHand
+// through the SAME ForgottenGUI entry points a click uses, so the scenario walks
+// the real shop-open path (engine regen -> detour -> sync re-assert -> window
+// registered -> guard) and the real close (guard released). SEH-guarded, POD
+// locals; a hand is built by the engine's own ctor from the object-order array.
+// Returns 1 done, 0 the engine declined (null window / no gui), -1 fault.
+int openTraderWindow(GameWorld* gw, const unsigned int cHand[5]) {
+    if (!gw || !cHand || !g_handCtorFn) return 0;
+    __try {
+        ForgottenGUI* g = ::gui;
+        if (!g) return 0;
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, cHand[3], cHand[4], (itemType)cHand[0], cHand[1], cHand[2]);
+        InventoryGUI* w = g->showTraderInventory(*h);
+        return w ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int closeTraderWindow(GameWorld* gw, const unsigned int cHand[5]) {
+    if (!gw || !cHand || !g_handCtorFn) return 0;
+    __try {
+        ForgottenGUI* g = ::gui;
+        if (!g) return 0;
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, cHand[3], cHand[4], (itemType)cHand[0], cHand[1], cHand[2]);
+        bool was = g->hasInventoryWindowOpen(*h);
+        g->closeInventory(*h);
+        return was ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+bool traderWindowOpen() {
+    if (!g_traderWinValid) return false;
+    bool open = false;
+    __try {
+        ForgottenGUI* g = ::gui;
+        if (g) open = g->hasInventoryWindowOpen(*reinterpret_cast<const hand*>(g_traderWinHandBuf));
+        if (!open) {
+            g_traderWinValid = false; // closed: forget it until the next open
+            coop::logLine("[shop] TRADER-WINDOW closed");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { open = false; g_traderWinValid = false; }
+    return open;
+}
+
+// Steam shutdown edge. The net worker pumps ISteamNetworking through the flat
+// steam_api64 exports; once the game calls SteamAPI_Shutdown those interfaces
+// (and, in the observed exit, the module behind them) are gone, and a worker
+// still polling jumps into unmapped code (v0.54 host log 2026-08-16 19:02:38:
+// non-main thread, EXECUTE of an unmapped address, right after quit). The
+// callback stops the worker BEFORE the original runs. Absent steam_api64.dll
+// (UDP transport) there is nothing to hook.
+typedef void (*SteamShutdownFn)();
+static SteamShutdownFn g_steamShutdownOrig = 0;
+static SteamShutdownCb g_steamShutdownCb   = 0;
+static void steamShutdown_hook() {
+    __try { if (g_steamShutdownCb) g_steamShutdownCb(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (g_steamShutdownOrig) g_steamShutdownOrig();
+}
+bool installSteamShutdownHook(SteamShutdownCb cb) {
+    HMODULE mod = GetModuleHandleA("steam_api64.dll");
+    if (!mod) return false;
+    FARPROC p = GetProcAddress(mod, "SteamAPI_Shutdown");
+    if (!p) return false;
+    g_steamShutdownCb = cb;
+    return KenshiLib::AddHook((intptr_t)p, (void*)&steamShutdown_hook,
+                              (void**)&g_steamShutdownOrig) == KenshiLib::SUCCESS;
 }
 
 bool installRecruitHook() {

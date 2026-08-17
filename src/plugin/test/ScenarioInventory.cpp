@@ -3138,19 +3138,31 @@ private:
 // even after the forced regen. Evidence lines: XVENDOR regen (what refreshInventory
 // did to the keeper's count) and [shop] VIEW-OVERLAP (view Item* identity vs the
 // keeper/shelf backing stores) - the ENGINE_FACTS material for the vendor model.
+//
+// vendor_sell (sellMode): the SAME scenario, but the join walks the REAL shop UI
+// path instead of forcing the regen directly: it OPENS the keeper's trade window
+// (ForgottenGUI::showTraderInventory - which runs the engine's shop-open fill,
+// i.e. refreshInventory(firstTime) -> the detour's synchronous re-assert), buys
+// one ware (keeper -> leader), sells it back (leader -> keeper) with the window
+// still up, then CLOSES it - the v0.54 field sequence that crashed the join
+// ("sell items, exit the trade menu"). Judged by Test-VendorSell: window opened,
+// the trader-window guard engaged and released around it, the sync re-assert
+// fired, both trades moved an item, and (health gates) nobody faulted.
 class VendorStockScenario : public Scenario {
 public:
-    VendorStockScenario()
-        : passed_(false), isHost_(false), have_(false),
+    VendorStockScenario(bool sellMode = false)
+        : sellMode_(sellMode), passed_(false), isHost_(false), have_(false),
           seeded_(0), looted_(0), seedTried_(false), lootTried_(false),
           regenTried_(false), overlapTried_(false), regenRan_(0),
           regenBefore_(-1), regenAfter_(-1),
+          buyTried_(false), sellTried_(false), closeTried_(false),
+          guiOpen_(0), bought_(0), sold_(0), guiClosed_(0),
           subjHow_(0), subjEntries_(0), seedType_(0),
           base_(-1), peak_(-1), final_(-1), lastLogMs_(0) {
         for (int i = 0; i < 5; ++i) subjHand_[i] = 0;
         seedSid_[0] = '\0'; subjName_[0] = '\0';
     }
-    virtual const char* name() const { return "vendor_stock"; }
+    virtual const char* name() const { return sellMode_ ? "vendor_sell" : "vendor_stock"; }
 
     void pinTrader(const ScenarioContext& ctx) {
         if (have_) return;
@@ -3280,10 +3292,50 @@ public:
         if (!isHost_ && !regenTried_ && ctx.elapsedMs >= REGEN_MS) {
             regenTried_ = true;
             regenBefore_ = keeperQty(ctx.gw);
-            regenRan_ = engine::forceTraderRefresh(ctx.gw, subjHand_, /*firstTime*/ true);
-            regenAfter_ = keeperQty(ctx.gw);
-            char b[160]; _snprintf(b, sizeof(b) - 1,
-                "XVENDOR regen ran=%d before=%d after=%d", regenRan_, regenBefore_, regenAfter_);
+            if (sellMode_) {
+                // The REAL shop-open path: the engine's own showTraderInventory runs
+                // the initial fill (refreshInventory firstTime) itself, so the regen
+                // + the detour's synchronous re-assert happen inside this call.
+                guiOpen_  = engine::openTraderWindow(ctx.gw, subjHand_);
+                regenRan_ = (guiOpen_ == 1) ? 1 : 0;
+                regenAfter_ = keeperQty(ctx.gw);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "XVENDOR gui open=%d before=%d after=%d", guiOpen_, regenBefore_, regenAfter_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                regenRan_ = engine::forceTraderRefresh(ctx.gw, subjHand_, /*firstTime*/ true);
+                regenAfter_ = keeperQty(ctx.gw);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "XVENDOR regen ran=%d before=%d after=%d", regenRan_, regenBefore_, regenAfter_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        // vendor_sell (join): trade with the window UP, then close it - the field
+        // crash sequence. Buy = keeper -> leader, sell = leader -> keeper (the money
+        // half is not exercised; the item moves are what the reconcile sees).
+        if (sellMode_ && !isHost_ && !buyTried_ && seedSid_[0] && ctx.elapsedMs >= BUY_MS) {
+            buyTried_ = true;
+            unsigned int lh[5];
+            if (myLeaderHand(ctx.gw, lh))
+                bought_ = engine::moveItemBetweenContainers(ctx.gw, subjHand_, lh, seedSid_, seedType_, 1);
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "XVENDOR buy n=%d sid='%s' keeperQty=%d", bought_, seedSid_, keeperQty(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (sellMode_ && !isHost_ && !sellTried_ && seedSid_[0] && ctx.elapsedMs >= SELL_MS) {
+            sellTried_ = true;
+            unsigned int lh[5];
+            if (myLeaderHand(ctx.gw, lh))
+                sold_ = engine::moveItemBetweenContainers(ctx.gw, lh, subjHand_, seedSid_, seedType_, 1);
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "XVENDOR sell n=%d sid='%s' keeperQty=%d", sold_, seedSid_, keeperQty(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (sellMode_ && !isHost_ && !closeTried_ && ctx.elapsedMs >= CLOSE_MS) {
+            closeTried_ = true;
+            guiClosed_ = engine::closeTraderWindow(ctx.gw, subjHand_);
+            char b[120]; _snprintf(b, sizeof(b) - 1,
+                "XVENDOR gui close=%d keeperQty=%d", guiClosed_, keeperQty(ctx.gw));
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
 
@@ -3310,13 +3362,23 @@ public:
                 // (pre-mirror the keeper was never censused, so base==peak==final).
                 bool observed = (peak_ != base_) || (final_ != base_);
                 passed_ = (base_ >= 0) && observed;
-                char b[260]; _snprintf(b, sizeof(b) - 1,
+                // vendor_sell additionally needs the real UI path to have run: the
+                // window opened, both trades moved an item, the window closed.
+                if (sellMode_)
+                    passed_ = passed_ && (guiOpen_ == 1) && (bought_ > 0) && (sold_ > 0) && (guiClosed_ >= 0);
+                char b[300]; _snprintf(b, sizeof(b) - 1,
                     "XVENDOR verdict role=join pass=%d subj=%u,%u,%u,%u,%u how=%d base=%d "
                     "peak=%d final=%d regen=%d regenBefore=%d regenAfter=%d",
                     passed_ ? 1 : 0, subjHand_[0], subjHand_[1], subjHand_[2], subjHand_[3],
                     subjHand_[4], subjHow_, base_, peak_, final_, regenRan_, regenBefore_,
                     regenAfter_);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                if (sellMode_) {
+                    char s[200]; _snprintf(s, sizeof(s) - 1,
+                        "XVENDOR sell-verdict pass=%d guiOpen=%d bought=%d sold=%d guiClosed=%d",
+                        passed_ ? 1 : 0, guiOpen_, bought_, sold_, guiClosed_);
+                    s[sizeof(s) - 1] = '\0'; coop::logLine(s);
+                }
             }
             return true;
         }
@@ -3330,6 +3392,9 @@ private:
     static const unsigned long LOOT_MS    = 20000;
     static const unsigned long OVERLAP_MS = 28000;
     static const unsigned long REGEN_MS   = 27000;
+    static const unsigned long BUY_MS     = 30000; // vendor_sell: window up
+    static const unsigned long SELL_MS    = 33000; // vendor_sell: window up
+    static const unsigned long CLOSE_MS   = 36000; // vendor_sell: close it
     static const int           SEED_N     = 3;
     static const unsigned long JOIN_DURATION_MS = 40000;
     static const unsigned long HOST_DURATION_MS = 46000;
@@ -3342,6 +3407,7 @@ private:
         return q;
     }
 
+    bool          sellMode_;
     bool          passed_;
     bool          isHost_;
     bool          have_;
@@ -3354,6 +3420,13 @@ private:
     int           regenRan_;
     int           regenBefore_;
     int           regenAfter_;
+    bool          buyTried_;
+    bool          sellTried_;
+    bool          closeTried_;
+    int           guiOpen_;
+    int           bought_;
+    int           sold_;
+    int           guiClosed_;
     int           subjHow_;
     int           subjEntries_;
     unsigned int  seedType_;
@@ -3414,6 +3487,7 @@ Scenario* makeInventoryScenario(const std::string& name) {
     if (name == "shop_shelf")   return new ShopShelfScenario();
     if (name == "shelf_empty")  return new ShopShelfScenario(/*emptyMode=*/true);
     if (name == "vendor_stock") return new VendorStockScenario();
+    if (name == "vendor_sell")  return new VendorStockScenario(/*sellMode*/ true);
     return 0;
 }
 

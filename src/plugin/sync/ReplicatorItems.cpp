@@ -314,7 +314,26 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
+void Replicator::onTraderRefreshNow() {
+    // Called from inside ActivePlatoon::refreshInventory (the detour), i.e. from
+    // engine code, not the plugin tick. The census author never reconciles the
+    // rows this is about, and without a world from a prior tick there is nothing
+    // to resolve against; re-entrancy (a scenario's forced refresh from within
+    // our own tick) just leaves the edge queued for the ordinary drain.
+    if (storeSync_ || !invGw_ || inApplyInv_) return;
+    coop::logLine("[shop] REFRESH-INV sync re-assert (inside the engine's regen call)");
+    applyInventories(invGw_);
+}
+
 void Replicator::applyInventories(GameWorld* gw) {
+    invGw_ = gw;
+    if (inApplyInv_) return;
+    inApplyInv_ = true;
+    applyInventoriesImpl(gw);
+    inApplyInv_ = false;
+}
+
+void Replicator::applyInventoriesImpl(GameWorld* gw) {
     // Vendor-stock mirror: the engine just REGENERATED a trader platoon's stock on
     // this client (shop-open initial fill or the periodic restock, detoured at
     // ActivePlatoon::refreshInventory). On the census author that is simply new
@@ -347,6 +366,29 @@ void Replicator::applyInventories(GameWorld* gw) {
         }
     }
     if (invRecv_.empty()) return;
+    // Trader-window guard (v0.54 field: the join crashed after selling and closing
+    // the trade menu). The trade window is an aggregated view over the shop's
+    // shelf/keeper Item*s; a reconcile that destroys or refabricates one of those
+    // underneath it (a stale periodic snapshot landing after a sale, a latch or
+    // xfer-defer expiring) leaves the view on freed memory. While THIS client has
+    // a trader window up, every dirty row stays dirty and applies the tick it
+    // closes. The shop-open re-assert itself is not blocked by this: it runs
+    // synchronously from the regen detour (onTraderRefreshNow) before the window
+    // is registered, so the join still opens onto the host's stock.
+    {
+        bool traderOpen = engine::traderWindowOpen();
+        if (traderOpen != invTraderOpenLast_) {
+            unsigned int nd = 0;
+            for (std::map<Key, InvRecv>::const_iterator di = invRecv_.begin(); di != invRecv_.end(); ++di)
+                if (di->second.dirty) ++nd;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[shop] TRADER-WINDOW guard %s (dirty rows %s=%u)",
+                traderOpen ? "ON" : "OFF", traderOpen ? "deferred" : "released", nd);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            invTraderOpenLast_ = traderOpen;
+        }
+        if (traderOpen) return;
+    }
     for (std::map<Key, InvRecv>::iterator it = invRecv_.begin(); it != invRecv_.end(); ++it) {
         if (!it->second.dirty) continue;
         it->second.dirty = false;

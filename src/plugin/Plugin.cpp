@@ -2001,6 +2001,67 @@ void startNetworking() {
     if (!ok) coopErr("KenshiCoop: networking failed to start");
 }
 
+// Every Replicator flag that is a pure function of the ROLE, in one place, so a
+// role chosen at runtime (the F2 panel) re-arms exactly what a role chosen at
+// launch (KENSHICOOP_MODE / coop_config.json "role") armed. Field report
+// 2026-08-16 (v0.54): the shipped coop_config.json carries no "role", so a friend
+// who launches with it starts as HOST (Config.cpp defaults mode to host), then
+// picks JOIN in the panel. coopUiConnect re-armed streamNpcs + ownRanks but left
+// storeSync_ / gateAuthority_ / reportCombat_ at their launch values - so the
+// JOIN ran the HOST-ONLY container census (its save fence ACKed 108 containers;
+// the host [inv] APPLY-ed the join's snapshots of the same shelves, shopkeepers,
+// corpses and chests it authors itself, up to 38k applies/min). Two authors per
+// vendor container = destroy/refabricate churn under the trade window (the
+// join's sell-then-close crash), leaked/dropped fabrications on the host (the
+// "rare items spawned at the bar" / "vendors dropped their stock"), and corpse
+// loot fighting. Called from installEngineDetours (launch) and coopUiConnect.
+bool g_dmgGuardInstalled = false;
+
+// Vendor-stock mirror, synchronous half (engine::setTraderRefreshCallback): the
+// refreshInventory detour just saw a REAL regen; let the non-author re-assert the
+// host's stock before the engine builds a trade view over its own random roll.
+void traderRefreshNowThunk(void*) { g_repl.onTraderRefreshNow(); }
+
+// Exit hygiene (engine::installSteamShutdownHook): the game is shutting Steam
+// down; join the net worker while the ISteamNetworking interfaces it pumps still
+// exist. Without this a worker poll after the shutdown ran into unmapped code
+// (v0.54 host log, 19:02:38, right after quit).
+void steamShutdownThunk() {
+    coopLog("[net] SteamAPI_Shutdown: stopping the net worker before Steam goes away");
+    if (g_net.isRunning()) g_net.stop();
+    coop::steamp2p::shutdown();
+}
+
+void applyRoleFlags(bool isHost) {
+    // Host streams world NPCs; join drives. Under presence authority both do,
+    // each for the cells it claims.
+    g_repl.setStreamNpcs(isHost || g_cfg.cellAuth);
+    // Protocol 34: the HOST authors every storage/machine container near the
+    // interest centers (the ~1 Hz census inside publishInventories); the join
+    // reconciles via the translated key. Host-only flag - the join must never
+    // census-author (host-authoritative world containers). Layered on invSync
+    // (publishInventories is the carrier and is gated on it).
+    g_repl.setStoreSync(g_cfg.storeSync && isHost);
+    // Divergence-gated authority (join side, DEFAULT ON since the step-4 A/B):
+    // trust world NPCs whose local AI sustainedly agrees with the host; drive
+    // only divergence. KENSHICOOP_GATE_AUTHORITY=0 disables (A/B escape hatch).
+    g_repl.setGateAuthority(!isHost && g_cfg.gateAuthority);
+    // Join-dealt authoritative damage report (protocol 45): only the JOIN reports
+    // (the HOST owns + simulates world NPCs, so its own swings land natively).
+    // Meaningful only once the hitByMeleeAttack detour is in (installEngineDetours).
+    g_repl.setReportCombat(!isHost && g_dmgGuardInstalled);
+    char b[200];
+    _snprintf(b, sizeof(b) - 1,
+              "[role] %s: streamNpcs=%d storeSync=%d gateAuthority=%d reportCombat=%d",
+              isHost ? "HOST" : "JOIN",
+              (isHost || g_cfg.cellAuth) ? 1 : 0,
+              (g_cfg.storeSync && isHost) ? 1 : 0,
+              (!isHost && g_cfg.gateAuthority) ? 1 : 0,
+              (!isHost && g_dmgGuardInstalled) ? 1 : 0);
+    b[sizeof(b) - 1] = '\0';
+    coopLog(b);
+}
+
 // In-game panel handlers. coopUiConnect tears down any live session, re-arms the
 // config from the panel's choices, and restarts via the shared startNetworking()
 // path (NetLink cleanly supports stop() then start again; Steam is re-armed and
@@ -2022,9 +2083,9 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // normal flow is Copy my Steam ID -> friend Pastes it -> Connect, with no file
     // editing. peerId is 0 when nothing was pasted, so the config value stands.
     if (peerId != 0) g_cfg.steamPeer = peerId;
-    // Host streams world NPCs; join drives. Under presence authority both do,
-    // each for the cells it claims.
-    g_repl.setStreamNpcs(isHost || g_cfg.cellAuth);
+    // Every role-derived Replicator flag (streamNpcs, the host-only container
+    // census, gate authority, combat-hit report) follows the panel's role.
+    applyRoleFlags(isHost);
     // Ownership ranks must follow the role chosen in the panel. Only an explicit
     // KENSHICOOP_OWN_SQUAD override is preserved; otherwise recompute the default
     // (host owns {0}, join owns {1}). Without this, a session launched as HOST
@@ -2299,10 +2360,9 @@ void installEngineDetours() {
     // Divergence-gated authority (join side, DEFAULT ON since the step-4 A/B):
     // trust world NPCs whose local AI sustainedly agrees with the host; drive
     // only divergence. KENSHICOOP_GATE_AUTHORITY=0 disables (A/B escape hatch).
-    if (!g_cfg.isHost && g_cfg.gateAuthority) {
-        g_repl.setGateAuthority(true);
+    // Armed by applyRoleFlags at the end of this function (role-derived).
+    if (!g_cfg.isHost && g_cfg.gateAuthority)
         coopLog("[trust] divergence-gated authority ON (default; KENSHICOOP_GATE_AUTHORITY=0 disables)");
-    }
 
     // Damage guard (BOTH sides, DEFAULT ON): locally-simulated melee hits on
     // driven bodies are suppressed (HIT_MISSED) so cosmetic fights cannot diverge
@@ -2319,7 +2379,8 @@ void installEngineDetours() {
             // natively). Enabling report mode on the join makes the guard accumulate
             // the damage its player-squad melee WOULD have dealt to driven world-NPC
             // copies; publishCombatHits forwards it and the host wounds the real body.
-            g_repl.setReportCombat(!g_cfg.isHost);
+            // The flag itself is role-derived: applyRoleFlags (below / panel Connect).
+            g_dmgGuardInstalled = true;
             coopLog(g_cfg.isHost
                 ? "[dmg] hitByMeleeAttack detour installed; damage guard ON (host, driven peer-squad bodies)"
                 : "[dmg] hitByMeleeAttack detour installed; damage guard ON + combat-hit report ON (join)");
@@ -2342,10 +2403,20 @@ void installEngineDetours() {
     // re-assert the host's snapshots the moment its own engine regenerates a
     // trader's stock. Both sides install it (the host only logs the edge).
     if (g_cfg.storeSync) {
-        if (coop::engine::installTraderRefreshHook())
-            coopLog("[shop] refreshInventory detour installed; vendor-stock mirror ON");
-        else
+        if (coop::engine::installTraderRefreshHook()) {
+            // Synchronous half: re-assert inside the regen call (before the trade
+            // view exists) rather than a tick later.
+            coop::engine::setTraderRefreshCallback(&traderRefreshNowThunk, 0);
+            coopLog("[shop] refreshInventory detour installed; vendor-stock mirror ON (sync re-assert)");
+        } else {
             coopLog("[shop] FAILED to install refreshInventory detour; vendor stock re-asserts only on the periodic resend");
+        }
+        // Trader-window guard: no container reconcile underneath an open trade window
+        // (v0.54 field: join crashed after selling + closing the trade menu).
+        if (coop::engine::installTraderWindowHook())
+            coopLog("[shop] showTraderInventory detour installed; trader-window reconcile guard ON");
+        else
+            coopLog("[shop] FAILED to install showTraderInventory detour; trader-window guard OFF (reconciles may land under an open trade window)");
     }
 
     // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER, default ON in real sessions):
@@ -2401,12 +2472,16 @@ void installEngineDetours() {
     g_repl.setResearchSync(g_cfg.researchSync);
     g_repl.setDeedSync(g_cfg.deedSync);
     g_repl.setFixtureSync(g_cfg.fixtureSync);
-    // Protocol 34: the HOST authors every storage/machine container near the
-    // interest centers (the ~1 Hz census inside publishInventories); the join
-    // reconciles via the translated key. Host-only flag - the join must never
-    // census-author (host-authoritative world containers). Layered on invSync
-    // (publishInventories is the carrier and is gated on it below).
-    g_repl.setStoreSync(g_cfg.storeSync && g_cfg.isHost);
+    // Role-derived flags (streamNpcs, the HOST-ONLY container census, gate
+    // authority, combat-hit report) - armed here for the launch role and again by
+    // coopUiConnect for the panel's role. Before this the census stayed armed on
+    // a client that launched with the default (host) config and joined via F2.
+    applyRoleFlags(g_cfg.isHost);
+    // Exit hygiene: join the net worker before the game tears Steam down.
+    if (coop::engine::installSteamShutdownHook(&steamShutdownThunk))
+        coopLog("[net] SteamAPI_Shutdown detour installed; net worker stops before Steam teardown");
+    else
+        coopLog("[net] SteamAPI_Shutdown detour not installed (no steam_api64.dll / export); exit relies on process teardown");
     if (g_cfg.recruitSync) {
         if (coop::engine::installRecruitHook())
             coopLog("[recruit] recruit detour installed; recruitment sync ON");

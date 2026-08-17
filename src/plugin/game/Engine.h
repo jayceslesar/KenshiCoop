@@ -1722,6 +1722,13 @@ bool installShopHook();
 // the peer re-keys its local copy of the old hand to the new stream key.
 struct RecruitEdge { unsigned int before[5]; unsigned int after[5]; };
 bool installRecruitHook();
+
+// Steam shutdown edge (exit hygiene): detour steam_api64!SteamAPI_Shutdown and
+// run `cb` BEFORE it, so the net worker that pumps ISteamNetworking can be joined
+// while the interfaces still exist. Returns false when steam_api64.dll is not
+// loaded (UDP transport) or the export/hook is unavailable - then nothing changes.
+typedef void (*SteamShutdownCb)();
+bool installSteamShutdownHook(SteamShutdownCb cb);
 unsigned int drainRecruitEdges(RecruitEdge* out, unsigned int maxOut);
 
 // ---- Protocol 24: faction-relation sync -------------------------------------
@@ -2222,6 +2229,28 @@ struct TraderRefreshEdge {
 };
 bool installTraderRefreshHook();
 unsigned int drainTraderRefreshes(TraderRefreshEdge* out, unsigned int maxOut);
+// Fired synchronously from the detour after a REAL regen (shop-open initial fill
+// or a restock whose clock advanced), still inside the engine call - the moment
+// to re-assert the host's stock before the trade view is built over the local
+// random roll. The callee typically drains the edge and re-applies snapshots.
+typedef void (*TraderRefreshCb)(void* ctx);
+void setTraderRefreshCallback(TraderRefreshCb cb, void* ctx);
+
+// Trader-window guard: detour ForgottenGUI::showTraderInventory (the one entry
+// to the shop UI) so the Replicator can tell when THIS client has a trade window
+// up. That window is an aggregated VIEW over the shop's shelf + shopkeeper
+// Item*s; a reconcile that destroys one of those underneath it leaves the view
+// holding freed memory (the v0.54 sell-then-close crash on the join). While
+// traderWindowOpen() the non-author DEFERS its container reconciles (kept dirty,
+// applied the tick the window closes). Poll-based close detection: the query asks
+// ForgottenGUI whether the recorded owner's window is still open. Main thread only.
+bool installTraderWindowHook();
+bool traderWindowOpen();
+// TEST LEVERS (vendor_sell): open / close the shop UI for the shopkeeper at cHand
+// via ForgottenGUI::showTraderInventory / closeInventory - the real click path.
+// 1 done, 0 engine declined (null window / no gui / no ctor), -1 fault.
+int  openTraderWindow(GameWorld* gw, const unsigned int cHand[5]);
+int  closeTraderWindow(GameWorld* gw, const unsigned int cHand[5]);
 
 // SEH-guarded TEST LEVER (vendor_stock): run the engine's own stock builder for
 // the platoon of the shopkeeper at cHand - ActivePlatoon::refreshInventory

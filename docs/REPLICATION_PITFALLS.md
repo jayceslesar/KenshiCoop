@@ -472,3 +472,29 @@ asserting a fact that can stop being true has to be re-asserted on a cadence and
 withdrawn when it lapses — otherwise the instrument manufactures the failure it
 was built to detect, and it does so most convincingly in exactly the long
 sessions where you are least able to check it.
+
+## 19. A role chosen at runtime must re-arm everything a role chosen at launch armed
+
+The plugin decides its role twice: once at launch from `KENSHICOOP_MODE` /
+`coop_config.json` (`role`, defaulting to host), and again when a player clicks
+Connect in the F2 panel. Several Replicator flags are pure functions of the role
+— the host-only container census (`storeSync_`), the join's divergence-gated
+authority, the join's combat-hit report — and they were armed once, at launch.
+The panel path re-armed `isHost`, `streamNpcs` and `ownRanks` and nothing else.
+The shipped config carries no `role`, so a friend who installs the kit launches
+as HOST and joins through the panel with the host census still on. Field report
+v0.54 (2026-08-16): the join ACKed a save fence with 108 authored containers; the
+host `[inv] APPLY`-ed the join's snapshots of the very shelves, shopkeepers,
+corpses and chests it authors itself (38k applies in one minute at the peak);
+two authors per vendor container gave the sell-then-close crash, "vendors drop
+their stock", "rare items spawned at the bar" and the corpse-loot fights. The
+harness never saw it because it launches with the env role, not the panel.
+
+The fix is structural, not a patch to the panel: one `applyRoleFlags(isHost)`
+owns every role-derived flag and both entry points call it.
+
+**Rule.** Any state derived from the role lives behind one function, and every
+place the role can change calls that function. A launch-only default that a
+runtime choice can contradict is a bug that no env-driven test will ever hit —
+so when a field symptom smells like "the join is doing host things", check what
+the panel path did NOT re-arm before reading a single sync channel.

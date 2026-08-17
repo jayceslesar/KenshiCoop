@@ -706,7 +706,17 @@ public:
 
     // AFTER engine: reconcile each peer-owned container we received a (dirty) snapshot
     // for to its desired contents. Skips containers we own (we author those).
+    // Trader-window guard: while THIS client has a trade window up
+    // (engine::traderWindowOpen) every dirty row stays dirty - the window is a
+    // view over the shop's shelf/keeper Item*s and a reconcile underneath it is
+    // the sell-then-close crash class - and applies the tick it closes.
     void applyInventories(GameWorld* gw);
+    // Vendor-stock mirror, synchronous half: called from the refreshInventory
+    // detour right after a REAL regen (shop-open fill / restock) so the non-author
+    // re-asserts the host's stock BEFORE the engine builds the trade view over its
+    // own random roll. Runs applyInventories on the last tick's world; a no-op on
+    // the census author, when no world is known yet, or re-entrantly.
+    void onTraderRefreshNow();
 
     // AFTER applyTargets: make the region's AUTHOR authoritative for world NPCs.
     // Any nearby NPC the author is NOT streaming this tick is hidden + frozen so
@@ -1463,6 +1473,13 @@ private:
     bool           storeSync_;
     unsigned long  contCensusMs_;
     std::set<Key>  censusContainers_;
+    // Trader-window guard bookkeeping: the world applyInventories last ran on
+    // (for the synchronous shop-open re-assert), a re-entrancy latch, and the
+    // last polled window state (edge-logged only).
+    GameWorld*     invGw_;
+    bool           inApplyInv_;
+    bool           invTraderOpenLast_;
+    void applyInventoriesImpl(GameWorld* gw); // body of applyInventories (latched)
     // Rows that just LEFT the census while still resolving here, kept authored
     // for a grace window (value = ms they dropped out). The census admits a
     // non-storage shelf / a corpse only while it CARRIES items, so the state that

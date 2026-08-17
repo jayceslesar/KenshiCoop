@@ -2323,6 +2323,22 @@
             Advisory = @('smoothness', 'march')
             Tier = 'full'; WanVariant = $false
         }
+        # vendor_sell: the v0.54 field crash sequence on the join ("sell items,
+        # exit the trade menu"). Same pin/seed/loot as vendor_stock, but the join
+        # walks the REAL shop UI: opens the keeper's trade window (the engine's own
+        # shop-open fill -> refreshInventory detour -> synchronous re-assert), buys
+        # one ware and sells it back with the window UP, then closes it. Gate: the
+        # window opened, the trader-window reconcile guard engaged and released
+        # around it, the sync re-assert fired, both trades moved an item, and the
+        # health gates saw no fault. vendor_stock's mirror verdict rides as advisory.
+        vendor_sell = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_STORE_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'vendor_sell'
+            Gating   = @('vendor_sell', 'clock_sync')
+            Advisory = @('vendor_stock', 'smoothness', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # Same round trip with the author's FIRST re-home refused. That is the case that
         # used to strand the item in both places forever - the author tried once, off a
         # cached pointer, and never revisited it. Now it retries and, once it can READ the

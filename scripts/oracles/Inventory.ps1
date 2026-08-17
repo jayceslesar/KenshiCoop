@@ -1871,3 +1871,47 @@ function Test-VendorStock {
                             joinRegen = $jRegen; joinRegenBefore = $jRegenBefore; joinRegenAfter = $jRegenAfter;
                             fixtureMiss = ($noPinHost -or $noPinJoin) })
 }
+
+# vendor_sell: the join walked the REAL shop UI (open trade window -> buy -> sell
+# -> close) on top of the vendor_stock pin. This gate keys on the plugin's own
+# evidence lines rather than any pixel: the window opened ("[shop] TRADER-WINDOW
+# open ... gui=1"), the reconcile guard engaged and released around it ("guard
+# ON" then "guard OFF"), the synchronous shop-open re-assert fired ("REFRESH-INV
+# sync re-assert"), and the scenario's own sell-verdict says both trades moved an
+# item and the window closed. A fault would already fail the health gates; here
+# the join's log must ALSO carry no "[crash] VEH" line (belt and braces - the
+# fault tracer writes it before the process dies).
+function Test-VendorSell {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = "vendor_sell")
+    if (-not (Test-Path $JoinFile)) {
+        Write-Host "  VENDOR-SELL FAIL - no join log"
+        return (Add-GateResult -Name $GateName -Status FAIL -Detail "no join log")
+    }
+    $opened  = [bool](Select-String -Path $JoinFile -Pattern '\[shop\] TRADER-WINDOW open .* gui=1' -ErrorAction SilentlyContinue)
+    $guardOn = [bool](Select-String -Path $JoinFile -Pattern '\[shop\] TRADER-WINDOW guard ON'  -ErrorAction SilentlyContinue)
+    $guardOff= [bool](Select-String -Path $JoinFile -Pattern '\[shop\] TRADER-WINDOW guard OFF' -ErrorAction SilentlyContinue)
+    $syncRe  = [bool](Select-String -Path $JoinFile -Pattern '\[shop\] REFRESH-INV sync re-assert' -ErrorAction SilentlyContinue)
+    $fault   = [bool](Select-String -Path $JoinFile -Pattern '\[crash\] VEH ' -ErrorAction SilentlyContinue)
+    $v = Select-String -Path $JoinFile -Pattern 'XVENDOR sell-verdict pass=(\d) guiOpen=(-?\d+) bought=(\d+) sold=(\d+) guiClosed=(-?\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $vPass = $false; $guiOpen = -9; $bought = 0; $sold = 0; $guiClosed = -9
+    if ($null -ne $v) {
+        $g = $v.Matches[0].Groups
+        $vPass = ([int]$g[1].Value -eq 1); $guiOpen = [int]$g[2].Value
+        $bought = [int]$g[3].Value; $sold = [int]$g[4].Value; $guiClosed = [int]$g[5].Value
+    }
+    $noPin = [bool](Select-String -Path $JoinFile -Pattern 'XVENDOR nopin' -ErrorAction SilentlyContinue)
+    Write-Host ("  VENDOR-SELL [join] window opened=$opened guardOn=$guardOn guardOff=$guardOff syncReassert=$syncRe " +
+                "bought=$bought sold=$sold guiClosed=$guiClosed fault=$fault verdict=$vPass")
+    if ($noPin) { Write-Host "    NOTE: FIXTURE MISS - no stocked shopkeeper near spawn (pick a save/spot with a shop in range)" }
+    if ($guiOpen -eq 0) { Write-Host "    NOTE: the engine DECLINED to open the trade window for the pinned keeper (lever limitation, not the bug)" }
+    if ($guiOpen -eq -1) { Write-Host "    NOTE: showTraderInventory FAULTED (SEH) - the lever hit engine state it cannot drive; investigate before trusting the gate" }
+    if ($opened -and -not $guardOn) { Write-Host "    NOTE: window opened but the guard never engaged - hasInventoryWindowOpen(owner) did not see it (guard keyed wrong)" }
+    if ($guardOn -and -not $guardOff) { Write-Host "    NOTE: guard engaged but never released - reconciles stayed deferred after the close" }
+    if (-not $syncRe) { Write-Host "    NOTE: no synchronous shop-open re-assert on the join (detour edge missing / callback unset)" }
+    $ok = $opened -and $guardOn -and $guardOff -and $syncRe -and $vPass -and -not $fault
+    Write-Host ("  VENDOR-SELL " + $(if ($ok) { "PASS" } else { "FAIL" }) + " - trade window open/buy/sell/close on the join with no reconcile underneath it and no fault")
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ opened = $opened; guardOn = $guardOn; guardOff = $guardOff; syncReassert = $syncRe;
+                            guiOpen = $guiOpen; bought = $bought; sold = $sold; guiClosed = $guiClosed;
+                            fault = $fault; verdict = $vPass; fixtureMiss = $noPin })
+}
